@@ -1,0 +1,12 @@
+celery>=5.5.0
+channels>=4.0.0
+channels-redis>=4.0.0
+daphne>=4.0.0
+djangorestframework>=3.16.0
+django-cors-headers>=4.9.0
+redis>=7.0.0
+Django>=5.2.0
+psycopg2-binary
+yfinance>=2.9.0
+django-celery-beat>=2.5.0
+
