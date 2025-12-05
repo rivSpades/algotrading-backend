@@ -45,6 +45,7 @@ INSTALLED_APPS = [
     'django_celery_beat',
     # Local apps
     'market_data',
+    'analytical_tools',
 ]
 
 MIDDLEWARE = [

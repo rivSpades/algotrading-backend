@@ -65,7 +65,7 @@ class SymbolViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['get'])
     def ohlcv(self, request, pk=None):
-        """Get OHLCV data for a symbol with pagination"""
+        """Get OHLCV data for a symbol with pagination and on-the-fly indicator computation"""
         symbol = self.get_object()
         timeframe = request.query_params.get('timeframe', 'daily')
         start_date = request.query_params.get('start_date')
@@ -73,29 +73,111 @@ class SymbolViewSet(viewsets.ModelViewSet):
         page = int(request.query_params.get('page', 1))
         page_size = int(request.query_params.get('page_size', 50))
 
-        queryset = OHLCV.objects.filter(symbol=symbol, timeframe=timeframe)
-
+        # Get all OHLCV data for indicator computation (need full dataset for accurate indicators)
+        full_queryset = OHLCV.objects.filter(symbol=symbol, timeframe=timeframe)
+        
         if start_date:
-            queryset = queryset.filter(timestamp__gte=start_date)
+            full_queryset = full_queryset.filter(timestamp__gte=start_date)
         if end_date:
-            queryset = queryset.filter(timestamp__lte=end_date)
+            full_queryset = full_queryset.filter(timestamp__lte=end_date)
 
-        total_count = queryset.count()
-        queryset = queryset.order_by('-timestamp')
+        # Get paginated queryset for response
+        total_count = full_queryset.count()
+        paginated_queryset = full_queryset.order_by('-timestamp')
         
         # Pagination
         start = (page - 1) * page_size
         end = start + page_size
-        queryset = queryset[start:end]
+        paginated_queryset = paginated_queryset[start:end]
 
-        serializer = OHLCVSerializer(queryset, many=True)
+        # Serialize paginated data
+        serializer = OHLCVSerializer(paginated_queryset, many=True)
+        results = serializer.data
+
+        # Compute indicators on-the-fly using full dataset
+        # Convert full queryset to list for pandas (need full dataset for accurate indicators)
+        full_queryset_ordered = full_queryset.order_by('timestamp')
+        full_ohlcv_list = []
+        for ohlcv in full_queryset_ordered.values('timestamp', 'open', 'high', 'low', 'close', 'volume'):
+            full_ohlcv_list.append({
+                'timestamp': ohlcv['timestamp'],
+                'open': float(ohlcv['open']),
+                'high': float(ohlcv['high']),
+                'low': float(ohlcv['low']),
+                'close': float(ohlcv['close']),
+                'volume': float(ohlcv['volume'])
+            })
+        
+        # Compute indicators on full dataset
+        from .services.indicator_service import compute_indicators_for_ohlcv
+        full_indicator_values = compute_indicators_for_ohlcv(symbol, full_ohlcv_list)
+        
+        # Create timestamp to index mapping for paginated results
+        # Build a mapping from serialized timestamp strings to indices in full_ohlcv_list
+        # full_ohlcv_list is ordered by timestamp (ascending), same as indicator computation
+        from datetime import datetime as dt
+        timestamp_to_index = {}
+        for idx, ohlcv_item in enumerate(full_ohlcv_list):
+            ts = ohlcv_item['timestamp']
+            # Normalize timestamp to ISO string format for matching
+            # DRF serializes DateTimeField as ISO string, so we need to match that format
+            if isinstance(ts, str):
+                # Already a string, use as-is
+                timestamp_to_index[ts] = idx
+            else:
+                # Datetime object, convert to ISO string (DRF format)
+                iso_str = ts.isoformat()
+                timestamp_to_index[iso_str] = idx
+                # Also store with 'Z' suffix (common format)
+                timestamp_to_index[iso_str.replace('+00:00', 'Z')] = idx
+                # Store original string representation
+                timestamp_to_index[str(ts)] = idx
+        
+        # Add indicator values to paginated results
+        indicators_metadata = {}
+        for indicator_key, indicator_data in full_indicator_values.items():
+            full_values = indicator_data['values']
+            
+            # Extract values for paginated results by matching timestamps
+            for result in results:
+                result_timestamp = result['timestamp']
+                # Try to find matching index - result_timestamp is already serialized by DRF
+                full_index = timestamp_to_index.get(result_timestamp)
+                
+                # If not found, try normalizing the timestamp string
+                if full_index is None and isinstance(result_timestamp, str):
+                    # Try with 'Z' replaced by '+00:00'
+                    normalized = result_timestamp.replace('Z', '+00:00')
+                    full_index = timestamp_to_index.get(normalized)
+                    # Try parsing and converting back to ISO
+                    if full_index is None:
+                        try:
+                            parsed_ts = dt.fromisoformat(normalized)
+                            full_index = timestamp_to_index.get(parsed_ts.isoformat())
+                        except:
+                            pass
+                
+                # Assign indicator value if index found
+                if full_index is not None and full_index < len(full_values):
+                    result[indicator_key] = full_values[full_index]
+                else:
+                    result[indicator_key] = None
+            
+            # Store metadata
+            indicators_metadata[indicator_key] = {
+                'color': indicator_data['color'],
+                'line_width': indicator_data['line_width'],
+                'subchart': indicator_data.get('subchart', False)
+            }
+
         return Response({
-            'results': serializer.data,
+            'results': results,
             'count': total_count,
             'page': page,
             'page_size': page_size,
             'next': f'?page={page + 1}' if end < total_count else None,
-            'previous': f'?page={page - 1}' if page > 1 else None
+            'previous': f'?page={page - 1}' if page > 1 else None,
+            'indicators': indicators_metadata  # Metadata about enabled indicators
         })
 
     @action(detail=True, methods=['post'], url_path='update-data', url_name='update-data')
