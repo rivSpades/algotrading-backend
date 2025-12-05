@@ -113,3 +113,5 @@ def compute_indicator_task(self, assignment_id):
             'message': f'Error computing indicator: {str(e)}'
         }
 
+
+

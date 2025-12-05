@@ -126,3 +126,5 @@ class YahooFinanceProvider:
         return result
 
 
+
+

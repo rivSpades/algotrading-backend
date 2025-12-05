@@ -129,6 +129,39 @@ def calculate_ema(prices: pd.Series, period: int = 20) -> pd.Series:
     return prices.ewm(span=period, adjust=False).mean()
 
 
+def calculate_bollinger_bands(prices: pd.Series, period: int = 20, num_std: float = 2.0) -> Dict[str, pd.Series]:
+    """
+    Calculate Bollinger Bands
+    
+    Args:
+        prices: Series of closing prices
+        period: Moving average period (default: 20)
+        num_std: Number of standard deviations (default: 2.0)
+    
+    Returns:
+        Dictionary with 'upper', 'middle', 'lower', and 'bandwidth' series
+    """
+    # Middle band is SMA
+    middle = prices.rolling(window=period).mean()
+    
+    # Standard deviation
+    std = prices.rolling(window=period).std()
+    
+    # Upper and lower bands
+    upper = middle + (std * num_std)
+    lower = middle - (std * num_std)
+    
+    # Bandwidth = (upper - lower) / middle * 100
+    bandwidth = ((upper - lower) / middle) * 100
+    
+    return {
+        'upper': upper,
+        'middle': middle,
+        'lower': lower,
+        'bandwidth': bandwidth
+    }
+
+
 # Indicator registry mapping tool names to calculation functions
 INDICATOR_FUNCTIONS = {
     'RSI': calculate_rsi,
@@ -137,6 +170,7 @@ INDICATOR_FUNCTIONS = {
     'Variance': calculate_variance,
     'SMA': calculate_sma,
     'EMA': calculate_ema,
+    'BollingerBands': calculate_bollinger_bands,
 }
 
 
@@ -188,6 +222,25 @@ def compute_indicator(
                 result_dict['macd'].values,
                 result_dict['signal'].values,
                 result_dict['histogram'].values
+            )
+        ]
+    
+    elif tool_name == 'BollingerBands':
+        result_dict = func(df['close'], **parameters)
+        # Store all bands in metadata
+        df['indicator_value'] = result_dict['middle'].values  # Default to middle band
+        df['metadata'] = [
+            {
+                'upper': float(upper) if pd.notna(upper) else None,
+                'middle': float(middle) if pd.notna(middle) else None,
+                'lower': float(lower) if pd.notna(lower) else None,
+                'bandwidth': float(bandwidth) if pd.notna(bandwidth) else None
+            }
+            for upper, middle, lower, bandwidth in zip(
+                result_dict['upper'].values,
+                result_dict['middle'].values,
+                result_dict['lower'].values,
+                result_dict['bandwidth'].values
             )
         ]
     

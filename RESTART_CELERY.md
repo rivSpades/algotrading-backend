@@ -62,3 +62,5 @@ Sempre reinicie os workers Celery após:
 - Mudar configurações do Celery
 
 
+
+

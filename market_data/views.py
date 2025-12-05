@@ -99,8 +99,17 @@ class SymbolViewSet(viewsets.ModelViewSet):
         full_queryset_ordered = full_queryset.order_by('timestamp')
         full_ohlcv_list = []
         for ohlcv in full_queryset_ordered.values('timestamp', 'open', 'high', 'low', 'close', 'volume'):
+            # Convert timestamp to ISO format string if it's a datetime object
+            timestamp = ohlcv['timestamp']
+            if hasattr(timestamp, 'isoformat'):
+                timestamp = timestamp.isoformat()
+            elif isinstance(timestamp, str):
+                timestamp = timestamp
+            else:
+                timestamp = str(timestamp)
+            
             full_ohlcv_list.append({
-                'timestamp': ohlcv['timestamp'],
+                'timestamp': timestamp,
                 'open': float(ohlcv['open']),
                 'high': float(ohlcv['high']),
                 'low': float(ohlcv['low']),
@@ -165,11 +174,21 @@ class SymbolViewSet(viewsets.ModelViewSet):
             
             # Store metadata
             indicators_metadata[indicator_key] = {
+                'display_name': indicator_data.get('display_name', indicator_key),
                 'color': indicator_data['color'],
                 'line_width': indicator_data['line_width'],
                 'subchart': indicator_data.get('subchart', False)
             }
 
+        # Calculate statistics (volatility, etc.) from full dataset
+        from analytical_tools.statistics import calculate_statistics
+        statistics = calculate_statistics(full_ohlcv_list)
+        
+        # Debug: Log statistics to see what's being calculated
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"Statistics calculated for {symbol.ticker}: {statistics}")
+        
         return Response({
             'results': results,
             'count': total_count,
@@ -177,7 +196,8 @@ class SymbolViewSet(viewsets.ModelViewSet):
             'page_size': page_size,
             'next': f'?page={page + 1}' if end < total_count else None,
             'previous': f'?page={page - 1}' if page > 1 else None,
-            'indicators': indicators_metadata  # Metadata about enabled indicators
+            'indicators': indicators_metadata,  # Metadata about enabled indicators
+            'statistics': statistics if statistics else {}  # Statistics (volatility, etc.) - ensure it's always a dict
         })
 
     @action(detail=True, methods=['post'], url_path='update-data', url_name='update-data')

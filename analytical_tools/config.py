@@ -44,6 +44,15 @@ INDICATOR_DEFINITIONS = [
         'category': 'indicator',
         'default_parameters': {'period': 20}
     },
+    {
+        'name': 'BollingerBands',
+        'description': 'Bollinger Bands - Volatility indicator with upper, middle, and lower bands',
+        'category': 'indicator',
+        'default_parameters': {
+            'period': 20,
+            'num_std': 2.0
+        }
+    },
 ]
 
 def get_indicator_definition(name):
@@ -56,4 +65,6 @@ def get_indicator_definition(name):
 def get_all_indicator_definitions():
     """Get all indicator definitions"""
     return INDICATOR_DEFINITIONS
+
+
 
