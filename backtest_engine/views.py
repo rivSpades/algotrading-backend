@@ -11,7 +11,7 @@ from django.shortcuts import get_object_or_404
 from django.db.models import Q
 from .models import Backtest, Trade, BacktestStatistics
 from .serializers import (
-    BacktestSerializer, BacktestCreateSerializer,
+    BacktestSerializer, BacktestListSerializer, BacktestDetailSerializer, BacktestCreateSerializer,
     TradeSerializer, BacktestStatisticsSerializer
 )
 from strategies.models import StrategyDefinition, StrategyAssignment
@@ -38,7 +38,7 @@ class BacktestPagination(PageNumberPagination):
 
 class BacktestViewSet(viewsets.ModelViewSet):
     """ViewSet for Backtest"""
-    queryset = Backtest.objects.all().prefetch_related('symbols', 'strategy', 'trades', 'statistics')
+    queryset = Backtest.objects.all()
     serializer_class = BacktestSerializer
     filter_backends = [SearchFilter, OrderingFilter]
     search_fields = ['name', 'strategy__name']
@@ -47,8 +47,23 @@ class BacktestViewSet(viewsets.ModelViewSet):
     pagination_class = BacktestPagination
     
     def get_queryset(self):
-        """Filter backtests by strategy if strategy parameter is provided"""
-        queryset = super().get_queryset()
+        """Optimize queryset based on action - list vs detail"""
+        queryset = Backtest.objects.all()
+        
+        if self.action == 'list':
+            # For list views, only prefetch strategy (needed for strategy.name)
+            # Don't prefetch symbols, trades, statistics to improve performance
+            queryset = queryset.select_related('strategy', 'strategy_assignment')
+        elif self.action == 'retrieve':
+            # For detail views (retrieve), only prefetch strategy - trades and statistics are fetched separately
+            # This dramatically improves performance for backtests with thousands of symbols
+            queryset = queryset.select_related('strategy', 'strategy_assignment')
+        else:
+            # For other actions (update, partial_update, etc.), may need more data
+            # But still avoid prefetching trades/statistics unless absolutely necessary
+            queryset = queryset.select_related('strategy', 'strategy_assignment')
+        
+        # Filter backtests by strategy if strategy parameter is provided
         strategy_id = self.request.query_params.get('strategy', None)
         if strategy_id:
             queryset = queryset.filter(strategy_id=strategy_id)
@@ -57,6 +72,14 @@ class BacktestViewSet(viewsets.ModelViewSet):
     def get_serializer_class(self):
         if self.action == 'create':
             return BacktestCreateSerializer
+        elif self.action == 'list':
+            return BacktestListSerializer
+        elif self.action == 'retrieve':
+            # Use lightweight serializer for detail views - excludes trades and statistics
+            # Trades: fetched via /backtests/{id}/trades/ endpoint
+            # Statistics: fetched via /backtests/{id}/statistics/optimized/ endpoint
+            # Symbols: fetched via /backtests/{id}/symbols/ endpoint
+            return BacktestDetailSerializer
         return BacktestSerializer
     
     def create(self, request, *args, **kwargs):
@@ -159,19 +182,44 @@ class BacktestViewSet(viewsets.ModelViewSet):
     
     @action(detail=True, methods=['get'])
     def trades(self, request, pk=None):
-        """Get all trades for a backtest (with pagination)"""
+        """Get trades for a backtest with pagination and filtering
+        
+        Query parameters:
+        - symbol: Filter by symbol ticker
+        - mode: Filter by position mode ('all', 'long', 'short')
+          - 'long' filters for trade_type='buy'
+          - 'short' filters for trade_type='sell'
+          - 'all' returns all trades
+        - no_pagination: Set to 'true' to disable pagination (not recommended for large datasets)
+        """
         backtest = self.get_object()
-        trades = backtest.trades.all().order_by('entry_timestamp')
+        trades = backtest.trades.select_related('symbol').all()
+        
+        # Filter by symbol ticker if provided
+        symbol_ticker = request.query_params.get('symbol', None)
+        if symbol_ticker:
+            trades = trades.filter(symbol__ticker=symbol_ticker)
+        
+        # Filter by mode (position mode)
+        mode = request.query_params.get('mode', 'all').lower()
+        if mode == 'long':
+            trades = trades.filter(trade_type='buy')
+        elif mode == 'short':
+            trades = trades.filter(trade_type='sell')
+        # 'all' mode doesn't filter by trade_type
+        
+        # Order by entry timestamp
+        trades = trades.order_by('entry_timestamp')
         
         # Check if pagination should be disabled
         no_pagination = request.query_params.get('no_pagination', 'false').lower() == 'true'
         
         if no_pagination:
-            # Return all trades without pagination
+            # Return all trades without pagination (not recommended for large datasets)
             serializer = TradeSerializer(trades, many=True)
             return Response(serializer.data)
         
-        # Apply pagination
+        # Apply pagination (default behavior)
         paginator = TradePagination()
         page = paginator.paginate_queryset(trades, request)
         if page is not None:
@@ -189,6 +237,80 @@ class BacktestViewSet(viewsets.ModelViewSet):
         stats = backtest.statistics.all()
         serializer = BacktestStatisticsSerializer(stats, many=True)
         return Response(serializer.data)
+    
+    @action(detail=True, methods=['get'], url_path='statistics/optimized')
+    def statistics_optimized(self, request, pk=None):
+        """Get optimized statistics for a backtest - organized by mode (ALL/LONG/SHORT)"""
+        backtest = self.get_object()
+        
+        # Get portfolio stats (symbol=None)
+        portfolio_stats = backtest.statistics.filter(symbol__isnull=True).first()
+        
+        result = {
+            'portfolio': None,
+            'symbols': []
+        }
+        
+        if portfolio_stats:
+            serializer = BacktestStatisticsSerializer(portfolio_stats)
+            result['portfolio'] = {
+                'stats_by_mode': serializer.data.get('stats_by_mode', {}),
+                'equity_curve_x': serializer.data.get('equity_curve_x', []),
+                'equity_curve_y': serializer.data.get('equity_curve_y', []),
+            }
+        
+        # Get symbol-level stats
+        symbol_stats = backtest.statistics.filter(symbol__isnull=False).select_related('symbol')
+        for stat in symbol_stats:
+            serializer = BacktestStatisticsSerializer(stat)
+            result['symbols'].append({
+                'symbol_ticker': serializer.data.get('symbol_ticker'),
+                'stats_by_mode': serializer.data.get('stats_by_mode', {}),
+                'equity_curve_x': serializer.data.get('equity_curve_x', []),
+                'equity_curve_y': serializer.data.get('equity_curve_y', []),
+            })
+        
+        return Response(result)
+    
+    @action(detail=True, methods=['get'], url_path='symbols')
+    def symbols(self, request, pk=None):
+        """Get paginated list of symbols associated with this backtest (with search support)"""
+        from market_data.serializers import SymbolListSerializer
+        
+        # Get backtest - ensure we have the object
+        backtest = self.get_object()
+        
+        # Get unique symbols from the backtest (ManyToMany relationship)
+        symbols_queryset = backtest.symbols.all().order_by('ticker')
+        
+        # Apply search filter if provided
+        search = request.query_params.get('search', None)
+        if search:
+            symbols_queryset = symbols_queryset.filter(ticker__icontains=search)
+        
+        # Log for debugging
+        symbol_count = symbols_queryset.count()
+        logger.info(f"Backtest {pk} has {symbol_count} symbols (search: {search})")
+        
+        # Apply pagination
+        paginator = PageNumberPagination()
+        paginator.page_size = 20
+        paginator.page_size_query_param = 'page_size'
+        paginator.max_page_size = 100
+        
+        page = paginator.paginate_queryset(symbols_queryset, request)
+        if page is not None:
+            # Serialize symbols to return full symbol objects
+            serializer = SymbolListSerializer(page, many=True)
+            logger.info(f"Returning {len(serializer.data)} symbols on page {request.query_params.get('page', 1)}")
+            # Get pagination metadata
+            paginated_response = paginator.get_paginated_response(serializer.data)
+            return paginated_response
+        
+        # Fallback if pagination not requested - return all as array
+        serializer = SymbolListSerializer(symbols_queryset, many=True)
+        logger.info(f"Returning {len(serializer.data)} symbols (no pagination)")
+        return Response({'results': serializer.data, 'count': len(serializer.data), 'next': None, 'previous': None})
     
     @action(detail=True, methods=['get'], url_path='symbol/(?P<ticker>[^/.]+)')
     def by_symbol(self, request, pk=None, ticker=None):

@@ -64,3 +64,4 @@ Sempre reinicie os workers Celery após:
 
 
 
+

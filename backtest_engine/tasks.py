@@ -159,19 +159,60 @@ def run_backtest_task(self, backtest_id):
                     trade_metadata = {}
                 trade_metadata['position_mode'] = position_mode
                 
+                # Convert numpy types to Python native types to avoid Django field validation errors
+                def convert_value(value):
+                    """Convert numpy/pandas types to Python native types"""
+                    if value is None:
+                        return None
+                    import numpy as np
+                    # Handle numpy arrays first (before checking other numpy types)
+                    if isinstance(value, np.ndarray):
+                        # For arrays, return None or handle appropriately
+                        if value.size == 0:
+                            return None
+                        if value.size == 1:
+                            return float(value.item())
+                        # Multiple values - this shouldn't happen for a single field
+                        return None
+                    # Handle numpy scalars
+                    if isinstance(value, (np.integer, np.floating)):
+                        return float(value)
+                    # Handle numpy types that have .item() method
+                    if hasattr(value, 'item') and not isinstance(value, (str, list, dict)):
+                        try:
+                            return float(value.item())
+                        except (ValueError, AttributeError):
+                            pass
+                    # Handle pandas types
+                    if hasattr(value, 'iloc'):  # pandas Series/DataFrame
+                        try:
+                            return float(value)
+                        except (ValueError, TypeError):
+                            pass
+                    # If it's already a Python native type, return as is
+                    if isinstance(value, (int, float, str, bool)):
+                        return value
+                    # Try to convert to float as last resort
+                    try:
+                        return float(value)
+                    except (ValueError, TypeError):
+                        # If all else fails, return None (safer than passing invalid type)
+                        logger.warning(f"Could not convert value {type(value)} to Python native type, using None")
+                        return None
+                
                 Trade.objects.create(
                     backtest=backtest,
                     symbol=trade_data['symbol'],
                     trade_type=trade_data['trade_type'],
-                    entry_price=trade_data['entry_price'],
-                    exit_price=trade_data.get('exit_price'),
+                    entry_price=convert_value(trade_data['entry_price']),
+                    exit_price=convert_value(trade_data.get('exit_price')),
                     entry_timestamp=trade_data['entry_timestamp'],
                     exit_timestamp=trade_data.get('exit_timestamp'),
-                    quantity=trade_data['quantity'],
-                    pnl=trade_data.get('pnl'),
-                    pnl_percentage=trade_data.get('pnl_percentage'),
+                    quantity=convert_value(trade_data['quantity']),
+                    pnl=convert_value(trade_data.get('pnl')),
+                    pnl_percentage=convert_value(trade_data.get('pnl_percentage')),
                     is_winner=trade_data.get('is_winner'),
-                    max_drawdown=trade_data.get('max_drawdown'),
+                    max_drawdown=convert_value(trade_data.get('max_drawdown')),
                     metadata=trade_metadata
                 )
         
