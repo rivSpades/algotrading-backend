@@ -137,6 +137,66 @@ class SymbolViewSet(viewsets.ModelViewSet):
         from .services.indicator_service import compute_indicators_for_ohlcv
         full_indicator_values = compute_indicators_for_ohlcv(symbol, full_ohlcv_list)
         
+        # If strategy_id or backtest_id is provided, also compute strategy's required indicators
+        strategy_id = request.query_params.get('strategy_id')
+        backtest_id = request.query_params.get('backtest_id')
+        
+        if strategy_id or backtest_id:
+            try:
+                from strategies.models import StrategyDefinition
+                from backtest_engine.models import Backtest
+                strategy = None
+                
+                # Prefer backtest_id over strategy_id (backtest has the actual strategy instance)
+                if backtest_id:
+                    try:
+                        backtest_id_int = int(backtest_id)
+                        backtest = Backtest.objects.get(id=backtest_id_int)
+                        strategy = backtest.strategy
+                        import logging
+                        logger = logging.getLogger(__name__)
+                        logger.info(f"Found strategy from backtest {backtest_id_int}: {strategy.name} (id={strategy.id})")
+                    except (Backtest.DoesNotExist, ValueError, TypeError) as e:
+                        import logging
+                        logger = logging.getLogger(__name__)
+                        logger.warning(f"Could not find backtest {backtest_id}: {str(e)}")
+                        pass
+                
+                # If no strategy from backtest, try strategy_id
+                if not strategy and strategy_id:
+                    try:
+                        strategy_id_int = int(strategy_id)
+                        strategy = StrategyDefinition.objects.get(id=strategy_id_int)
+                        import logging
+                        logger = logging.getLogger(__name__)
+                        logger.info(f"Found strategy from strategy_id {strategy_id_int}: {strategy.name}")
+                    except (StrategyDefinition.DoesNotExist, ValueError, TypeError) as e:
+                        import logging
+                        logger = logging.getLogger(__name__)
+                        logger.warning(f"Could not find strategy {strategy_id}: {str(e)}")
+                        pass
+                
+                if strategy and strategy.required_tool_configs:
+                    # Compute strategy's required indicators
+                    from .services.indicator_service import compute_strategy_indicators_for_ohlcv
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.info(f"Computing strategy indicators for strategy {strategy.name} (id={strategy.id}) with {len(strategy.required_tool_configs)} tool configs")
+                    strategy_indicator_values = compute_strategy_indicators_for_ohlcv(
+                        strategy, full_ohlcv_list, symbol
+                    )
+                    # Log computed strategy indicators
+                    logger.info(f"Computed {len(strategy_indicator_values)} strategy indicators: {list(strategy_indicator_values.keys())}")
+                    # Merge strategy indicators with existing indicators (strategy indicators take precedence)
+                    full_indicator_values.update(strategy_indicator_values)
+                    logger.info(f"Total indicators after merge: {len(full_indicator_values)} keys: {list(full_indicator_values.keys())[:10]}")
+            except Exception as e:
+                # Log error but don't break the OHLCV endpoint
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f"Error computing strategy indicators: {str(e)}")
+                # Continue without strategy indicators - regular indicators will still work
+        
         # Create timestamp to index mapping for paginated results
         # Build a mapping from serialized timestamp strings to indices in full_ohlcv_list
         # full_ohlcv_list is ordered by timestamp (ascending), same as indicator computation
@@ -160,8 +220,19 @@ class SymbolViewSet(viewsets.ModelViewSet):
         
         # Add indicator values to paginated results
         indicators_metadata = {}
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"Adding {len(full_indicator_values)} indicators to {len(results)} paginated results. Indicator keys: {list(full_indicator_values.keys())[:20]}")
+        
         for indicator_key, indicator_data in full_indicator_values.items():
             full_values = indicator_data['values']
+            
+            # Skip if no values
+            if not full_values:
+                logger.warning(f"Skipping indicator {indicator_key} - no values")
+                continue
+            
+            logger.debug(f"Processing indicator {indicator_key} with {len(full_values)} values")
             
             # Extract values for paginated results by matching timestamps
             for result in results:
@@ -195,6 +266,10 @@ class SymbolViewSet(viewsets.ModelViewSet):
                 'line_width': indicator_data['line_width'],
                 'subchart': indicator_data.get('subchart', False)
             }
+            
+            # Log that we added this indicator
+            if 'SMA' in indicator_key:
+                logger.info(f"Added SMA indicator {indicator_key} to results. Sample values: {[v for v in full_values[:5] if v is not None]}")
 
         # Calculate statistics (volatility, etc.) from full dataset
         from analytical_tools.statistics import calculate_statistics, get_benchmark_ticker

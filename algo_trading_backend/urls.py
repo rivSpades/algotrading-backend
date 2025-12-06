@@ -21,4 +21,6 @@ urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/', include('market_data.urls')),
     path('api/', include('analytical_tools.urls')),
+    path('api/', include('strategies.urls')),
+    path('api/', include('backtest_engine.urls')),
 ]

@@ -195,3 +195,129 @@ def compute_indicators_for_ohlcv(symbol, ohlcv_data):
     
     return indicator_values
 
+
+def compute_strategy_indicators_for_ohlcv(strategy, ohlcv_data, symbol):
+    """
+    Compute strategy's required indicators for OHLCV data
+    
+    Args:
+        strategy: StrategyDefinition instance
+        ohlcv_data: List of OHLCV dicts with timestamp, open, high, low, close, volume
+        symbol: Symbol instance (for logging)
+    
+    Returns:
+        Dictionary mapping indicator names to their values aligned with ohlcv_data
+    """
+    if not strategy.required_tool_configs or not ohlcv_data:
+        return {}
+    
+    # Convert to DataFrame
+    df = pd.DataFrame(ohlcv_data)
+    
+    # Ensure timestamp is datetime
+    if 'timestamp' in df.columns:
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+    
+    # Sort by timestamp (ascending for proper indicator calculation)
+    df = df.sort_values('timestamp').reset_index(drop=True)
+    
+    # Store original order indices for alignment
+    original_indices = list(range(len(df)))
+    
+    # Get strategy parameters
+    strategy_params = strategy.default_parameters or {}
+    
+    # Compute each required indicator
+    indicator_values = {}
+    
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"Processing {len(strategy.required_tool_configs)} tool configs for strategy {strategy.name}")
+    
+    for idx, tool_config in enumerate(strategy.required_tool_configs, 1):
+        logger.info(f"Processing tool config {idx}/{len(strategy.required_tool_configs)}: {tool_config.get('tool_name')} with params {tool_config.get('parameters')}")
+        tool_name = tool_config.get('tool_name')
+        if not tool_name:
+            continue
+        
+        # Resolve parameters from strategy params
+        parameters = tool_config.get('parameters', {}).copy()
+        parameter_mapping = tool_config.get('parameter_mapping', {})
+        
+        # Map strategy parameters to tool parameters
+        for tool_param, strategy_param in parameter_mapping.items():
+            if strategy_params.get(strategy_param) is not None:
+                parameters[tool_param] = strategy_params[strategy_param]
+        
+        try:
+            # Create indicator key
+            period = parameters.get('period', '')
+            indicator_key = f"{tool_name}_{period}" if period else tool_name
+            
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"Computing strategy indicator {indicator_key} for {symbol.ticker} with parameters: {parameters}")
+            
+            # Compute indicator - use a copy of df to avoid modifying the original
+            result_df = compute_indicator(
+                tool_name=tool_name,
+                ohlcv_data=df.copy(),  # Use copy to ensure each computation is independent
+                parameters=parameters
+            )
+            
+            logger.info(f"Indicator computation result for {indicator_key}: {len(result_df)} rows, columns: {list(result_df.columns)}")
+            
+            # Extract values
+            values = []
+            for idx in original_indices:
+                if idx < len(result_df):
+                    value = result_df.iloc[idx]['value']
+                    if pd.notna(value):
+                        values.append(float(value))
+                    else:
+                        values.append(None)
+                else:
+                    values.append(None)
+            
+            non_null_count = sum(1 for v in values if v is not None)
+            logger.info(f"Extracted {len(values)} values for {indicator_key}, {non_null_count} non-null")
+            
+            # Get display name from tool config
+            display_name = tool_config.get('display_name', tool_name)
+            
+            # Get style from tool config
+            style = tool_config.get('style', {})
+            
+            indicator_values[indicator_key] = {
+                'values': values,
+                'display_name': display_name,
+                'color': style.get('color', '#3B82F6'),
+                'line_width': style.get('line_width', 2),
+                'subchart': tool_config.get('subchart', False),
+            }
+            
+            # Also create alternative key without underscores for compatibility (e.g., SMA_50 -> SMA50)
+            # Replace ALL underscores, not just the first one
+            alt_key = indicator_key.replace('_', '')
+            if alt_key != indicator_key:
+                indicator_values[alt_key] = {
+                    'values': values,  # Same values array
+                    'display_name': display_name,
+                    'color': style.get('color', '#3B82F6'),
+                    'line_width': style.get('line_width', 2),
+                    'subchart': tool_config.get('subchart', False),
+                }
+            
+            logger.info(f"Successfully computed strategy indicator {indicator_key} (alt: {alt_key}) for {symbol.ticker}: {len(values)} values, {non_null_count} non-null")
+                
+        except Exception as e:
+            import traceback
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Error computing strategy indicator {tool_name} for {symbol.ticker} with parameters {parameters}: {str(e)}")
+            logger.error(traceback.format_exc())
+            continue
+    
+    logger.info(f"Completed processing strategy indicators. Computed {len(indicator_values)} indicators: {list(indicator_values.keys())}")
+    return indicator_values
+

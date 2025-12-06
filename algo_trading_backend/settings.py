@@ -46,6 +46,8 @@ INSTALLED_APPS = [
     # Local apps
     'market_data',
     'analytical_tools',
+    'strategies',
+    'backtest_engine',
 ]
 
 MIDDLEWARE = [
