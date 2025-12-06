@@ -35,8 +35,15 @@ class ToolDefinition(models.Model):
 
 
 class ToolAssignment(models.Model):
-    """Assignment of a tool to a symbol with specific parameters"""
-    symbol = models.ForeignKey(Symbol, on_delete=models.CASCADE, related_name='tool_assignments')
+    """Assignment of a tool to a symbol (or global) with specific parameters"""
+    symbol = models.ForeignKey(
+        Symbol, 
+        on_delete=models.CASCADE, 
+        related_name='tool_assignments',
+        null=True,
+        blank=True,
+        help_text="If None, this assignment applies to all symbols globally"
+    )
     tool = models.ForeignKey(ToolDefinition, on_delete=models.CASCADE, related_name='assignments')
     parameters = models.JSONField(default=dict, blank=True)
     enabled = models.BooleanField(default=True)
@@ -54,16 +61,23 @@ class ToolAssignment(models.Model):
 
     class Meta:
         ordering = ['-created_at']
-        unique_together = [['symbol', 'tool']]
+        # unique_together doesn't work well with nullable fields, use UniqueConstraint instead
+        constraints = [
+            models.UniqueConstraint(fields=['symbol', 'tool'], name='unique_symbol_tool'),
+            models.UniqueConstraint(fields=['tool'], condition=models.Q(symbol__isnull=True), name='unique_global_tool'),
+        ]
         indexes = [
             models.Index(fields=['symbol', 'enabled']),
             models.Index(fields=['tool']),
+            models.Index(fields=['enabled'], condition=models.Q(symbol__isnull=True), name='analyt_global_idx'),
         ]
         verbose_name = 'Tool Assignment'
         verbose_name_plural = 'Tool Assignments'
 
     def __str__(self):
-        return f"{self.symbol.ticker} - {self.tool.name}"
+        if self.symbol:
+            return f"{self.symbol.ticker} - {self.tool.name}"
+        return f"Global - {self.tool.name}"
 
 
 class IndicatorValue(models.Model):

@@ -8,6 +8,7 @@ from datetime import datetime
 from django.utils import timezone
 from django.db import transaction
 from ..models import Symbol, OHLCV, Provider
+from .data_validation import validate_ohlcv_data
 
 
 class OHLCVService:
@@ -58,8 +59,35 @@ class OHLCVService:
                 'total': int
             }
         """
+        # Validate data before saving
+        is_valid, validation_reason = validate_ohlcv_data(ohlcv_data)
+        
         if not ohlcv_data:
-            return {'created': 0, 'updated': 0, 'errors': 0, 'total': 0}
+            # Mark as invalid if no data
+            symbol.validation_status = 'invalid'
+            symbol.validation_reason = 'No data provided'
+            symbol.status = 'disabled'
+            symbol.save(update_fields=['validation_status', 'validation_reason', 'status'])
+            return {
+                'created': 0, 
+                'updated': 0, 
+                'errors': 0, 
+                'total': 0,
+                'validation_passed': False,
+                'validation_reason': 'No data provided'
+            }
+        
+        # Update symbol validation status
+        symbol.validation_status = 'valid' if is_valid else 'invalid'
+        symbol.validation_reason = validation_reason if not is_valid else ''
+        
+        # Set symbol status based on validation
+        if is_valid:
+            symbol.status = 'active'
+        else:
+            symbol.status = 'disabled'
+        
+        symbol.save(update_fields=['validation_status', 'validation_reason', 'status'])
         
         # Get or set provider
         if provider is None:
@@ -127,7 +155,9 @@ class OHLCVService:
             'created': created_count,
             'updated': updated_count,
             'errors': error_count,
-            'total': len(ohlcv_data)
+            'total': len(ohlcv_data),
+            'validation_passed': is_valid,
+            'validation_reason': validation_reason
         }
 
 

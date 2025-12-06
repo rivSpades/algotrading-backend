@@ -27,12 +27,13 @@ class ToolAssignmentSerializer(serializers.ModelSerializer):
     tool_name = serializers.CharField(write_only=True, required=False)
     symbol = SymbolListSerializer(read_only=True)
     symbol_ticker = serializers.CharField(write_only=True, required=False)
+    is_global = serializers.BooleanField(write_only=True, required=False, default=False)
 
     class Meta:
         model = ToolAssignment
         fields = [
             'id', 'symbol', 'symbol_ticker', 'tool', 'tool_id', 'tool_name',
-            'parameters', 'enabled', 'subchart', 'style', 'created_at', 'updated_at'
+            'parameters', 'enabled', 'subchart', 'style', 'is_global', 'created_at', 'updated_at'
         ]
         read_only_fields = ['created_at', 'updated_at']
 
@@ -40,14 +41,20 @@ class ToolAssignmentSerializer(serializers.ModelSerializer):
         symbol_ticker = validated_data.pop('symbol_ticker', None)
         tool_id = validated_data.pop('tool_id', None)
         tool_name = validated_data.pop('tool_name', None)
+        is_global = validated_data.pop('is_global', False)
         
         # Ensure tool definitions exist in database
         ensure_tool_definitions_exist()
         
-        if symbol_ticker:
+        # If is_global is True, don't set symbol (global assignment)
+        # If symbol_ticker is provided and is_global is False, set symbol (symbol-specific)
+        if not is_global and symbol_ticker:
             from market_data.models import Symbol
             symbol = Symbol.objects.get(ticker=symbol_ticker)
             validated_data['symbol'] = symbol
+        elif is_global:
+            # Global assignment - symbol should be None
+            validated_data['symbol'] = None
         
         # Get tool by ID or name, auto-create from config if needed
         if tool_id:
@@ -76,11 +83,16 @@ class ToolAssignmentSerializer(serializers.ModelSerializer):
         symbol_ticker = validated_data.pop('symbol_ticker', None)
         tool_id = validated_data.pop('tool_id', None)
         tool_name = validated_data.pop('tool_name', None)
+        is_global = validated_data.pop('is_global', None)
         
-        if symbol_ticker:
-            from market_data.models import Symbol
-            symbol = Symbol.objects.get(ticker=symbol_ticker)
-            validated_data['symbol'] = symbol
+        # Handle global assignment updates
+        if is_global is not None:
+            if is_global:
+                validated_data['symbol'] = None
+            elif symbol_ticker:
+                from market_data.models import Symbol
+                symbol = Symbol.objects.get(ticker=symbol_ticker)
+                validated_data['symbol'] = symbol
         
         if tool_id:
             tool = ToolDefinition.objects.get(id=tool_id)

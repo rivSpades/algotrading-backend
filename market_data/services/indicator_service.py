@@ -24,11 +24,12 @@ def compute_indicators_for_ohlcv(symbol, ohlcv_data):
             ...
         }
     """
-    # Get enabled tool assignments for this symbol
+    # Get enabled tool assignments: both global (symbol=None) and symbol-specific
+    from django.db.models import Q
     assignments = ToolAssignment.objects.filter(
-        symbol=symbol,
+        Q(symbol=symbol) | Q(symbol__isnull=True),
         enabled=True
-    ).select_related('tool')
+    ).select_related('tool').order_by('symbol')  # Symbol-specific first, then global
     
     if not assignments.exists() or not ohlcv_data:
         return {}

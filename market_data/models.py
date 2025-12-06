@@ -67,6 +67,20 @@ class Symbol(models.Model):
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='disabled')
     name = models.CharField(max_length=200, blank=True)
     description = models.TextField(blank=True)
+    validation_status = models.CharField(
+        max_length=20,
+        choices=[
+            ('valid', 'Valid'),
+            ('invalid', 'Invalid'),
+            ('pending', 'Pending Validation'),
+        ],
+        default='pending',
+        help_text="Data validation status"
+    )
+    validation_reason = models.TextField(
+        blank=True,
+        help_text="Reason why data validation failed (if invalid)"
+    )
     last_updated = models.DateTimeField(default=timezone.now)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

@@ -36,7 +36,8 @@ class SymbolSerializer(serializers.ModelSerializer):
         model = Symbol
         fields = [
             'ticker', 'exchange', 'provider', 'type', 'status', 'name',
-            'description', 'last_updated', 'created_at', 'updated_at',
+            'description', 'validation_status', 'validation_reason',
+            'last_updated', 'created_at', 'updated_at',
             'exchange_code', 'provider_code'
         ]
         read_only_fields = ['created_at', 'updated_at', 'last_updated']
@@ -79,7 +80,7 @@ class SymbolListSerializer(serializers.ModelSerializer):
         model = Symbol
         fields = [
             'ticker', 'exchange', 'exchange_name', 'type', 'status',
-            'name', 'last_updated'
+            'name', 'validation_status', 'validation_reason', 'last_updated'
         ]
 
 

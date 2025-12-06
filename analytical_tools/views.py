@@ -88,11 +88,20 @@ class ToolAssignmentViewSet(viewsets.ModelViewSet):
     ordering = ['-created_at']
 
     def get_queryset(self):
-        """Filter by symbol if symbol_ticker is provided"""
+        """Filter by symbol if symbol_ticker is provided, or show global if requested"""
         queryset = super().get_queryset()
         symbol_ticker = self.request.query_params.get('symbol_ticker', None)
+        show_global = self.request.query_params.get('global', 'false').lower() == 'true'
+        
         if symbol_ticker:
-            queryset = queryset.filter(symbol__ticker=symbol_ticker)
+            # Show both symbol-specific and global assignments for this symbol
+            from django.db.models import Q
+            queryset = queryset.filter(Q(symbol__ticker=symbol_ticker) | Q(symbol__isnull=True))
+        elif show_global:
+            # Show only global assignments
+            queryset = queryset.filter(symbol__isnull=True)
+        # If neither, show all assignments
+        
         return queryset
 
     def perform_create(self, serializer):
@@ -105,8 +114,9 @@ class ToolAssignmentViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'], url_path='symbol/(?P<symbol_ticker>[^/.]+)')
     def by_symbol(self, request, symbol_ticker=None):
-        """Get all tool assignments for a specific symbol"""
-        assignments = self.queryset.filter(symbol__ticker=symbol_ticker)
+        """Get all tool assignments for a specific symbol (includes global assignments)"""
+        from django.db.models import Q
+        assignments = self.queryset.filter(Q(symbol__ticker=symbol_ticker) | Q(symbol__isnull=True))
         serializer = self.get_serializer(assignments, many=True)
         return Response(serializer.data)
 

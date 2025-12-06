@@ -245,18 +245,130 @@ def calculate_bollinger_phase(ohlcv_data: List[Dict], period: int = 20, num_std:
         return None
 
 
-def calculate_statistics(ohlcv_data: List[Dict]) -> Dict:
+def get_benchmark_ticker(exchange_code: str) -> Optional[str]:
+    """
+    Get benchmark ticker for an exchange
+    
+    Args:
+        exchange_code: Exchange code (e.g., 'US', 'NASDAQ', 'NYSE')
+    
+    Returns:
+        Benchmark ticker (e.g., '^GSPC' for US exchanges) or None
+    """
+    # Mapping of exchange codes to benchmark tickers
+    benchmark_map = {
+        'US': '^GSPC',  # S&P 500 for US stocks
+        'NASDAQ': '^GSPC',
+        'NYSE': '^GSPC',
+        # Add more exchanges as needed
+    }
+    
+    # Check exact match first
+    if exchange_code in benchmark_map:
+        return benchmark_map[exchange_code]
+    
+    # Check if exchange code contains 'US' (for variations like 'US-NASDAQ')
+    if 'US' in exchange_code.upper():
+        return '^GSPC'
+    
+    return None
+
+
+def calculate_beta(stock_ohlcv_data: List[Dict], benchmark_ohlcv_data: List[Dict]) -> Optional[float]:
+    """
+    Calculate beta (slope) of stock returns relative to benchmark returns
+    
+    Beta measures the stock's volatility relative to the market:
+    - Beta > 1: Stock is more volatile than the market
+    - Beta = 1: Stock moves with the market
+    - Beta < 1: Stock is less volatile than the market
+    - Beta < 0: Stock moves inversely to the market (rare)
+    
+    Args:
+        stock_ohlcv_data: List of OHLCV dicts for the stock
+        benchmark_ohlcv_data: List of OHLCV dicts for the benchmark
+    
+    Returns:
+        Beta value as float, or None if insufficient data
+    """
+    if not stock_ohlcv_data or not benchmark_ohlcv_data or len(stock_ohlcv_data) < 2 or len(benchmark_ohlcv_data) < 2:
+        return None
+    
+    try:
+        # Convert to DataFrames
+        stock_df = pd.DataFrame(stock_ohlcv_data)
+        benchmark_df = pd.DataFrame(benchmark_ohlcv_data)
+        
+        # Ensure timestamp is datetime
+        if 'timestamp' in stock_df.columns:
+            stock_df['timestamp'] = pd.to_datetime(stock_df['timestamp'], errors='coerce', format='mixed')
+        if 'timestamp' in benchmark_df.columns:
+            benchmark_df['timestamp'] = pd.to_datetime(benchmark_df['timestamp'], errors='coerce', format='mixed')
+        
+        # Sort by timestamp
+        stock_df = stock_df.sort_values('timestamp').reset_index(drop=True)
+        benchmark_df = benchmark_df.sort_values('timestamp').reset_index(drop=True)
+        
+        # Merge on timestamp to align data
+        merged_df = pd.merge(
+            stock_df[['timestamp', 'close']],
+            benchmark_df[['timestamp', 'close']],
+            on='timestamp',
+            how='inner',
+            suffixes=('_stock', '_benchmark')
+        )
+        
+        if len(merged_df) < 2:
+            return None
+        
+        # Calculate returns (percentage change)
+        merged_df['close_stock'] = pd.to_numeric(merged_df['close_stock'], errors='coerce')
+        merged_df['close_benchmark'] = pd.to_numeric(merged_df['close_benchmark'], errors='coerce')
+        
+        merged_df['returns_stock'] = merged_df['close_stock'].pct_change()
+        merged_df['returns_benchmark'] = merged_df['close_benchmark'].pct_change()
+        
+        # Remove NaN values (first row will be NaN)
+        returns_df = merged_df[['returns_stock', 'returns_benchmark']].dropna()
+        
+        if len(returns_df) < 2:
+            return None
+        
+        # Calculate beta using covariance/variance formula
+        # Beta = Covariance(stock_returns, benchmark_returns) / Variance(benchmark_returns)
+        covariance = returns_df['returns_stock'].cov(returns_df['returns_benchmark'])
+        benchmark_variance = returns_df['returns_benchmark'].var()
+        
+        if benchmark_variance == 0 or pd.isna(benchmark_variance):
+            return None
+        
+        beta = covariance / benchmark_variance
+        
+        # Return as float, rounded to 3 decimal places
+        return round(float(beta), 3) if not pd.isna(beta) else None
+        
+    except Exception as e:
+        print(f"Error calculating beta: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def calculate_statistics(ohlcv_data: List[Dict], symbol=None, benchmark_ohlcv_data: Optional[List[Dict]] = None) -> Dict:
     """
     Calculate all statistics for a symbol's OHLCV data
     
     Args:
         ohlcv_data: List of OHLCV dicts with timestamp, open, high, low, close, volume
+        symbol: Symbol instance (optional, for future use)
+        benchmark_ohlcv_data: Benchmark OHLCV data (optional, for beta calculation)
     
     Returns:
         Dictionary with statistics:
         {
             'volatility': float,  # Standard deviation of returns in %
             'mean_price': float,  # Mean closing price
+            'beta': float,  # Beta relative to benchmark
             'bollinger_phase': str,  # Current Bollinger Band phase
             ...
         }
@@ -272,6 +384,12 @@ def calculate_statistics(ohlcv_data: List[Dict]) -> Dict:
     volatility = calculate_volatility(ohlcv_data)
     if volatility is not None:
         stats['volatility'] = volatility
+    
+    # Calculate beta if benchmark data is provided
+    if benchmark_ohlcv_data:
+        beta = calculate_beta(ohlcv_data, benchmark_ohlcv_data)
+        if beta is not None:
+            stats['beta'] = beta
     
     # Calculate Bollinger Band phase (if we have enough data)
     # Always try to calculate phase - it will return None if insufficient data

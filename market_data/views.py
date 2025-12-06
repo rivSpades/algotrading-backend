@@ -58,6 +58,22 @@ class SymbolViewSet(viewsets.ModelViewSet):
     ordering_fields = ['ticker', 'last_updated', 'created_at']
     ordering = ['ticker']
 
+    def get_queryset(self):
+        """Filter by exchange and status if provided"""
+        queryset = super().get_queryset()
+        
+        # Filter by exchange code
+        exchange_code = self.request.query_params.get('exchange', None)
+        if exchange_code:
+            queryset = queryset.filter(exchange__code=exchange_code)
+        
+        # Filter by status
+        status = self.request.query_params.get('status', None)
+        if status:
+            queryset = queryset.filter(status=status)
+        
+        return queryset
+
     def get_serializer_class(self):
         if self.action == 'list':
             return SymbolListSerializer
@@ -181,8 +197,64 @@ class SymbolViewSet(viewsets.ModelViewSet):
             }
 
         # Calculate statistics (volatility, etc.) from full dataset
-        from analytical_tools.statistics import calculate_statistics
-        statistics = calculate_statistics(full_ohlcv_list)
+        from analytical_tools.statistics import calculate_statistics, get_benchmark_ticker
+        
+        # Get benchmark data for beta calculation
+        benchmark_ohlcv_data = None
+        benchmark_ticker = get_benchmark_ticker(symbol.exchange.code)
+        if benchmark_ticker:
+            try:
+                # Get benchmark symbol
+                benchmark_symbol = Symbol.objects.filter(ticker=benchmark_ticker).first()
+                if benchmark_symbol:
+                    # Get overlapping date range between stock and benchmark
+                    # This ensures we only calculate beta for dates where both have data
+                    stock_dates = full_queryset.values_list('timestamp', flat=True).order_by('timestamp')
+                    benchmark_dates = OHLCV.objects.filter(
+                        symbol=benchmark_symbol,
+                        timeframe=timeframe
+                    ).values_list('timestamp', flat=True).order_by('timestamp')
+                    
+                    if stock_dates.exists() and benchmark_dates.exists():
+                        # Find overlapping date range
+                        stock_min = stock_dates.first()
+                        stock_max = stock_dates.last()
+                        benchmark_min = benchmark_dates.first()
+                        benchmark_max = benchmark_dates.last()
+                        
+                        overlap_start = max(stock_min, benchmark_min)
+                        overlap_end = min(stock_max, benchmark_max)
+                        
+                        # Get benchmark OHLCV data for the overlapping date range
+                        benchmark_queryset = OHLCV.objects.filter(
+                            symbol=benchmark_symbol,
+                            timeframe=timeframe,
+                            timestamp__gte=overlap_start,
+                            timestamp__lte=overlap_end
+                        )
+                        
+                        benchmark_queryset_ordered = benchmark_queryset.order_by('timestamp')
+                        benchmark_ohlcv_list = []
+                        for ohlcv in benchmark_queryset_ordered.values('timestamp', 'open', 'high', 'low', 'close', 'volume'):
+                            timestamp = ohlcv['timestamp']
+                            if hasattr(timestamp, 'isoformat'):
+                                timestamp = timestamp.isoformat()
+                            benchmark_ohlcv_list.append({
+                                'timestamp': timestamp,
+                                'open': float(ohlcv['open']),
+                                'high': float(ohlcv['high']),
+                                'low': float(ohlcv['low']),
+                                'close': float(ohlcv['close']),
+                                'volume': float(ohlcv['volume'])
+                            })
+                        if benchmark_ohlcv_list:
+                            benchmark_ohlcv_data = benchmark_ohlcv_list
+            except Exception as e:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f"Error fetching benchmark data for beta calculation: {str(e)}")
+        
+        statistics = calculate_statistics(full_ohlcv_list, symbol=symbol, benchmark_ohlcv_data=benchmark_ohlcv_data)
         
         # Debug: Log statistics to see what's being calculated
         import logging
