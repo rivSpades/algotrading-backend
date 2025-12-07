@@ -272,13 +272,20 @@ class BacktestViewSet(viewsets.ModelViewSet):
         
         return Response(result)
     
-    @action(detail=True, methods=['get'], url_path='symbols')
+    @action(detail=True, methods=['get'], url_path='symbol-list')
     def symbols(self, request, pk=None):
         """Get paginated list of symbols associated with this backtest (with search support)"""
         from market_data.serializers import SymbolListSerializer
         
         # Get backtest - ensure we have the object
-        backtest = self.get_object()
+        # Use pk from kwargs if available, otherwise use pk parameter
+        lookup_pk = self.kwargs.get('pk', pk)
+        try:
+            backtest = self.get_object()
+        except Exception:
+            # Try to get backtest directly if get_object() fails
+            from .models import Backtest
+            backtest = Backtest.objects.get(pk=lookup_pk)
         
         # Get unique symbols from the backtest (ManyToMany relationship)
         symbols_queryset = backtest.symbols.all().order_by('ticker')
@@ -286,11 +293,13 @@ class BacktestViewSet(viewsets.ModelViewSet):
         # Apply search filter if provided
         search = request.query_params.get('search', None)
         if search:
-            symbols_queryset = symbols_queryset.filter(ticker__icontains=search)
-        
-        # Log for debugging
-        symbol_count = symbols_queryset.count()
-        logger.info(f"Backtest {pk} has {symbol_count} symbols (search: {search})")
+            # Trim whitespace and ensure search is not empty
+            search = search.strip()
+            if search:
+                symbols_queryset = symbols_queryset.filter(ticker__icontains=search)
+            else:
+                # If search is only whitespace, treat as no search
+                search = None
         
         # Apply pagination
         paginator = PageNumberPagination()
@@ -302,17 +311,15 @@ class BacktestViewSet(viewsets.ModelViewSet):
         if page is not None:
             # Serialize symbols to return full symbol objects
             serializer = SymbolListSerializer(page, many=True)
-            logger.info(f"Returning {len(serializer.data)} symbols on page {request.query_params.get('page', 1)}")
             # Get pagination metadata
             paginated_response = paginator.get_paginated_response(serializer.data)
             return paginated_response
         
         # Fallback if pagination not requested - return all as array
         serializer = SymbolListSerializer(symbols_queryset, many=True)
-        logger.info(f"Returning {len(serializer.data)} symbols (no pagination)")
         return Response({'results': serializer.data, 'count': len(serializer.data), 'next': None, 'previous': None})
     
-    @action(detail=True, methods=['get'], url_path='symbol/(?P<ticker>[^/.]+)')
+    @action(detail=True, methods=['get'], url_path=r'symbol/(?P<ticker>[^/]+)/$')
     def by_symbol(self, request, pk=None, ticker=None):
         """Get backtest statistics for a specific symbol"""
         backtest = self.get_object()

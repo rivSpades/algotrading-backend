@@ -1,6 +1,7 @@
 """
 Data Validation Service
-Validates OHLCV data for quality issues: missing values, duplicates, outliers
+Validates OHLCV data for quality issues: missing values, duplicates, outliers,
+OHLCV logical constraints, and extreme single-day price jumps
 """
 
 import pandas as pd
@@ -16,6 +17,8 @@ def validate_ohlcv_data(ohlcv_data: List[Dict]) -> Tuple[bool, str]:
     1. Missing values (null or NaN)
     2. Duplicate timestamps
     3. Outliers in price data
+    4. Complete OHLCV logical constraints (High >= all, Low <= all)
+    5. Extreme single-day price jumps (>50%)
     
     Args:
         ohlcv_data: List of OHLCV dicts with timestamp, open, high, low, close, volume
@@ -86,6 +89,37 @@ def validate_ohlcv_data(ohlcv_data: List[Dict]) -> Tuple[bool, str]:
             if violation_count > 0:
                 outlier_checks.append(f"high < low violations: {violation_count}")
         
+        # Check complete OHLCV logical constraints
+        # High should be >= all prices (open, high, low, close)
+        # Low should be <= all prices (open, high, low, close)
+        logical_violations = []
+        
+        # Ensure all price columns are numeric
+        for col in ['open', 'high', 'low', 'close']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        # Check High >= all prices
+        if all(col in df.columns for col in ['high', 'open', 'low', 'close']):
+            high_vs_open = (df['high'] < df['open']).sum()
+            high_vs_close = (df['high'] < df['close']).sum()
+            if high_vs_open > 0:
+                logical_violations.append(f"high < open: {high_vs_open} violations")
+            if high_vs_close > 0:
+                logical_violations.append(f"high < close: {high_vs_close} violations")
+        
+        # Check Low <= all prices
+        if all(col in df.columns for col in ['low', 'open', 'high', 'close']):
+            low_vs_open = (df['low'] > df['open']).sum()
+            low_vs_close = (df['low'] > df['close']).sum()
+            if low_vs_open > 0:
+                logical_violations.append(f"low > open: {low_vs_open} violations")
+            if low_vs_close > 0:
+                logical_violations.append(f"low > close: {low_vs_close} violations")
+        
+        if logical_violations:
+            outlier_checks.append(f"OHLCV logical violations - {', '.join(logical_violations)}")
+        
         # Check for extreme outliers using IQR method (more robust than z-score)
         for col in ['open', 'high', 'low', 'close']:
             if col in df.columns:
@@ -108,6 +142,41 @@ def validate_ohlcv_data(ohlcv_data: List[Dict]) -> Tuple[bool, str]:
         
         if outlier_checks:
             reasons.append(f"Outliers detected - {', '.join(outlier_checks)}")
+        
+        # 4. Check for extreme single-day price jumps
+        # Price jumps >50% in a single day are not normal and indicate data quality issues
+        if len(df) > 1 and 'timestamp' in df.columns and 'close' in df.columns:
+            # Sort by timestamp to ensure chronological order
+            df_sorted = df.sort_values('timestamp').reset_index(drop=True)
+            df_sorted['close'] = pd.to_numeric(df_sorted['close'], errors='coerce')
+            
+            # Calculate day-to-day price changes
+            price_changes = df_sorted['close'].pct_change().abs()
+            
+            # Flag extreme jumps (>50% change)
+            extreme_jump_threshold = 0.50  # 50%
+            extreme_jumps = price_changes[price_changes > extreme_jump_threshold]
+            
+            if len(extreme_jumps) > 0:
+                jump_details = []
+                for idx in extreme_jumps.index:
+                    if idx > 0:
+                        prev_close = df_sorted.iloc[idx - 1]['close']
+                        curr_close = df_sorted.iloc[idx]['close']
+                        change_pct = price_changes.iloc[idx] * 100
+                        jump_date = df_sorted.iloc[idx]['timestamp']
+                        
+                        if pd.notna(prev_close) and pd.notna(curr_close):
+                            date_str = pd.to_datetime(jump_date).strftime('%Y-%m-%d') if pd.notna(jump_date) else 'N/A'
+                            jump_details.append(
+                                f"{date_str}: {prev_close:.4f}->{curr_close:.4f} ({change_pct:.2f}%)"
+                            )
+                
+                if jump_details:
+                    reasons.append(
+                        f"Extreme price jumps detected ({len(extreme_jumps)}): " + 
+                        "; ".join(jump_details[:5])  # Limit to first 5 to avoid very long messages
+                    )
         
         # Determine if data is valid
         is_valid = len(reasons) == 0

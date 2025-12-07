@@ -838,11 +838,17 @@ def delete_ohlcv_data_task(self, ticker: str):
         # Delete all OHLCV data for this symbol
         deleted_count, _ = OHLCV.objects.filter(symbol=symbol).delete()
         
+        # Disable the symbol after OHLCV data deletion
+        symbol.status = 'disabled'
+        symbol.validation_status = 'invalid'
+        symbol.validation_reason = 'OHLCV data has been deleted'
+        symbol.save(update_fields=['status', 'validation_status', 'validation_reason'])
+        
         connections.close_all()
         
         return {
             'progress': 100,
-            'message': f'Successfully deleted {deleted_count} OHLCV records for {ticker}',
+            'message': f'Successfully deleted {deleted_count} OHLCV records for {ticker} and disabled the symbol',
             'status': 'completed',
             'deleted_count': deleted_count
         }
@@ -887,6 +893,13 @@ def delete_ohlcv_data_multiple_symbols_task(self, tickers: List[str]):
                 symbol = Symbol.objects.get(ticker=ticker)
                 deleted_count, _ = OHLCV.objects.filter(symbol=symbol).delete()
                 total_deleted += deleted_count
+                
+                # Disable the symbol after OHLCV data deletion
+                symbol.status = 'disabled'
+                symbol.validation_status = 'invalid'
+                symbol.validation_reason = 'OHLCV data has been deleted'
+                symbol.save(update_fields=['status', 'validation_status', 'validation_reason'])
+                
                 results[ticker] = {'deleted': deleted_count, 'status': 'success'}
             except Symbol.DoesNotExist:
                 results[ticker] = {'deleted': 0, 'status': 'not_found'}
@@ -972,11 +985,19 @@ def delete_ohlcv_data_by_exchange_task(self, exchange_code: str):
         # Use a subquery to get all OHLCV records for symbols in this exchange
         deleted_count, _ = OHLCV.objects.filter(symbol__exchange=exchange).delete()
         
+        # Disable all symbols in this exchange after OHLCV data deletion
+        symbols = Symbol.objects.filter(exchange=exchange)
+        symbols.update(
+            status='disabled',
+            validation_status='invalid',
+            validation_reason='OHLCV data has been deleted'
+        )
+        
         connections.close_all()
         
         return {
             'progress': 100,
-            'message': f'Successfully deleted {deleted_count} OHLCV records for {total_symbols} symbols in exchange {exchange_code}',
+            'message': f'Successfully deleted {deleted_count} OHLCV records for {total_symbols} symbols in exchange {exchange_code} and disabled all symbols',
             'status': 'completed',
             'deleted_count': deleted_count,
             'symbols_count': total_symbols
