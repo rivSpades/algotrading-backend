@@ -211,8 +211,149 @@ class BacktestExecutor:
             logger.info(f"Computed {len(symbol_indicators)} indicators for {symbol.ticker}: {list(symbol_indicators.keys())}")
     
     def execute_strategy(self):
-        """Execute strategy logic and generate trades"""
+        """Execute strategy logic and generate trades
+        
+        For multi-symbol backtests, processes all symbols chronologically using shared portfolio capital.
+        For single-symbol backtests, uses symbol-specific capital.
+        """
         logger.info(f"Executing strategy: {self.strategy.name}")
+        
+        # Check if this is a multi-symbol backtest
+        is_multi_symbol = len(self.symbols) > 1
+        
+        if is_multi_symbol:
+            # For multi-symbol: process all symbols chronologically with shared capital
+            self._execute_strategy_multi_symbol()
+        else:
+            # For single symbol: process with symbol-specific capital (original logic)
+            self._execute_strategy_single_symbol()
+    
+    def _execute_strategy_single_symbol(self):
+        """Execute strategy for a single symbol (original implementation)"""
+        symbol = self.symbols[0]
+        
+        if symbol not in self.ohlcv_data:
+            return
+            
+        df = self.ohlcv_data[symbol]
+        indicators = self.indicators.get(symbol, {})
+        
+        # Validate we have data
+        if df.empty:
+            logger.warning(f"No data available for symbol {symbol.ticker}, skipping")
+            return
+        
+        # Split data into training and testing
+        split_idx = int(len(df) * self.split_ratio)
+        if split_idx >= len(df):
+            split_idx = max(0, len(df) - 1)
+        
+        train_df = df.iloc[:split_idx]
+        test_df = df.iloc[split_idx:]
+        
+        if test_df.empty:
+            logger.warning(f"No test data available for symbol {symbol.ticker} after split")
+            return
+        
+        # Initialize position tracking
+        position = None
+        initial_capital = float(self.backtest.initial_capital)
+        bet_size_pct = float(self.backtest.bet_size_percentage) / 100.0
+        capital = initial_capital
+        
+        # Initialize equity curve
+        if not train_df.empty:
+            first_timestamp = train_df.iloc[0]['timestamp']
+        elif not test_df.empty:
+            first_timestamp = test_df.iloc[0]['timestamp']
+        else:
+            first_timestamp = df.iloc[0]['timestamp']
+        
+        equity_curve = [(first_timestamp, initial_capital)]
+        
+        # Execute strategy on test data
+        prev_indicator_values = None
+        
+        logger.info(f"Executing strategy on {len(test_df)} test rows for {symbol.ticker}")
+        
+        for i, (idx, row) in enumerate(test_df.iterrows()):
+            timestamp = row['timestamp']
+            price = float(row['close']) if pd.notna(row['close']) else None
+            if price is None:
+                continue
+            
+            # Get indicator values
+            indicator_values = {}
+            for name, series in indicators.items():
+                if idx in series.index:
+                    try:
+                        value = series.loc[idx]
+                        if pd.notna(value):
+                            indicator_values[name] = float(value)
+                    except (KeyError, IndexError, TypeError):
+                        pass
+            
+            # For SMA crossover, we need both SMAs
+            fast_period = self.parameters.get('fast_period', 20)
+            slow_period = self.parameters.get('slow_period', 50)
+            fast_sma_key = f'SMA_{fast_period}'
+            slow_sma_key = f'SMA_{slow_period}'
+            
+            fast_sma = indicator_values.get(fast_sma_key)
+            slow_sma = indicator_values.get(slow_sma_key)
+            
+            if fast_sma is None or slow_sma is None:
+                if prev_indicator_values is None and indicator_values:
+                    prev_indicator_values = indicator_values.copy()
+                continue
+            
+            # Generate signal
+            signal = self._generate_signal(row, indicator_values, position, prev_indicator_values)
+            
+            if signal:
+                logger.info(f"[{self.position_mode.upper()}] Signal at {timestamp}: {signal}")
+            
+            if indicator_values:
+                prev_indicator_values = indicator_values.copy()
+            
+            # Execute trades based on signal (reuse existing logic)
+            capital, position, equity_curve = self._process_trade_signal(
+                symbol, timestamp, price, signal, position, capital, bet_size_pct, equity_curve, indicators, idx
+            )
+        
+        # Close any open position at the end
+        if position is not None:
+            final_price = float(test_df.iloc[-1]['close'])
+            final_timestamp = test_df.iloc[-1]['timestamp']
+            capital = self._close_position_at_end(symbol, position, final_price, final_timestamp, capital)
+            equity_curve.append((final_timestamp, float(capital)))
+        
+        # Store equity curve
+        self.equity_curves[symbol] = equity_curve
+    
+    def _execute_strategy_multi_symbol(self):
+        """Execute strategy for multiple symbols with shared portfolio capital
+        
+        Optimized version using price cache for fast lookups instead of DataFrame filtering.
+        """
+        logger.info(f"Executing multi-symbol strategy with shared capital for {len(self.symbols)} symbols")
+        
+        # Initialize shared portfolio capital
+        initial_capital = float(self.backtest.initial_capital)
+        bet_size_pct = float(self.backtest.bet_size_percentage) / 100.0
+        portfolio_capital = initial_capital
+        
+        # Track positions per symbol: {symbol: position_dict}
+        positions = {}  # {symbol: {'type': 'buy'|'sell', 'entry_price': float, ...}}
+        
+        # Track previous indicator values per symbol
+        prev_indicators = {}  # {symbol: {indicator_name: value}}
+        
+        # Prepare data for all symbols
+        symbol_data = {}  # {symbol: {'df': DataFrame, 'test_df': DataFrame, 'indicators': dict}}
+        
+        # Build timestamp-to-price lookup dictionaries for fast access (O(1) instead of O(n) DataFrame filtering)
+        symbol_price_cache = {}  # {symbol: {timestamp: price}}
         
         for symbol in self.symbols:
             if symbol not in self.ohlcv_data:
@@ -221,329 +362,389 @@ class BacktestExecutor:
             df = self.ohlcv_data[symbol]
             indicators = self.indicators.get(symbol, {})
             
-            # Validate we have data
             if df.empty:
-                logger.warning(f"No data available for symbol {symbol.ticker}, skipping")
                 continue
             
-            # Split data into training and testing
+            # Split data
             split_idx = int(len(df) * self.split_ratio)
-            # Ensure we have at least some test data (minimum 1 row)
             if split_idx >= len(df):
                 split_idx = max(0, len(df) - 1)
             
             train_df = df.iloc[:split_idx]
             test_df = df.iloc[split_idx:]
             
-            # Validate we have test data
             if test_df.empty:
-                logger.warning(f"No test data available for symbol {symbol.ticker} after split (split_idx={split_idx}, total_rows={len(df)}), skipping")
                 continue
             
-            # Initialize position tracking
-            position = None  # {'type': 'buy'|'sell', 'entry_price': float, 'entry_timestamp': datetime, 'quantity': float}
-            initial_capital = float(self.backtest.initial_capital)  # Get from backtest model
-            bet_size_pct = float(self.backtest.bet_size_percentage) / 100.0  # Convert percentage to decimal
-            capital = initial_capital
-            
-            # Initialize equity curve - use first available timestamp
-            # Prefer train_df first timestamp, fallback to test_df first timestamp, or df first timestamp
-            if not train_df.empty:
-                first_timestamp = train_df.iloc[0]['timestamp']
-            elif not test_df.empty:
-                first_timestamp = test_df.iloc[0]['timestamp']
-            else:
-                first_timestamp = df.iloc[0]['timestamp']
-            
-            equity_curve = [(first_timestamp, initial_capital)]
-            
-            # Execute strategy on test data
-            # Track previous indicator values for crossover detection
-            prev_indicator_values = None
-            
-            logger.info(f"Executing strategy on {len(test_df)} test rows for {symbol.ticker}")
-            logger.info(f"Available indicators: {list(indicators.keys())}")
-            
-            for i, (idx, row) in enumerate(test_df.iterrows()):
-                # Extract and convert to Python native types immediately
+            # Build price cache - O(n) once instead of O(n*m) repeatedly
+            # This avoids expensive DataFrame filtering in the main loop
+            price_cache = {}
+            for idx, row in test_df.iterrows():
                 timestamp = row['timestamp']
-                # Convert pandas/numpy types to Python native types
-                price = float(row['close']) if pd.notna(row['close']) else None
-                if price is None:
-                    continue  # Skip rows with invalid price
-                
-                # Get indicator values for current row
-                indicator_values = {}
-                for name, series in indicators.items():
-                    if idx in series.index:
-                        try:
-                            value = series.loc[idx]
-                            # Check if value is valid (not NaN)
-                            if pd.notna(value):
-                                indicator_values[name] = float(value)
-                        except (KeyError, IndexError, TypeError) as e:
-                            logger.debug(f"Error getting indicator {name} at index {idx}: {e}")
-                            pass
-                
-                # For SMA crossover, we need both SMA_20 and SMA_50
-                fast_period = self.parameters.get('fast_period', 20)
-                slow_period = self.parameters.get('slow_period', 50)
-                fast_sma_key = f'SMA_{fast_period}'
-                slow_sma_key = f'SMA_{slow_period}'
-                
-                fast_sma = indicator_values.get(fast_sma_key)
-                slow_sma = indicator_values.get(slow_sma_key)
-                
-                # Skip if we don't have both SMAs
-                if fast_sma is None or slow_sma is None:
-                    if prev_indicator_values is None and indicator_values:
-                        prev_indicator_values = indicator_values.copy()
-                    continue
-                
-                # Generate signal from strategy (pass previous values for crossover detection)
-                signal = self._generate_signal(row, indicator_values, position, prev_indicator_values)
-                
-                if signal:
-                    prev_fast = prev_indicator_values.get(fast_sma_key) if prev_indicator_values else None
-                    prev_slow = prev_indicator_values.get(slow_sma_key) if prev_indicator_values else None
-                    prev_fast_str = f"{prev_fast:.2f}" if prev_fast is not None else "N/A"
-                    prev_slow_str = f"{prev_slow:.2f}" if prev_slow is not None else "N/A"
-                    logger.info(f"[{self.position_mode.upper()}] Signal at {timestamp}: {signal}, position={position['type'] if position else None}, fast_sma={fast_sma:.2f} (prev={prev_fast_str}), slow_sma={slow_sma:.2f} (prev={prev_slow_str})")
-                
-                # Update previous values for next iteration (only if we have valid values)
-                if indicator_values:
-                    prev_indicator_values = indicator_values.copy()
-                
-                # Execute trades based on signal
-                if signal == 'buy' and position is None:
-                    # Open long position
-                    bet_amount = float(capital * bet_size_pct)
-                    quantity = float(bet_amount / price)
-                    position = {
-                        'type': 'buy',
-                        'entry_price': float(price),
-                        'entry_timestamp': timestamp,
-                        'quantity': quantity,
-                        'bet_amount': bet_amount  # Track bet amount for proper capital calculation
-                    }
-                    # Reduce capital by bet amount (cash spent to buy shares)
-                    capital = float(capital - bet_amount)
-                    logger.debug(f"{symbol.ticker} LONG ENTRY @ {price} on {timestamp}, quantity: {quantity:.4f}, bet_amount: ${bet_amount:.2f}, capital after: ${capital:.2f}")
-                
-                elif signal == 'sell' and position is None:
-                    # Open short position
-                    bet_amount = float(capital * bet_size_pct)
-                    quantity = float(bet_amount / price)
-                    position = {
-                        'type': 'sell',
-                        'entry_price': float(price),
-                        'entry_timestamp': timestamp,
-                        'quantity': quantity,
-                        'bet_amount': bet_amount  # Track bet amount for proper capital calculation
-                    }
-                    # Increase capital by bet amount (cash received from selling borrowed shares)
-                    capital = float(capital + bet_amount)
-                    logger.debug(f"{symbol.ticker} SHORT ENTRY @ {price} on {timestamp}, quantity: {quantity:.4f}, bet_amount: ${bet_amount:.2f}, capital after: ${capital:.2f}")
-                
-                elif signal == 'sell' and position is not None and position['type'] == 'buy':
-                    # Close long position
-                    exit_price = float(price)
-                    bet_amount = float(position.get('bet_amount', position['entry_price'] * position['quantity']))
-                    pnl = float((exit_price - position['entry_price']) * position['quantity'])
-                    pnl_percentage = float(((exit_price - position['entry_price']) / position['entry_price']) * 100)
-                    
-                    # Calculate maximum drawdown for this trade
-                    max_drawdown = self._calculate_trade_drawdown(
-                        symbol, 
-                        position['entry_timestamp'], 
-                        timestamp, 
-                        position['entry_price'], 
-                        is_long=True
-                    )
-                    
-                    # Record trade
-                    trade = {
-                        'symbol': symbol,
-                        'trade_type': 'buy',
-                        'entry_price': float(position['entry_price']),
-                        'exit_price': exit_price,
-                        'entry_timestamp': position['entry_timestamp'],
-                        'exit_timestamp': timestamp,
-                        'quantity': float(position['quantity']),
-                        'pnl': pnl,
-                        'pnl_percentage': pnl_percentage,
-                        'is_winner': pnl > 0,
-                        'max_drawdown': float(max_drawdown) if max_drawdown is not None else None,
-                        'metadata': {}
-                    }
-                    self.trades.append(trade)
-                    
-                    # Update capital: add back the bet amount + profit/loss
-                    # When we sold the shares, we received: exit_price * quantity = bet_amount + pnl
-                    capital = float(capital + bet_amount + pnl)
-                    position = None
-                    logger.debug(f"{symbol.ticker} LONG EXIT @ {exit_price} on {timestamp}, PnL: {pnl:.2f}, bet_amount returned: ${bet_amount:.2f}, capital after: ${capital:.2f}")
-                    
-                    # In ALL mode, immediately open opposite position (short) since crossover already happened
-                    if self.position_mode == 'all':
-                        bet_amount = float(capital * bet_size_pct)
-                        quantity = float(bet_amount / price)
-                        position = {
-                            'type': 'sell',
-                            'entry_price': float(price),
-                            'entry_timestamp': timestamp,
-                            'quantity': quantity,
-                            'bet_amount': bet_amount
-                        }
-                        # Increase capital by bet amount (cash received from selling borrowed shares)
-                        capital = float(capital + bet_amount)
-                        logger.debug(f"{symbol.ticker} SHORT ENTRY (after long exit) @ {price} on {timestamp}, quantity: {quantity:.4f}, bet_amount: ${bet_amount:.2f}, capital after: ${capital:.2f}")
-                
-                elif signal == 'buy' and position is not None and position['type'] == 'sell':
-                    # Close short position
-                    exit_price = float(price)
-                    bet_amount = float(position.get('bet_amount', position['entry_price'] * position['quantity']))
-                    pnl = float((position['entry_price'] - exit_price) * position['quantity'])  # For short: profit when price goes down
-                    pnl_percentage = float(((position['entry_price'] - exit_price) / position['entry_price']) * 100)
-                    
-                    # Calculate maximum drawdown for this trade
-                    max_drawdown = self._calculate_trade_drawdown(
-                        symbol, 
-                        position['entry_timestamp'], 
-                        timestamp, 
-                        position['entry_price'], 
-                        is_long=False
-                    )
-                    
-                    # Record trade
-                    trade = {
-                        'symbol': symbol,
-                        'trade_type': 'sell',
-                        'entry_price': float(position['entry_price']),
-                        'exit_price': exit_price,
-                        'entry_timestamp': position['entry_timestamp'],
-                        'exit_timestamp': timestamp,
-                        'quantity': float(position['quantity']),
-                        'pnl': pnl,
-                        'pnl_percentage': pnl_percentage,
-                        'is_winner': pnl > 0,
-                        'max_drawdown': float(max_drawdown) if max_drawdown is not None else None,
-                        'metadata': {}
-                    }
-                    self.trades.append(trade)
-                    
-                    # Update capital: return the bet amount we received earlier, then add/subtract profit/loss
-                    # When we buy back shares to close short, we pay: exit_price * quantity = bet_amount - pnl
-                    # So: capital = capital - bet_amount + pnl, which simplifies to:
-                    capital = float(capital - bet_amount + pnl)
-                    position = None
-                    logger.debug(f"{symbol.ticker} SHORT EXIT @ {exit_price} on {timestamp}, PnL: {pnl:.2f}, bet_amount returned: ${bet_amount:.2f}, capital after: ${capital:.2f}")
-                    
-                    # In ALL mode, immediately open opposite position (long) since crossover already happened
-                    if self.position_mode == 'all':
-                        bet_amount = float(capital * bet_size_pct)
-                        quantity = float(bet_amount / price)
-                        position = {
-                            'type': 'buy',
-                            'entry_price': float(price),
-                            'entry_timestamp': timestamp,
-                            'quantity': quantity,
-                            'bet_amount': bet_amount
-                        }
-                        # Reduce capital by bet amount (cash spent to buy shares)
-                        capital = float(capital - bet_amount)
-                        logger.debug(f"{symbol.ticker} LONG ENTRY (after short exit) @ {price} on {timestamp}, quantity: {quantity:.4f}, bet_amount: ${bet_amount:.2f}, capital after: ${capital:.2f}")
-                
-                # Update equity curve
-                # Equity = cash capital + position value (mark-to-market)
-                current_equity = capital
-                if position is not None:
-                    # Mark-to-market for open position
-                    bet_amount = position.get('bet_amount', position['entry_price'] * position['quantity'])
-                    if position['type'] == 'buy':
-                        # Long position: we spent bet_amount to buy shares
-                        # Current value of shares = price * quantity
-                        # Equity = cash (capital) + position_value
-                        # capital was reduced by bet_amount, so:
-                        # Equity = capital + price * quantity
-                        position_value = price * position['quantity']
-                        current_equity = capital + position_value
-                    else:
-                        # Short position: we received bet_amount cash when selling borrowed shares
-                        # We owe shares worth current price * quantity
-                        # Equity = cash (capital) - liability
-                        # capital was increased by bet_amount, and liability = price * quantity
-                        # Equity = capital - price * quantity
-                        # But capital = old_capital + bet_amount, so:
-                        # Equity = old_capital + bet_amount - price * quantity
-                        # Which equals: capital - price * quantity (since capital already includes bet_amount)
-                        position_liability = price * position['quantity']
-                        current_equity = capital - position_liability
-                equity_curve.append((timestamp, current_equity))
+                if pd.notna(row['close']):
+                    price_cache[timestamp] = float(row['close'])
+            symbol_price_cache[symbol] = price_cache
             
-            # Close any open position at the end of backtest to calculate final equity accurately
+            symbol_data[symbol] = {
+                'df': df,
+                'test_df': test_df,
+                'indicators': indicators
+            }
+            positions[symbol] = None
+            prev_indicators[symbol] = None
+        
+        if not symbol_data:
+            logger.warning("No valid symbol data for multi-symbol execution")
+            return
+        
+        # Create a merged timeline of all events from all symbols
+        # Collect all timestamps with their corresponding symbol and row data
+        all_events = []  # List of (timestamp, symbol, row_index, row_data)
+        
+        for symbol, data in symbol_data.items():
+            test_df = data['test_df']
+            for idx, row in test_df.iterrows():
+                timestamp = row['timestamp']
+                if pd.notna(row['close']):
+                    all_events.append((timestamp, symbol, idx, row))
+        
+        # Sort all events chronologically
+        all_events.sort(key=lambda x: x[0])
+        
+        logger.info(f"Processing {len(all_events)} events across {len(symbol_data)} symbols chronologically")
+        
+        # Helper function to get current price for a symbol at a timestamp (uses cache)
+        def get_price_at_timestamp(symbol, timestamp):
+            """Get price for symbol at timestamp using cached lookup (O(1) dict lookup)"""
+            price_cache = symbol_price_cache.get(symbol, {})
+            # Find the closest timestamp <= current timestamp
+            # Since events are processed chronologically, we can use the last known price
+            valid_timestamps = [ts for ts in price_cache.keys() if ts <= timestamp]
+            if valid_timestamps:
+                # Get the most recent price (closest to timestamp)
+                closest_ts = max(valid_timestamps)
+                return price_cache[closest_ts]
+            return None
+        
+        # Initialize portfolio equity curve
+        portfolio_equity_curve = []
+        first_event_timestamp = all_events[0][0] if all_events else None
+        if first_event_timestamp:
+            portfolio_equity_curve.append((first_event_timestamp, initial_capital))
+        
+        # Process events chronologically with shared capital
+        for timestamp, symbol, idx, row in all_events:
+            price = float(row['close'])
+            position = positions[symbol]
+            indicators = symbol_data[symbol]['indicators']
+            prev_indicator_values = prev_indicators[symbol]
+            
+            # Get indicator values for current row
+            indicator_values = {}
+            for name, series in indicators.items():
+                if idx in series.index:
+                    try:
+                        value = series.loc[idx]
+                        if pd.notna(value):
+                            indicator_values[name] = float(value)
+                    except (KeyError, IndexError, TypeError):
+                        pass
+            
+            # Check if we have required indicators
+            fast_period = self.parameters.get('fast_period', 20)
+            slow_period = self.parameters.get('slow_period', 50)
+            fast_sma_key = f'SMA_{fast_period}'
+            slow_sma_key = f'SMA_{slow_period}'
+            
+            fast_sma = indicator_values.get(fast_sma_key)
+            slow_sma = indicator_values.get(slow_sma_key)
+            
+            if fast_sma is None or slow_sma is None:
+                if prev_indicator_values is None and indicator_values:
+                    prev_indicators[symbol] = indicator_values.copy()
+                continue
+            
+            # Generate signal for this symbol
+            signal = self._generate_signal(row, indicator_values, position, prev_indicator_values)
+            
+            if indicator_values:
+                prev_indicators[symbol] = indicator_values.copy()
+            
+            # Process trade with shared portfolio capital
+            portfolio_capital, new_position, _ = self._process_trade_signal(
+                symbol, timestamp, price, signal, position, portfolio_capital, bet_size_pct,
+                [], indicators, idx  # Pass empty list since we'll track portfolio equity separately
+            )
+            
+            # Update position for this symbol BEFORE calculating equity
+            positions[symbol] = new_position
+            
+            # Calculate portfolio equity ONCE after trade (much faster with cache)
+            # This replaces the expensive DataFrame filtering with O(1) dictionary lookups
+            portfolio_equity = portfolio_capital
+            for sym, pos in positions.items():
+                if pos is not None:
+                    # Use cached price lookup instead of DataFrame filtering
+                    sym_current_price = get_price_at_timestamp(sym, timestamp)
+                    if sym_current_price is None:
+                        # Fallback: use entry price if no cache entry found
+                        sym_current_price = pos['entry_price']
+                    
+                    if pos['type'] == 'buy':
+                        portfolio_equity += sym_current_price * pos['quantity']
+                    else:  # short
+                        portfolio_equity -= sym_current_price * pos['quantity']
+            
+            # Also include the new position if any (use current event price)
+            if new_position is not None:
+                if new_position['type'] == 'buy':
+                    portfolio_equity += price * new_position['quantity']
+                else:
+                    portfolio_equity -= price * new_position['quantity']
+            
+            # Update portfolio equity curve
+            portfolio_equity_curve.append((timestamp, float(portfolio_equity)))
+        
+        # Close any open positions at the end
+        final_timestamp = all_events[-1][0] if all_events else None
+        for symbol, position in positions.items():
             if position is not None:
+                test_df = symbol_data[symbol]['test_df']
                 final_price = float(test_df.iloc[-1]['close'])
                 final_timestamp = test_df.iloc[-1]['timestamp']
-                
-                if position['type'] == 'buy':
-                    # Close long position
-                    exit_price = final_price
-                    bet_amount = float(position.get('bet_amount', position['entry_price'] * position['quantity']))
-                    pnl = float((exit_price - position['entry_price']) * position['quantity'])
-                    
-                    # Record trade
-                    trade = {
-                        'symbol': symbol,
-                        'trade_type': 'buy',
-                        'entry_price': float(position['entry_price']),
-                        'exit_price': exit_price,
-                        'entry_timestamp': position['entry_timestamp'],
-                        'exit_timestamp': final_timestamp,
-                        'quantity': float(position['quantity']),
-                        'pnl': pnl,
-                        'pnl_percentage': float(((exit_price - position['entry_price']) / position['entry_price']) * 100),
-                        'is_winner': pnl > 0,
-                        'max_drawdown': None,  # Can't calculate for final position
-                        'metadata': {'closed_at_end': True}
-                    }
-                    self.trades.append(trade)
-                    
-                    # Update capital
-                    capital = float(capital + bet_amount + pnl)
-                    logger.debug(f"{symbol.ticker} LONG POSITION CLOSED AT END @ {exit_price}, PnL: {pnl:.2f}, capital: ${capital:.2f}")
-                else:
-                    # Close short position
-                    exit_price = final_price
-                    bet_amount = float(position.get('bet_amount', position['entry_price'] * position['quantity']))
-                    pnl = float((position['entry_price'] - exit_price) * position['quantity'])
-                    
-                    # Record trade
-                    trade = {
-                        'symbol': symbol,
-                        'trade_type': 'sell',
-                        'entry_price': float(position['entry_price']),
-                        'exit_price': exit_price,
-                        'entry_timestamp': position['entry_timestamp'],
-                        'exit_timestamp': final_timestamp,
-                        'quantity': float(position['quantity']),
-                        'pnl': pnl,
-                        'pnl_percentage': float(((position['entry_price'] - exit_price) / position['entry_price']) * 100),
-                        'is_winner': pnl > 0,
-                        'max_drawdown': None,  # Can't calculate for final position
-                        'metadata': {'closed_at_end': True}
-                    }
-                    self.trades.append(trade)
-                    
-                    # Update capital
-                    capital = float(capital - bet_amount + pnl)
-                    logger.debug(f"{symbol.ticker} SHORT POSITION CLOSED AT END @ {exit_price}, PnL: {pnl:.2f}, capital: ${capital:.2f}")
-                
-                # Update equity curve with final equity (no open positions)
-                equity_curve.append((final_timestamp, float(capital)))
+                portfolio_capital = self._close_position_at_end(symbol, position, final_price, final_timestamp, portfolio_capital)
+        
+        # Update final portfolio equity curve point
+        if final_timestamp:
+            portfolio_equity_curve.append((final_timestamp, float(portfolio_capital)))
+        
+        # For multi-symbol, use portfolio-level equity curve for all symbols
+        # (since capital is shared, all symbols share the same portfolio equity)
+        # Ensure chronological order
+        portfolio_equity_curve.sort(key=lambda x: x[0])
+        for symbol in self.symbols:
+            if symbol in symbol_data:
+                self.equity_curves[symbol] = portfolio_equity_curve
+    
+    def _process_trade_signal(self, symbol, timestamp, price, signal, position, capital, bet_size_pct, equity_curve, indicators, row_idx):
+        """Process a trade signal and return updated capital, position, and equity curve"""
+        
+        # Execute trades based on signal
+        if signal == 'buy' and position is None:
+            # Open long position
+            bet_amount = float(capital * bet_size_pct)
+            quantity = float(bet_amount / price)
+            position = {
+                'type': 'buy',
+                'entry_price': float(price),
+                'entry_timestamp': timestamp,
+                'quantity': quantity,
+                'bet_amount': bet_amount
+            }
+            # Reduce capital by bet amount (cash spent to buy shares)
+            capital = float(capital - bet_amount)
+            logger.debug(f"{symbol.ticker} LONG ENTRY @ {price} on {timestamp}, quantity: {quantity:.4f}, bet_amount: ${bet_amount:.2f}, capital after: ${capital:.2f}")
+        
+        elif signal == 'sell' and position is None:
+            # Open short position
+            bet_amount = float(capital * bet_size_pct)
+            quantity = float(bet_amount / price)
+            position = {
+                'type': 'sell',
+                'entry_price': float(price),
+                'entry_timestamp': timestamp,
+                'quantity': quantity,
+                'bet_amount': bet_amount
+            }
+            # Increase capital by bet amount (cash received from selling borrowed shares)
+            capital = float(capital + bet_amount)
+            logger.debug(f"{symbol.ticker} SHORT ENTRY @ {price} on {timestamp}, quantity: {quantity:.4f}, bet_amount: ${bet_amount:.2f}, capital after: ${capital:.2f}")
+        
+        elif signal == 'sell' and position is not None and position['type'] == 'buy':
+            # Close long position
+            exit_price = float(price)
+            bet_amount = float(position.get('bet_amount', position['entry_price'] * position['quantity']))
+            pnl = float((exit_price - position['entry_price']) * position['quantity'])
+            pnl_percentage = float(((exit_price - position['entry_price']) / position['entry_price']) * 100)
             
-            # Store equity curve
-            self.equity_curves[symbol] = equity_curve
+            # Calculate maximum drawdown for this trade
+            max_drawdown = self._calculate_trade_drawdown(
+                symbol, 
+                position['entry_timestamp'], 
+                timestamp, 
+                position['entry_price'], 
+                is_long=True
+            )
+            
+            # Record trade
+            trade = {
+                'symbol': symbol,
+                'trade_type': 'buy',
+                'entry_price': float(position['entry_price']),
+                'exit_price': exit_price,
+                'entry_timestamp': position['entry_timestamp'],
+                'exit_timestamp': timestamp,
+                'quantity': float(position['quantity']),
+                'pnl': pnl,
+                'pnl_percentage': pnl_percentage,
+                'is_winner': pnl > 0,
+                'max_drawdown': float(max_drawdown) if max_drawdown is not None else None,
+                'metadata': {
+                    'bet_amount': float(bet_amount)
+                }
+            }
+            self.trades.append(trade)
+            
+            # Update capital: add back the bet amount + profit/loss
+            capital = float(capital + bet_amount + pnl)
+            position = None
+            logger.debug(f"{symbol.ticker} LONG EXIT @ {exit_price} on {timestamp}, PnL: {pnl:.2f}, bet_amount returned: ${bet_amount:.2f}, capital after: ${capital:.2f}")
+            
+            # In ALL mode, immediately open opposite position (short) since crossover already happened
+            if self.position_mode == 'all':
+                bet_amount = float(capital * bet_size_pct)
+                quantity = float(bet_amount / price)
+                position = {
+                    'type': 'sell',
+                    'entry_price': float(price),
+                    'entry_timestamp': timestamp,
+                    'quantity': quantity,
+                    'bet_amount': bet_amount
+                }
+                # Increase capital by bet amount (cash received from selling borrowed shares)
+                capital = float(capital + bet_amount)
+                logger.debug(f"{symbol.ticker} SHORT ENTRY (after long exit) @ {price} on {timestamp}, quantity: {quantity:.4f}, bet_amount: ${bet_amount:.2f}, capital after: ${capital:.2f}")
+        
+        elif signal == 'buy' and position is not None and position['type'] == 'sell':
+            # Close short position
+            exit_price = float(price)
+            bet_amount = float(position.get('bet_amount', position['entry_price'] * position['quantity']))
+            pnl = float((position['entry_price'] - exit_price) * position['quantity'])
+            pnl_percentage = float(((position['entry_price'] - exit_price) / position['entry_price']) * 100)
+            
+            # Calculate maximum drawdown for this trade
+            max_drawdown = self._calculate_trade_drawdown(
+                symbol, 
+                position['entry_timestamp'], 
+                timestamp, 
+                position['entry_price'], 
+                is_long=False
+            )
+            
+            # Record trade
+            trade = {
+                'symbol': symbol,
+                'trade_type': 'sell',
+                'entry_price': float(position['entry_price']),
+                'exit_price': exit_price,
+                'entry_timestamp': position['entry_timestamp'],
+                'exit_timestamp': timestamp,
+                'quantity': float(position['quantity']),
+                'pnl': pnl,
+                'pnl_percentage': pnl_percentage,
+                'is_winner': pnl > 0,
+                'max_drawdown': float(max_drawdown) if max_drawdown is not None else None,
+                'metadata': {
+                    'bet_amount': float(bet_amount)
+                }
+            }
+            self.trades.append(trade)
+            
+            # Update capital: return the bet amount we received earlier, then add/subtract profit/loss
+            capital = float(capital - bet_amount + pnl)
+            position = None
+            logger.debug(f"{symbol.ticker} SHORT EXIT @ {exit_price} on {timestamp}, PnL: {pnl:.2f}, bet_amount returned: ${bet_amount:.2f}, capital after: ${capital:.2f}")
+            
+            # In ALL mode, immediately open opposite position (long) since crossover already happened
+            if self.position_mode == 'all':
+                bet_amount = float(capital * bet_size_pct)
+                quantity = float(bet_amount / price)
+                position = {
+                    'type': 'buy',
+                    'entry_price': float(price),
+                    'entry_timestamp': timestamp,
+                    'quantity': quantity,
+                    'bet_amount': bet_amount
+                }
+                # Reduce capital by bet amount (cash spent to buy shares)
+                capital = float(capital - bet_amount)
+                logger.debug(f"{symbol.ticker} LONG ENTRY (after short exit) @ {price} on {timestamp}, quantity: {quantity:.4f}, bet_amount: ${bet_amount:.2f}, capital after: ${capital:.2f}")
+        
+        # Update equity curve
+        current_equity = capital
+        if position is not None:
+            bet_amount_pos = position.get('bet_amount', position['entry_price'] * position['quantity'])
+            if position['type'] == 'buy':
+                position_value = price * position['quantity']
+                current_equity = capital + position_value
+            else:
+                position_liability = price * position['quantity']
+                current_equity = capital - position_liability
+        equity_curve.append((timestamp, current_equity))
+        
+        return capital, position, equity_curve
+    
+    def _close_position_at_end(self, symbol, position, final_price, final_timestamp, capital):
+        """Close a position at the end of backtest and return updated capital"""
+        
+        if position['type'] == 'buy':
+            # Close long position
+            exit_price = final_price
+            bet_amount = float(position.get('bet_amount', position['entry_price'] * position['quantity']))
+            pnl = float((exit_price - position['entry_price']) * position['quantity'])
+            
+            # Record trade
+            trade = {
+                'symbol': symbol,
+                'trade_type': 'buy',
+                'entry_price': float(position['entry_price']),
+                'exit_price': exit_price,
+                'entry_timestamp': position['entry_timestamp'],
+                'exit_timestamp': final_timestamp,
+                'quantity': float(position['quantity']),
+                'pnl': pnl,
+                'pnl_percentage': float(((exit_price - position['entry_price']) / position['entry_price']) * 100),
+                'is_winner': pnl > 0,
+                'max_drawdown': None,
+                'metadata': {
+                    'closed_at_end': True,
+                    'bet_amount': float(bet_amount)
+                }
+            }
+            self.trades.append(trade)
+            
+            capital = float(capital + bet_amount + pnl)
+            logger.debug(f"{symbol.ticker} LONG POSITION CLOSED AT END @ {exit_price}, PnL: {pnl:.2f}, capital: ${capital:.2f}")
+        else:
+            # Close short position
+            exit_price = final_price
+            bet_amount = float(position.get('bet_amount', position['entry_price'] * position['quantity']))
+            pnl = float((position['entry_price'] - exit_price) * position['quantity'])
+            
+            # Record trade
+            trade = {
+                'symbol': symbol,
+                'trade_type': 'sell',
+                'entry_price': float(position['entry_price']),
+                'exit_price': exit_price,
+                'entry_timestamp': position['entry_timestamp'],
+                'exit_timestamp': final_timestamp,
+                'quantity': float(position['quantity']),
+                'pnl': pnl,
+                'pnl_percentage': float(((position['entry_price'] - exit_price) / position['entry_price']) * 100),
+                'is_winner': pnl > 0,
+                'max_drawdown': None,
+                'metadata': {
+                    'closed_at_end': True,
+                    'bet_amount': float(bet_amount)
+                }
+            }
+            self.trades.append(trade)
+            
+            capital = float(capital - bet_amount + pnl)
+            logger.debug(f"{symbol.ticker} SHORT POSITION CLOSED AT END @ {exit_price}, PnL: {pnl:.2f}, capital: ${capital:.2f}")
+        
+        return capital
     
     def _generate_signal(self, row: pd.Series, indicators: Dict, position: Optional[Dict], prev_indicators: Optional[Dict] = None) -> Optional[str]:
         """
@@ -739,11 +940,16 @@ class BacktestExecutor:
         gross_loss = abs(sum(t['pnl'] for t in losing_trades)) if losing_trades else 0
         profit_factor = gross_profit / gross_loss if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0)
         
-        # Equity curve
-        equity_curve = self.equity_curves.get(symbol, [])
-        equity_curve_data = [
-            {'timestamp': ts.isoformat() if hasattr(ts, 'isoformat') else str(ts), 'equity': float(eq)}
-            for ts, eq in equity_curve
+        # Equity curve - always calculate from trades for clean, consistent chart
+        # This ensures:
+        # 1. Equity curve matches total_pnl (calculated from trades only)
+        # 2. Clean chart with points only at trade exits (not every data row)
+        # 3. Consistency between single-symbol and multi-symbol backtests
+        equity_curve_data = self._calculate_symbol_equity_curve_from_trades(trades, initial_capital)
+        # Convert to list of tuples for compatibility with drawdown calculation
+        equity_curve = [
+            (pd.to_datetime(point['timestamp']), point['equity'])
+            for point in equity_curve_data
         ]
         
         # Calculate max drawdown - use average of individual trade drawdowns from closed trades only
@@ -762,7 +968,12 @@ class BacktestExecutor:
         returns = [t['pnl_percentage'] / 100 for t in trades]
         sharpe_ratio = self._calculate_sharpe_ratio(returns)
         
-        # Calculate CAGR - use same calculation as portfolio stats (with timezone handling)
+        # Calculate CAGR and total_return - use same calculation as portfolio stats (with timezone handling)
+        # For symbol-level stats, total_return should equal total_pnl_percentage since:
+        # - equity curve starts at initial_capital and ends at initial_capital + total_pnl
+        # - total_return = ((final_equity - initial_equity) / initial_equity) * 100
+        # - = ((initial_capital + total_pnl - initial_capital) / initial_capital) * 100
+        # - = (total_pnl / initial_capital) * 100 = total_pnl_percentage
         if equity_curve:
             initial_equity = equity_curve[0][1]
             final_equity = equity_curve[-1][1]
@@ -778,7 +989,14 @@ class BacktestExecutor:
             days = (end_ts - start_ts).days if len(equity_curve) > 1 else 0
             
             if days > 0 and initial_equity > 0:
+                # Calculate total_return from equity curve
+                # For symbol-level stats, this should match total_pnl_percentage (within rounding)
                 total_return = ((final_equity - initial_equity) / initial_equity) * 100
+                
+                # Ensure total_return matches total_pnl_percentage for symbol-level stats
+                # (they should be mathematically equivalent, but use equity curve value for consistency)
+                # Round to match the precision of total_pnl_percentage
+                total_return = round(total_return, 4)
                 
                 # Calculate CAGR - handle negative equity ratio to avoid complex numbers
                 equity_ratio = final_equity / initial_equity
@@ -817,6 +1035,138 @@ class BacktestExecutor:
             'total_return': round(total_return, 4),
             'equity_curve': equity_curve_data,
         }
+    
+    def _calculate_symbol_equity_curve_from_trades(self, trades: List[Dict], initial_capital: float) -> List[Dict]:
+        """Calculate symbol-specific equity curve from trades only (for multi-symbol backtests)
+        
+        This ensures the equity curve matches total_pnl which is calculated from trades only.
+        """
+        equity_curve_data = []
+        
+        if not trades:
+            return equity_curve_data
+        
+        # Helper to normalize timestamps
+        def normalize_timestamp(ts):
+            if ts is None:
+                return None
+            if isinstance(ts, str):
+                ts = pd.to_datetime(ts)
+            if timezone.is_naive(ts):
+                ts = timezone.make_aware(ts)
+            return ts
+        
+        # Get all trades with exits, sort by exit timestamp (when PnL is realized)
+        trades_with_exits = [t for t in trades if t.get('exit_timestamp') and t.get('pnl') is not None]
+        
+        if trades_with_exits:
+            # Sort trades by exit timestamp to process chronologically
+            sorted_trades = sorted(trades_with_exits, key=lambda t: normalize_timestamp(t['exit_timestamp']) or datetime.min)
+            
+            # Find the earliest timestamp (entry or exit) to start the curve
+            all_timestamps = []
+            for trade in trades:
+                if trade.get('entry_timestamp'):
+                    all_timestamps.append(normalize_timestamp(trade['entry_timestamp']))
+                if trade.get('exit_timestamp'):
+                    all_timestamps.append(normalize_timestamp(trade['exit_timestamp']))
+            
+            earliest_ts = min(all_timestamps) if all_timestamps else None
+            
+            # Start with initial capital at earliest timestamp
+            if earliest_ts:
+                equity_curve_data.append({
+                    'timestamp': earliest_ts.isoformat() if hasattr(earliest_ts, 'isoformat') else str(earliest_ts),
+                    'equity': initial_capital
+                })
+            
+            # Track cumulative PnL as trades exit (when PnL is realized)
+            cumulative_pnl = 0.0
+            for trade in sorted_trades:
+                cumulative_pnl += float(trade['pnl'])
+                exit_ts = normalize_timestamp(trade['exit_timestamp'])
+                
+                current_equity = initial_capital + cumulative_pnl
+                equity_curve_data.append({
+                    'timestamp': exit_ts.isoformat() if hasattr(exit_ts, 'isoformat') else str(exit_ts),
+                    'equity': round(current_equity, 2)
+                })
+            
+            # Sort by timestamp to ensure chronological order BEFORE final point adjustment
+            equity_curve_data.sort(key=lambda x: pd.to_datetime(x['timestamp']))
+            
+            # Remove duplicates (same timestamp, keep the one with correct equity)
+            seen_timestamps = {}
+            for point in equity_curve_data:
+                ts_key = point['timestamp']
+                # Keep the last equity value for each timestamp (most up-to-date)
+                seen_timestamps[ts_key] = point
+            equity_curve_data = list(seen_timestamps.values())
+            equity_curve_data.sort(key=lambda x: pd.to_datetime(x['timestamp']))
+            
+            # Ensure final point matches total_pnl exactly
+            if equity_curve_data:
+                total_pnl = sum(t['pnl'] for t in trades)
+                final_equity = initial_capital + total_pnl
+                # Get the latest timestamp from trades
+                latest_ts = max((normalize_timestamp(t.get('exit_timestamp') or t.get('entry_timestamp')) for t in trades if t.get('exit_timestamp') or t.get('entry_timestamp')), default=earliest_ts)
+                
+                # Normalize the last point's timestamp for comparison
+                last_point_ts = pd.to_datetime(equity_curve_data[-1]['timestamp'])
+                if timezone.is_naive(last_point_ts):
+                    last_point_ts = timezone.make_aware(last_point_ts)
+                
+                # Compare timestamps properly
+                if latest_ts and latest_ts != last_point_ts:
+                    # Add new point if latest trade timestamp is different
+                    equity_curve_data.append({
+                        'timestamp': latest_ts.isoformat() if hasattr(latest_ts, 'isoformat') else str(latest_ts),
+                        'equity': round(final_equity, 2)
+                    })
+                    # Re-sort after adding
+                    equity_curve_data.sort(key=lambda x: pd.to_datetime(x['timestamp']))
+                else:
+                    # Just update equity value
+                    equity_curve_data[-1]['equity'] = round(final_equity, 2)
+            
+            # Ensure final point matches total_pnl
+            if equity_curve_data:
+                total_pnl = sum(t['pnl'] for t in trades)
+                final_equity = initial_capital + total_pnl
+                equity_curve_data[-1]['equity'] = round(final_equity, 2)
+        else:
+            # No trades with exits - create simple curve
+            all_timestamps = []
+            for trade in trades:
+                if trade.get('entry_timestamp'):
+                    all_timestamps.append(normalize_timestamp(trade['entry_timestamp']))
+            
+            if all_timestamps:
+                earliest_ts = min(all_timestamps)
+                latest_ts = max(all_timestamps)
+                total_pnl = sum(t['pnl'] for t in trades)
+                equity_curve_data = [
+                    {'timestamp': earliest_ts.isoformat() if hasattr(earliest_ts, 'isoformat') else str(earliest_ts), 'equity': initial_capital},
+                    {'timestamp': latest_ts.isoformat() if hasattr(latest_ts, 'isoformat') else str(latest_ts), 'equity': round(initial_capital + total_pnl, 2)}
+                ]
+            else:
+                now = timezone.now()
+                total_pnl = sum(t['pnl'] for t in trades)
+                equity_curve_data = [
+                    {'timestamp': now.isoformat(), 'equity': initial_capital},
+                    {'timestamp': now.isoformat(), 'equity': round(initial_capital + total_pnl, 2)}
+                ]
+        
+        # Ensure we have at least initial and final points
+        if len(equity_curve_data) == 0:
+            now = timezone.now()
+            total_pnl = sum(t['pnl'] for t in trades)
+            equity_curve_data = [
+                {'timestamp': now.isoformat(), 'equity': initial_capital},
+                {'timestamp': now.isoformat(), 'equity': round(initial_capital + total_pnl, 2)}
+            ]
+        
+        return equity_curve_data
     
     def _calculate_portfolio_statistics(self, trade_type_filter: Optional[str] = None) -> Dict:
         """

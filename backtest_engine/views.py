@@ -200,13 +200,17 @@ class BacktestViewSet(viewsets.ModelViewSet):
         if symbol_ticker:
             trades = trades.filter(symbol__ticker=symbol_ticker)
         
-        # Filter by mode (position mode)
-        mode = request.query_params.get('mode', 'all').lower()
-        if mode == 'long':
-            trades = trades.filter(trade_type='buy')
-        elif mode == 'short':
-            trades = trades.filter(trade_type='sell')
-        # 'all' mode doesn't filter by trade_type
+        # Filter by mode (position mode) - use metadata.position_mode to ensure each mode has independent bankroll
+        # Each mode (ALL, LONG, SHORT) is executed separately with its own capital, so we must filter by position_mode
+        # Only filter if mode is explicitly provided in query params
+        mode = request.query_params.get('mode', None)
+        if mode:
+            mode = mode.lower()
+            if mode in ['long', 'short', 'all']:
+                # Filter by metadata.position_mode using JSON field lookup
+                # This ensures we only get trades from the specific mode execution (which has its own bankroll)
+                trades = trades.filter(metadata__position_mode=mode)
+        # If mode is not provided, return trades from all modes (useful for getAllBacktestTrades)
         
         # Order by entry timestamp
         trades = trades.order_by('entry_timestamp')
