@@ -252,9 +252,22 @@ class BacktestExecutor:
             if indicator_values:
                 prev_indicator_values = indicator_values.copy()
             
+            # Calculate current equity BEFORE processing trade signal
+            # This includes cash + mark-to-market value of open position (if any)
+            # We need this to calculate bet_amount correctly (bet_size_pct of current equity, not just cash)
+            current_equity = capital
+            if position is not None:
+                # Add mark-to-market value of open position
+                if position['type'] == 'buy':
+                    current_equity += price * position['quantity']
+                else:  # short
+                    current_equity -= price * position['quantity']
+            
             # Execute trades based on signal (reuse existing logic)
+            # Pass capital (cash) and current_equity (total equity) separately
+            # This ensures bet_amount is calculated from total equity while cash tracking remains correct
             capital, position, equity_curve = self._process_trade_signal(
-                symbol, timestamp, price, signal, position, capital, bet_size_pct, equity_curve, indicators, idx
+                symbol, timestamp, price, signal, position, capital, bet_size_pct, equity_curve, indicators, idx, current_equity=current_equity
             )
         
         # Close any open position at the end
@@ -393,16 +406,34 @@ class BacktestExecutor:
             if indicator_values:
                 prev_indicators[symbol] = indicator_values.copy()
             
-            # Process trade with shared portfolio capital
+            # Calculate CURRENT portfolio equity BEFORE processing trade
+            # This includes cash + mark-to-market value of all open positions
+            # We need this to calculate bet_amount correctly (bet_size_pct of current equity, not just cash)
+            current_portfolio_equity = portfolio_capital
+            for sym, pos in positions.items():
+                if pos is not None:
+                    # Use cached price lookup instead of DataFrame filtering
+                    sym_current_price = get_price_at_timestamp(sym, timestamp)
+                    if sym_current_price is None:
+                        # Fallback: use entry price if no cache entry found
+                        sym_current_price = pos['entry_price']
+                    
+                    if pos['type'] == 'buy':
+                        current_portfolio_equity += sym_current_price * pos['quantity']
+                    else:  # short
+                        current_portfolio_equity -= sym_current_price * pos['quantity']
+            
+            # Process trade: calculate bet_amount from total equity, but pass cash capital
+            # This ensures bet_amount scales with portfolio performance while maintaining correct cash tracking
             portfolio_capital, new_position, _ = self._process_trade_signal(
                 symbol, timestamp, price, signal, position, portfolio_capital, bet_size_pct,
-                [], indicators, idx  # Pass empty list since we'll track portfolio equity separately
+                [], indicators, idx, current_equity=current_portfolio_equity  # Pass equity for bet_amount calculation
             )
             
             # Update position for this symbol BEFORE calculating equity
             positions[symbol] = new_position
             
-            # Calculate portfolio equity ONCE after trade (much faster with cache)
+            # Calculate portfolio equity AFTER trade (much faster with cache)
             # This replaces the expensive DataFrame filtering with O(1) dictionary lookups
             portfolio_equity = portfolio_capital
             for sym, pos in positions.items():
@@ -449,13 +480,22 @@ class BacktestExecutor:
             if symbol in symbol_data:
                 self.equity_curves[symbol] = portfolio_equity_curve
     
-    def _process_trade_signal(self, symbol, timestamp, price, signal, position, capital, bet_size_pct, equity_curve, indicators, row_idx):
-        """Process a trade signal and return updated capital, position, and equity curve"""
+    def _process_trade_signal(self, symbol, timestamp, price, signal, position, capital, bet_size_pct, equity_curve, indicators, row_idx, current_equity=None):
+        """Process a trade signal and return updated capital, position, and equity curve
+        
+        Args:
+            capital: Current cash capital (not total equity)
+            current_equity: Current total equity (cash + mark-to-market positions). If provided, bet_amount is calculated from this instead of capital.
+        """
+        
+        # Use current_equity for bet_amount calculation if provided (for multi-symbol shared capital)
+        # Otherwise use capital (for single-symbol or when equity not provided)
+        equity_for_bet = current_equity if current_equity is not None else capital
         
         # Execute trades based on signal
         if signal == 'buy' and position is None:
             # Open long position
-            bet_amount = float(capital * bet_size_pct)
+            bet_amount = float(equity_for_bet * bet_size_pct)
             quantity = float(bet_amount / price)
             position = {
                 'type': 'buy',
@@ -470,7 +510,7 @@ class BacktestExecutor:
         
         elif signal == 'sell' and position is None:
             # Open short position
-            bet_amount = float(capital * bet_size_pct)
+            bet_amount = float(equity_for_bet * bet_size_pct)
             quantity = float(bet_amount / price)
             position = {
                 'type': 'sell',
@@ -525,7 +565,11 @@ class BacktestExecutor:
             
             # In ALL mode, immediately open opposite position (short) since crossover already happened
             if self.position_mode == 'all':
-                bet_amount = float(capital * bet_size_pct)
+                # After closing, the new equity is the updated capital (for single-symbol)
+                # For multi-symbol, the caller should recalculate portfolio equity
+                # Use updated capital as equity (works for single-symbol; multi-symbol handles separately)
+                equity_after_close = capital  # Capital now includes the closed position's PnL
+                bet_amount = float(equity_after_close * bet_size_pct)
                 quantity = float(bet_amount / price)
                 position = {
                     'type': 'sell',

@@ -180,62 +180,155 @@ def run_backtest_task(self, backtest_id):
                     trade_metadata = {}
                 trade_metadata['position_mode'] = position_mode
                 
+                # Get symbol ticker for error logging
+                symbol_ticker = 'unknown'
+                if 'symbol' in trade_data and trade_data['symbol']:
+                    if hasattr(trade_data['symbol'], 'ticker'):
+                        symbol_ticker = trade_data['symbol'].ticker
+                    elif isinstance(trade_data['symbol'], str):
+                        symbol_ticker = trade_data['symbol']
+                
                 # Convert numpy types to Python native types to avoid Django field validation errors
-                def convert_value(value):
-                    """Convert numpy/pandas types to Python native types"""
+                def convert_value(value, field_name=None):
+                    """Convert numpy/pandas types to Python native types, round to 2 decimal places, and validate database limits
+                    
+                    For DecimalField(max_digits=20, decimal_places=8), values must be < 10^12.
+                    If value exceeds limit, raises ValueError (indicates bad data/calculation error).
+                    """
                     if value is None:
                         return None
                     import numpy as np
+                    float_value = None
+                    
                     # Handle numpy arrays first (before checking other numpy types)
                     if isinstance(value, np.ndarray):
                         # For arrays, return None or handle appropriately
                         if value.size == 0:
                             return None
                         if value.size == 1:
-                            return float(value.item())
-                        # Multiple values - this shouldn't happen for a single field
-                        return None
+                            float_value = float(value.item())
+                        else:
+                            # Multiple values - this shouldn't happen for a single field
+                            return None
                     # Handle numpy scalars
-                    if isinstance(value, (np.integer, np.floating)):
-                        return float(value)
+                    elif isinstance(value, (np.integer, np.floating)):
+                        float_value = float(value)
                     # Handle numpy types that have .item() method
-                    if hasattr(value, 'item') and not isinstance(value, (str, list, dict)):
+                    elif hasattr(value, 'item') and not isinstance(value, (str, list, dict)):
                         try:
-                            return float(value.item())
+                            float_value = float(value.item())
                         except (ValueError, AttributeError):
                             pass
                     # Handle pandas types
-                    if hasattr(value, 'iloc'):  # pandas Series/DataFrame
+                    elif hasattr(value, 'iloc'):  # pandas Series/DataFrame
                         try:
-                            return float(value)
+                            float_value = float(value)
                         except (ValueError, TypeError):
                             pass
-                    # If it's already a Python native type, return as is
-                    if isinstance(value, (int, float, str, bool)):
-                        return value
+                    # If it's already a Python native type, convert to float
+                    elif isinstance(value, (int, float, str)):
+                        try:
+                            float_value = float(value)
+                        except (ValueError, TypeError):
+                            pass
+                    
                     # Try to convert to float as last resort
-                    try:
-                        return float(value)
-                    except (ValueError, TypeError):
-                        # If all else fails, return None (safer than passing invalid type)
-                        logger.warning(f"Could not convert value {type(value)} to Python native type, using None")
-                        return None
+                    if float_value is None:
+                        try:
+                            float_value = float(value)
+                        except (ValueError, TypeError):
+                            # If all else fails, return None (safer than passing invalid type)
+                            logger.warning(f"Could not convert value {type(value)} to Python native type, using None")
+                            return None
+                    
+                    # Round to 2 decimal places before validation
+                    rounded_value = round(float_value, 2)
+                    
+                    # Validate database limits for DecimalField(max_digits=20, decimal_places=8)
+                    # The database requires values to be strictly less than 10^12 (absolute value)
+                    # If value exceeds limit, this indicates bad data or calculation error - raise error
+                    if rounded_value >= 10**12:
+                        error_msg = (
+                            f"Value {rounded_value} for field '{field_name}' exceeds database limit (10^12). "
+                            f"This likely indicates bad data or a calculation error. "
+                            f"Symbol: {symbol_ticker}, "
+                            f"entry_price={trade_data.get('entry_price')}, exit_price={trade_data.get('exit_price')}, "
+                            f"quantity={trade_data.get('quantity')}, pnl={trade_data.get('pnl')}, "
+                            f"bet_amount={trade_metadata.get('bet_amount')}"
+                        )
+                        logger.error(error_msg)
+                        raise ValueError(error_msg)
+                    elif rounded_value <= -(10**12):
+                        error_msg = (
+                            f"Value {rounded_value} for field '{field_name}' exceeds database limit (-10^12). "
+                            f"This likely indicates bad data or a calculation error. "
+                            f"Symbol: {symbol_ticker}, "
+                            f"entry_price={trade_data.get('entry_price')}, exit_price={trade_data.get('exit_price')}, "
+                            f"quantity={trade_data.get('quantity')}, pnl={trade_data.get('pnl')}, "
+                            f"bet_amount={trade_metadata.get('bet_amount')}"
+                        )
+                        logger.error(error_msg)
+                        raise ValueError(error_msg)
+                    
+                    return rounded_value
                 
                 Trade.objects.create(
                     backtest=backtest,
                     symbol=trade_data['symbol'],
                     trade_type=trade_data['trade_type'],
-                    entry_price=convert_value(trade_data['entry_price']),
-                    exit_price=convert_value(trade_data.get('exit_price')),
+                    entry_price=convert_value(trade_data['entry_price'], 'entry_price'),
+                    exit_price=convert_value(trade_data.get('exit_price'), 'exit_price'),
                     entry_timestamp=trade_data['entry_timestamp'],
                     exit_timestamp=trade_data.get('exit_timestamp'),
-                    quantity=convert_value(trade_data['quantity']),
-                    pnl=convert_value(trade_data.get('pnl')),
-                    pnl_percentage=convert_value(trade_data.get('pnl_percentage')),
+                    quantity=convert_value(trade_data['quantity'], 'quantity'),
+                    pnl=convert_value(trade_data.get('pnl'), 'pnl'),
+                    pnl_percentage=convert_value(trade_data.get('pnl_percentage'), 'pnl_percentage'),
                     is_winner=trade_data.get('is_winner'),
-                    max_drawdown=convert_value(trade_data.get('max_drawdown')),
+                    max_drawdown=convert_value(trade_data.get('max_drawdown'), 'max_drawdown'),
                     metadata=trade_metadata
                 )
+        
+        # Helper function to round and validate statistics values before saving
+        def round_and_validate_stat(value, field_name=None, decimal_places=2, symbol=None):
+            """Round value to specified decimal places and validate database limits
+            
+            If value exceeds database limit, raises ValueError (indicates bad data/calculation error)
+            """
+            if value is None:
+                return None
+            
+            try:
+                float_value = float(value)
+            except (ValueError, TypeError):
+                logger.warning(f"Could not convert {field_name} value {value} to float, using None")
+                return None
+            
+            # Round to specified decimal places
+            rounded_value = round(float_value, decimal_places)
+            
+            # Validate database limits for DecimalField(max_digits=20, decimal_places=8)
+            # The database requires values to be strictly less than 10^12 (absolute value)
+            # If value exceeds limit, this indicates bad data or calculation error - raise error
+            if rounded_value >= 10**12:
+                symbol_info = f"Symbol: {symbol.ticker if symbol and hasattr(symbol, 'ticker') else 'portfolio-level'}"
+                error_msg = (
+                    f"Value {rounded_value} for field '{field_name}' exceeds database limit (10^12). "
+                    f"This likely indicates bad data or a calculation error. "
+                    f"{symbol_info}"
+                )
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+            elif rounded_value <= -(10**12):
+                symbol_info = f"Symbol: {symbol.ticker if symbol and hasattr(symbol, 'ticker') else 'portfolio-level'}"
+                error_msg = (
+                    f"Value {rounded_value} for field '{field_name}' exceeds database limit (-10^12). "
+                    f"This likely indicates bad data or a calculation error. "
+                    f"{symbol_info}"
+                )
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+            
+            return rounded_value
         
         # Save statistics
         for symbol, stats in statistics.items():
@@ -266,10 +359,22 @@ def run_backtest_task(self, backtest_id):
                         'equity_curve': [],
                     }
                 
+                # Prepare statistics with rounded and validated values
+                stats_dict = {k: v for k, v in portfolio_all.items() if k != 'additional_stats' and k != 'equity_curve'}
+                
+                # Round and validate numeric fields
+                numeric_fields = ['total_pnl', 'total_pnl_percentage', 'average_pnl', 'average_winner', 
+                                'average_loser', 'profit_factor', 'max_drawdown', 'sharpe_ratio', 
+                                'cagr', 'total_return', 'win_rate']
+                
+                for field in numeric_fields:
+                    if field in stats_dict:
+                        stats_dict[field] = round_and_validate_stat(stats_dict[field], field, decimal_places=2, symbol=None)
+                
                 BacktestStatistics.objects.create(
                     backtest=backtest,
                     symbol=None,
-                    **{k: v for k, v in portfolio_all.items() if k != 'additional_stats' and k != 'equity_curve'},
+                    **stats_dict,
                     equity_curve=portfolio_all.get('equity_curve', []),
                     additional_stats={
                         'long': stats.get('long', {}),
@@ -308,6 +413,15 @@ def run_backtest_task(self, backtest_id):
                         'cagr': 0,
                         'total_return': 0,
                     }
+                
+                # Round and validate numeric fields in stats_to_save
+                numeric_fields = ['total_pnl', 'total_pnl_percentage', 'average_pnl', 'average_winner', 
+                                'average_loser', 'profit_factor', 'max_drawdown', 'sharpe_ratio', 
+                                'cagr', 'total_return', 'win_rate']
+                
+                for field in numeric_fields:
+                    if field in stats_to_save:
+                        stats_to_save[field] = round_and_validate_stat(stats_to_save[field], field, decimal_places=2, symbol=symbol)
                 
                 BacktestStatistics.objects.create(
                     backtest=backtest,
