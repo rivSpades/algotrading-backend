@@ -133,17 +133,18 @@ class BacktestViewSet(viewsets.ModelViewSet):
             strategy_parameters.update(strategy_assignment.parameters)
         strategy_parameters.update(data.get('strategy_parameters', {}))
         
-        # Handle date range - if not provided, will be determined from actual data
+        # Handle date range - backtests now use ALL available data for each symbol
+        # start_date and end_date are kept for backward compatibility but are not used for filtering
         start_date = data.get('start_date')
         end_date = data.get('end_date')
         
-        # If dates not provided, set to None - will use actual data range
-        # The executor will update these with actual data dates
+        # If dates not provided, set to None
+        # The executor will use ALL available data for each symbol, not filter by dates
         if not start_date:
             start_date = None
         if not end_date:
             from django.utils import timezone
-            end_date = timezone.now()  # Current date for end_date, will be updated by executor
+            end_date = timezone.now()  # Set to current date for display purposes only
         
         # Create backtest
         backtest = Backtest.objects.create(

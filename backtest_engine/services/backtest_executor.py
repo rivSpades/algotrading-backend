@@ -47,23 +47,19 @@ class BacktestExecutor:
         self.equity_curves = {}  # {symbol: [(timestamp, equity), ...]}
         
     def load_data(self):
-        """Load OHLCV data for all symbols"""
-        logger.info(f"Loading OHLCV data for {len(self.symbols)} symbols")
+        """Load OHLCV data for all symbols - uses ALL available data for each symbol"""
+        logger.info(f"Loading OHLCV data for {len(self.symbols)} symbols (using all available data)")
         
         for symbol in self.symbols:
-            # Fetch OHLCV data - if dates are provided, filter by them, otherwise get all data
+            # Fetch ALL OHLCV data for this symbol - no date filtering
+            # Each symbol will use its own full date range
             ohlcv_filter = {
                 'symbol': symbol,
                 'timeframe': 'daily',
             }
             
-            # Add date filters if provided
-            from django.utils import timezone
-            
-            if self.start_date:
-                ohlcv_filter['timestamp__gte'] = self.start_date
-            if self.end_date:
-                ohlcv_filter['timestamp__lte'] = self.end_date
+            # DO NOT filter by start_date or end_date - use all available data
+            # This allows each symbol to use its own full historical data range
             
             ohlcv_queryset = OHLCV.objects.filter(**ohlcv_filter).order_by('timestamp')
             
@@ -91,68 +87,15 @@ class BacktestExecutor:
             df['timestamp'] = pd.to_datetime(df['timestamp'])
             df = df.sort_values('timestamp').reset_index(drop=True)
             
-            # Store the actual data range for this symbol
+            # Store the actual data range for this symbol (for logging only)
             symbol_start = df['timestamp'].min().to_pydatetime()
             symbol_end = df['timestamp'].max().to_pydatetime()
             
-            # Convert to timezone-aware if needed
-            if timezone.is_naive(symbol_start):
-                symbol_start = timezone.make_aware(symbol_start)
-            if timezone.is_naive(symbol_end):
-                symbol_end = timezone.make_aware(symbol_end)
+            # Log the actual data range for this symbol
+            logger.info(f"Loaded {len(df)} rows for {symbol.ticker} (date range: {symbol_start.date()} to {symbol_end.date()})")
             
-            # Update backtest date range to actual data range (use earliest start, latest end)
-            # Only update if we have valid dates (not the default "all data" placeholder)
-            from datetime import datetime
-            min_valid_date = timezone.make_aware(datetime(2000, 1, 1))  # Only update if date is after 2000
-            
-            # Ensure both dates are timezone-aware for comparison
-            if self.start_date and timezone.is_naive(self.start_date):
-                self.start_date = timezone.make_aware(self.start_date)
-            if self.end_date and timezone.is_naive(self.end_date):
-                self.end_date = timezone.make_aware(self.end_date)
-            
-            # Compare and update start_date
-            if not self.start_date:
-                self.start_date = symbol_start
-                self.backtest.start_date = self.start_date
-            else:
-                # Only update if current date is invalid (before 2000) or if symbol_start is earlier
-                try:
-                    if self.start_date < min_valid_date:
-                        self.start_date = symbol_start
-                        self.backtest.start_date = self.start_date
-                    elif symbol_start < self.start_date:
-                        self.start_date = symbol_start
-                        self.backtest.start_date = self.start_date
-                except TypeError:
-                    # If comparison fails, just use symbol_start
-                    self.start_date = symbol_start
-                    self.backtest.start_date = self.start_date
-            
-            # Compare and update end_date
-            if not self.end_date:
-                self.end_date = symbol_end
-                self.backtest.end_date = self.end_date
-            else:
-                # Only update if current date is invalid (before 2000) or if symbol_end is later
-                try:
-                    if self.end_date < min_valid_date:
-                        self.end_date = symbol_end
-                        self.backtest.end_date = self.end_date
-                    elif symbol_end > self.end_date:
-                        self.end_date = symbol_end
-                        self.backtest.end_date = self.end_date
-                except TypeError:
-                    # If comparison fails, just use symbol_end
-                    self.end_date = symbol_end
-                    self.backtest.end_date = self.end_date
-            
-            # Save updated dates
-            self.backtest.save(update_fields=['start_date', 'end_date'])
-            
+            # Store the data - each symbol uses its own full date range
             self.ohlcv_data[symbol] = df
-            logger.info(f"Loaded {len(df)} rows for {symbol.ticker}")
     
     def compute_indicators(self):
         """Compute required indicators for all symbols using strategy's required_tool_configs"""
@@ -745,6 +688,8 @@ class BacktestExecutor:
             return self._sma_crossover_signal(row, indicators, position, prev_indicators)
         elif strategy_name == 'Moving Average Crossover':
             return self._moving_average_crossover_signal(row, indicators, position, prev_indicators)
+        elif strategy_name == 'Gap-Up and Gap-Down':
+            return self._gap_up_gap_down_signal(row, indicators, position)
         elif strategy_name == 'RSI Mean Reversion':
             return self._rsi_mean_reversion_signal(row, indicators)
         elif strategy_name == 'Bollinger Bands Breakout':
@@ -891,6 +836,84 @@ class BacktestExecutor:
                 # Long position open: Exit LONG (close long = sell) - always allowed
                 logger.info(f"[{self.position_mode.upper()}] LONG EXIT signal: Short SMA ({short_sma:.2f}) crossed below Long SMA ({long_sma:.2f})")
                 return 'sell'
+        
+        return None
+    
+    def _gap_up_gap_down_signal(self, row: pd.Series, indicators: Dict, position: Optional[Dict]) -> Optional[str]:
+        """
+        Gap-Up and Gap-Down strategy signal
+        - Long entry: returns > threshold × std (gap-up)
+        - Short entry: returns < -(threshold × std) (gap-down)
+        - Exit: Opposite signal or position not allowed in mode
+        
+        Supports position_mode: 'long', 'short', 'all' (with flipping in ALL mode)
+        
+        IMPORTANT: Returns and STD are calculated using only data up to today's open
+        to avoid lookahead bias.
+        """
+        threshold = self.parameters.get('threshold', 0.25)
+        std_period = self.parameters.get('std_period', 90)
+        
+        # Get indicators - Returns and RollingSTD
+        # Indicator keys are formatted as: {tool_name}_{period} if period exists, else {tool_name}
+        returns_key = 'Returns'
+        std_key = f'RollingSTD_{std_period}'
+        
+        # Try multiple key formats for compatibility
+        returns = indicators.get(returns_key) or indicators.get('returns')
+        std = indicators.get(std_key) or indicators.get(f'STD_{std_period}') or indicators.get('RollingSTD')
+        
+        if returns is None or std is None:
+            logger.debug(f"Gap-Up and Gap-Down: Missing indicators. returns={returns}, std={std}, keys={list(indicators.keys())}")
+            return None
+        
+        # Check if we have an open position
+        has_position = position is not None
+        position_type = position['type'] if has_position else None  # "buy" or "sell"
+        
+        # Calculate signal thresholds
+        long_threshold = threshold * std
+        short_threshold = -threshold * std
+        
+        long_signal = returns > long_threshold
+        short_signal = returns < short_threshold
+        
+        # LONG ENTRY/FLIP
+        if long_signal:
+            if self.position_mode in ('long', 'all'):
+                if not has_position:
+                    # No position: Enter LONG
+                    logger.info(f"[{self.position_mode.upper()}] LONG ENTRY signal: returns ({returns:.4f}) > threshold×std ({long_threshold:.4f})")
+                    return 'buy'
+                elif self.position_mode == 'all' and position_type == 'sell':
+                    # Short position open in ALL mode: Flip to LONG
+                    logger.info(f"[{self.position_mode.upper()}] FLIP SHORT→LONG: returns ({returns:.4f}) > threshold×std ({long_threshold:.4f})")
+                    return 'buy'
+        
+        # SHORT ENTRY/FLIP
+        if short_signal:
+            if self.position_mode in ('short', 'all'):
+                if not has_position:
+                    # No position: Enter SHORT
+                    logger.info(f"[{self.position_mode.upper()}] SHORT ENTRY signal: returns ({returns:.4f}) < -threshold×std ({short_threshold:.4f})")
+                    return 'sell'
+                elif self.position_mode == 'all' and position_type == 'buy':
+                    # Long position open in ALL mode: Flip to SHORT
+                    logger.info(f"[{self.position_mode.upper()}] FLIP LONG→SHORT: returns ({returns:.4f}) < -threshold×std ({short_threshold:.4f})")
+                    return 'sell'
+        
+        # EXIT CONDITIONS
+        # Exit LONG if opposite signal (gap-down) or mode doesn't allow long
+        if has_position and position_type == 'buy':
+            if short_signal or self.position_mode == 'short':
+                logger.info(f"[{self.position_mode.upper()}] LONG EXIT signal: returns ({returns:.4f})")
+                return 'sell'
+        
+        # Exit SHORT if opposite signal (gap-up) or mode doesn't allow short
+        if has_position and position_type == 'sell':
+            if long_signal or self.position_mode == 'long':
+                logger.info(f"[{self.position_mode.upper()}] SHORT EXIT signal: returns ({returns:.4f})")
+                return 'buy'
         
         return None
     

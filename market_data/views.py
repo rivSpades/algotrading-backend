@@ -133,13 +133,18 @@ class SymbolViewSet(viewsets.ModelViewSet):
                 'volume': float(ohlcv['volume'])
             })
         
-        # Compute indicators on full dataset
-        from .services.indicator_service import compute_indicators_for_ohlcv
-        full_indicator_values = compute_indicators_for_ohlcv(symbol, full_ohlcv_list)
-        
-        # If strategy_id or backtest_id is provided, also compute strategy's required indicators
+        # If strategy_id or backtest_id is provided, ONLY compute strategy's required indicators
+        # Otherwise, compute all enabled indicators
         strategy_id = request.query_params.get('strategy_id')
         backtest_id = request.query_params.get('backtest_id')
+        
+        if strategy_id or backtest_id:
+            # For strategy/backtest views: ONLY compute strategy indicators (not all enabled indicators)
+            full_indicator_values = {}
+        else:
+            # For regular views: compute all enabled indicators
+            from .services.indicator_service import compute_indicators_for_ohlcv
+            full_indicator_values = compute_indicators_for_ohlcv(symbol, full_ohlcv_list)
         
         if strategy_id or backtest_id:
             try:
@@ -182,8 +187,20 @@ class SymbolViewSet(viewsets.ModelViewSet):
                     import logging
                     logger = logging.getLogger(__name__)
                     logger.info(f"Computing strategy indicators for strategy {strategy.name} (id={strategy.id}) with {len(strategy.required_tool_configs)} tool configs")
+                    
+                    # Get strategy parameters from backtest if available, otherwise use strategy defaults
+                    strategy_parameters = None
+                    if backtest_id:
+                        try:
+                            backtest_id_int = int(backtest_id)
+                            backtest = Backtest.objects.get(id=backtest_id_int)
+                            strategy_parameters = backtest.strategy_parameters
+                            logger.info(f"Using backtest strategy_parameters: {strategy_parameters}")
+                        except (Backtest.DoesNotExist, ValueError, TypeError):
+                            pass
+                    
                     strategy_indicator_values = compute_strategy_indicators_for_ohlcv(
-                        strategy, full_ohlcv_list, symbol
+                        strategy, full_ohlcv_list, symbol, strategy_parameters=strategy_parameters
                     )
                     # Log computed strategy indicators
                     logger.info(f"Computed {len(strategy_indicator_values)} strategy indicators: {list(strategy_indicator_values.keys())}")

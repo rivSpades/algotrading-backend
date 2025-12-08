@@ -162,6 +162,46 @@ def calculate_bollinger_bands(prices: pd.Series, period: int = 20, num_std: floa
     }
 
 
+def calculate_returns(open_prices: pd.Series, close_prices: pd.Series) -> pd.Series:
+    """
+    Calculate gap returns: (Open_t - Close_{t-1}) / Close_{t-1}
+    
+    This calculates the return from previous day's close to today's open.
+    Used for gap-up/gap-down analysis.
+    
+    Args:
+        open_prices: Series of opening prices
+        close_prices: Series of closing prices
+    
+    Returns:
+        Series of gap returns (as decimal, e.g., 0.02 for 2%)
+    """
+    # Shift close prices by 1 to get previous day's close
+    prev_close = close_prices.shift(1)
+    
+    # Calculate gap return: (open - prev_close) / prev_close
+    returns = (open_prices - prev_close) / prev_close
+    
+    return returns
+
+
+def calculate_rolling_std(returns: pd.Series, period: int = 90) -> pd.Series:
+    """
+    Calculate rolling standard deviation of returns
+    
+    IMPORTANT: This function calculates STD using only historical data up to the current point.
+    For bias prevention, ensure returns are calculated from data available before the current bar.
+    
+    Args:
+        returns: Series of returns (e.g., from calculate_returns)
+        period: Rolling window period (default: 90)
+    
+    Returns:
+        Series of rolling standard deviation values
+    """
+    return returns.rolling(window=period).std()
+
+
 # Indicator registry mapping tool names to calculation functions
 INDICATOR_FUNCTIONS = {
     'RSI': calculate_rsi,
@@ -171,6 +211,8 @@ INDICATOR_FUNCTIONS = {
     'SMA': calculate_sma,
     'EMA': calculate_ema,
     'BollingerBands': calculate_bollinger_bands,
+    'Returns': calculate_returns,
+    'RollingSTD': calculate_rolling_std,
 }
 
 
@@ -246,6 +288,19 @@ def compute_indicator(
     
     elif tool_name in ['Variance', 'SMA', 'EMA']:
         result = func(df['close'], **parameters)
+        df['indicator_value'] = result.values
+    
+    elif tool_name == 'Returns':
+        # Returns: (open - prev_close) / prev_close
+        result = func(df['open'], df['close'], **parameters)
+        df['indicator_value'] = result.values
+    
+    elif tool_name == 'RollingSTD':
+        # RollingSTD: rolling standard deviation of returns
+        # First calculate returns, then calculate rolling STD
+        # This ensures bias prevention - STD is calculated from historical returns only
+        returns = calculate_returns(df['open'], df['close'])
+        result = func(returns, **parameters)
         df['indicator_value'] = result.values
     
     else:
