@@ -155,57 +155,63 @@ class BacktestExecutor:
             logger.info(f"Loaded {len(df)} rows for {symbol.ticker}")
     
     def compute_indicators(self):
-        """Compute required indicators for all symbols"""
+        """Compute required indicators for all symbols using strategy's required_tool_configs"""
         logger.info("Computing indicators for all symbols")
         
-        # Get required indicators from strategy
-        required_indicators = self.strategy.analytic_tools_used
+        # Use strategy's required_tool_configs to compute indicators
+        # This handles different parameter names (fast_period/slow_period vs short_period/long_period)
+        from market_data.services.indicator_service import compute_strategy_indicators_for_ohlcv
         
         for symbol, df in self.ohlcv_data.items():
             symbol_indicators = {}
             
-            # For SMA Crossover strategy, compute SMAs directly from strategy parameters
-            if 'SMA' in required_indicators:
-                from analytical_tools.indicators import compute_indicator
-                
-                # Get strategy parameters
-                fast_period = self.parameters.get('fast_period', 20)
-                slow_period = self.parameters.get('slow_period', 50)
-                
-                # Compute fast SMA
-                fast_sma_df = compute_indicator('SMA', df.copy(), {'period': fast_period})
-                if 'value' in fast_sma_df.columns:
-                    fast_sma_key = f'SMA_{fast_period}'
-                    # Align with original DataFrame index
-                    fast_values = fast_sma_df['value'].values
-                    if len(fast_values) == len(df):
-                        symbol_indicators[fast_sma_key] = pd.Series(fast_values, index=df.index)
-                        logger.info(f"Computed {fast_sma_key} for {symbol.ticker}: {len(fast_values)} values, non-null: {pd.Series(fast_values).notna().sum()}")
-                    else:
-                        logger.error(f"Fast SMA length mismatch: {len(fast_values)} != {len(df)}")
-                
-                # Compute slow SMA
-                slow_sma_df = compute_indicator('SMA', df.copy(), {'period': slow_period})
-                if 'value' in slow_sma_df.columns:
-                    slow_sma_key = f'SMA_{slow_period}'
-                    # Align with original DataFrame index
-                    slow_values = slow_sma_df['value'].values
-                    if len(slow_values) == len(df):
-                        symbol_indicators[slow_sma_key] = pd.Series(slow_values, index=df.index)
-                        logger.info(f"Computed {slow_sma_key} for {symbol.ticker}: {len(slow_values)} values, non-null: {pd.Series(slow_values).notna().sum()}")
-                    else:
-                        logger.error(f"Slow SMA length mismatch: {len(slow_values)} != {len(df)}")
-            else:
-                # For other strategies, use the indicator service
-                ohlcv_list = df.to_dict('records')
-                indicator_values = compute_indicators_for_ohlcv(symbol, ohlcv_list)
-                
-                for indicator_key, values in indicator_values.items():
-                    base_name = indicator_key.split('_')[0]
-                    if base_name in required_indicators:
-                        series = pd.Series(values, index=df.index)
-                        symbol_indicators[base_name] = series
+            # Convert DataFrame to list of dicts for indicator service
+            ohlcv_list = df.to_dict('records')
+            
+            # Compute indicators using strategy's required_tool_configs
+            # This properly handles parameter mapping (e.g., short_period -> period)
+            # Use backtest's strategy_parameters (may override default_parameters)
+            indicator_values = compute_strategy_indicators_for_ohlcv(
+                self.strategy, ohlcv_list, symbol, strategy_parameters=self.parameters
+            )
+            
+            # Convert indicator values to pandas Series aligned with DataFrame index
+            # compute_strategy_indicators_for_ohlcv returns dict with structure:
+            # {indicator_key: {'values': [...], 'display_name': '...', ...}}
+            for indicator_key, indicator_data in indicator_values.items():
+                if isinstance(indicator_data, dict) and 'values' in indicator_data:
+                    # Extract values list from dict structure
+                    values = indicator_data['values']
+                    if isinstance(values, list):
+                        # Create Series aligned with DataFrame index
+                        # Pad with None if values list is shorter than df
+                        if len(values) < len(df):
+                            values.extend([None] * (len(df) - len(values)))
+                        elif len(values) > len(df):
+                            values = values[:len(df)]
+                        series = pd.Series(values, index=df.index[:len(values)])
                         symbol_indicators[indicator_key] = series
+                        
+                        # Also add base name for backward compatibility
+                        base_name = indicator_key.split('_')[0]
+                        if base_name not in symbol_indicators:
+                            symbol_indicators[base_name] = series
+                elif isinstance(indicator_data, list):
+                    # Direct list (legacy format)
+                    values = indicator_data
+                    if len(values) < len(df):
+                        values.extend([None] * (len(df) - len(values)))
+                    elif len(values) > len(df):
+                        values = values[:len(df)]
+                    series = pd.Series(values, index=df.index[:len(values)])
+                    symbol_indicators[indicator_key] = series
+                    
+                    base_name = indicator_key.split('_')[0]
+                    if base_name not in symbol_indicators:
+                        symbol_indicators[base_name] = series
+                elif isinstance(indicator_data, pd.Series):
+                    # Already a Series, just store it
+                    symbol_indicators[indicator_key] = indicator_data
             
             self.indicators[symbol] = symbol_indicators
             logger.info(f"Computed {len(symbol_indicators)} indicators for {symbol.ticker}: {list(symbol_indicators.keys())}")
@@ -293,21 +299,8 @@ class BacktestExecutor:
                     except (KeyError, IndexError, TypeError):
                         pass
             
-            # For SMA crossover, we need both SMAs
-            fast_period = self.parameters.get('fast_period', 20)
-            slow_period = self.parameters.get('slow_period', 50)
-            fast_sma_key = f'SMA_{fast_period}'
-            slow_sma_key = f'SMA_{slow_period}'
-            
-            fast_sma = indicator_values.get(fast_sma_key)
-            slow_sma = indicator_values.get(slow_sma_key)
-            
-            if fast_sma is None or slow_sma is None:
-                if prev_indicator_values is None and indicator_values:
-                    prev_indicator_values = indicator_values.copy()
-                continue
-            
-            # Generate signal
+            # Generate signal - let the strategy-specific signal function handle indicator validation
+            # Different strategies may use different parameter names (fast_period/slow_period vs short_period/long_period)
             signal = self._generate_signal(row, indicator_values, position, prev_indicator_values)
             
             if signal:
@@ -450,21 +443,8 @@ class BacktestExecutor:
                     except (KeyError, IndexError, TypeError):
                         pass
             
-            # Check if we have required indicators
-            fast_period = self.parameters.get('fast_period', 20)
-            slow_period = self.parameters.get('slow_period', 50)
-            fast_sma_key = f'SMA_{fast_period}'
-            slow_sma_key = f'SMA_{slow_period}'
-            
-            fast_sma = indicator_values.get(fast_sma_key)
-            slow_sma = indicator_values.get(slow_sma_key)
-            
-            if fast_sma is None or slow_sma is None:
-                if prev_indicator_values is None and indicator_values:
-                    prev_indicators[symbol] = indicator_values.copy()
-                continue
-            
-            # Generate signal for this symbol
+            # Generate signal for this symbol - let the strategy-specific signal function handle indicator validation
+            # Different strategies may use different parameter names (fast_period/slow_period vs short_period/long_period)
             signal = self._generate_signal(row, indicator_values, position, prev_indicator_values)
             
             if indicator_values:
@@ -763,6 +743,8 @@ class BacktestExecutor:
         
         if strategy_name == 'Simple Moving Average Crossover':
             return self._sma_crossover_signal(row, indicators, position, prev_indicators)
+        elif strategy_name == 'Moving Average Crossover':
+            return self._moving_average_crossover_signal(row, indicators, position, prev_indicators)
         elif strategy_name == 'RSI Mean Reversion':
             return self._rsi_mean_reversion_signal(row, indicators)
         elif strategy_name == 'Bollinger Bands Breakout':
@@ -838,6 +820,76 @@ class BacktestExecutor:
             elif position_type == 'buy':
                 # Long position open: Exit LONG (close long = sell) - always allowed
                 logger.info(f"[{self.position_mode.upper()}] LONG EXIT signal: Fast SMA ({fast_sma:.2f}) crossed below Slow SMA ({slow_sma:.2f})")
+                return 'sell'
+        
+        return None
+    
+    def _moving_average_crossover_signal(self, row: pd.Series, indicators: Dict, position: Optional[Dict], prev_indicators: Optional[Dict] = None) -> Optional[str]:
+        """
+        Moving Average Crossover strategy signal - supports LONG and SHORT modes only (ALL disabled)
+        - Long entry: Short SMA crosses above Long SMA
+        - Long exit: Short SMA crosses below Long SMA
+        - Short entry: Short SMA crosses below Long SMA
+        - Short exit: Short SMA crosses above Long SMA
+        
+        Only supports position_mode: 'long' (only longs), 'short' (only shorts)
+        ALL mode is intentionally disabled for this strategy
+        """
+        short_period = self.parameters.get('short_period', 20)
+        long_period = self.parameters.get('long_period', 50)
+        
+        short_key = f'SMA_{short_period}'
+        long_key = f'SMA_{long_period}'
+        
+        short_sma = indicators.get(short_key)
+        long_sma = indicators.get(long_key)
+        
+        if short_sma is None or long_sma is None:
+            logger.debug(f"Moving Average Crossover: Missing indicators. short_sma={short_sma}, long_sma={long_sma}, keys={list(indicators.keys())}")
+            return None
+        
+        # Need previous values to detect crossover
+        if prev_indicators is None:
+            logger.debug(f"Moving Average Crossover: No previous indicators available")
+            return None
+        
+        prev_short_sma = prev_indicators.get(short_key)
+        prev_long_sma = prev_indicators.get(long_key)
+        
+        if prev_short_sma is None or prev_long_sma is None:
+            logger.debug(f"Moving Average Crossover: Missing previous indicators. prev_short={prev_short_sma}, prev_long={prev_long_sma}")
+            return None
+        
+        # Check if we have an open position
+        has_position = position is not None
+        position_type = position['type'] if has_position else None
+        
+        # Bullish crossover: Short SMA crosses above Long SMA
+        if prev_short_sma <= prev_long_sma and short_sma > long_sma:
+            if not has_position:
+                # No position: Enter LONG (only if position_mode is 'long')
+                if self.position_mode == 'long':
+                    logger.info(f"[{self.position_mode.upper()}] LONG ENTRY signal: Short SMA ({short_sma:.2f}) crossed above Long SMA ({long_sma:.2f})")
+                    return 'buy'
+                else:
+                    logger.debug(f"[{self.position_mode.upper()}] LONG ENTRY signal ignored (position_mode={self.position_mode}, ALL mode disabled)")
+            elif position_type == 'sell':
+                # Short position open: Exit SHORT (close short = buy) - always allowed
+                logger.info(f"[{self.position_mode.upper()}] SHORT EXIT signal: Short SMA ({short_sma:.2f}) crossed above Long SMA ({long_sma:.2f})")
+                return 'buy'
+        
+        # Bearish crossover: Short SMA crosses below Long SMA
+        elif prev_short_sma >= prev_long_sma and short_sma < long_sma:
+            if not has_position:
+                # No position: Enter SHORT (only if position_mode is 'short')
+                if self.position_mode == 'short':
+                    logger.info(f"[{self.position_mode.upper()}] SHORT ENTRY signal: Short SMA ({short_sma:.2f}) crossed below Long SMA ({long_sma:.2f})")
+                    return 'sell'
+                else:
+                    logger.debug(f"[{self.position_mode.upper()}] SHORT ENTRY signal ignored (position_mode={self.position_mode}, ALL mode disabled)")
+            elif position_type == 'buy':
+                # Long position open: Exit LONG (close long = sell) - always allowed
+                logger.info(f"[{self.position_mode.upper()}] LONG EXIT signal: Short SMA ({short_sma:.2f}) crossed below Long SMA ({long_sma:.2f})")
                 return 'sell'
         
         return None
@@ -999,14 +1051,71 @@ class BacktestExecutor:
                 total_return = round(total_return, 4)
                 
                 # Calculate CAGR - handle negative equity ratio to avoid complex numbers
+                # Also handle overflow for very large ratios or very small time periods
                 equity_ratio = final_equity / initial_equity
                 if equity_ratio > 0:
-                    cagr_value = ((equity_ratio ** (365.25 / days)) - 1) * 100
-                    # Ensure cagr is a real number (not complex)
-                    if isinstance(cagr_value, complex):
+                    try:
+                        # Use logarithmic calculation to avoid overflow: CAGR = (exp(ln(ratio) * (365.25/days)) - 1) * 100
+                        # This is mathematically equivalent but more numerically stable
+                        safe_days = max(days, 1)
+                        years = safe_days / 365.25
+                        
+                        # Use logarithms to avoid overflow in exponentiation
+                        # CAGR = (exp(ln(equity_ratio) / years) - 1) * 100
+                        # But we need to cap the exponent to prevent exp() overflow
+                        if equity_ratio > 0 and years > 0:
+                            # Cap equity ratio before taking log to prevent extreme values
+                            max_ratio = 1000.0
+                            min_ratio = 0.01
+                            capped_ratio = max(min_ratio, min(equity_ratio, max_ratio))
+                            
+                            log_ratio = np.log(capped_ratio)
+                            
+                            # Cap the exponent to prevent exp() overflow
+                            # exp(700) is near the limit for float64, so cap at 700
+                            max_exp_arg = 700.0
+                            exp_arg = log_ratio / years
+                            
+                            if exp_arg > max_exp_arg:
+                                # Extreme case: cap CAGR at maximum
+                                cagr = 10000.0
+                            elif exp_arg < -max_exp_arg:
+                                # Extreme loss case: cap at -100%
+                                cagr = -100.0
+                            else:
+                                try:
+                                    cagr_value = (np.exp(exp_arg) - 1) * 100
+                                    
+                                    # Ensure cagr is a real number (not complex or inf/nan)
+                                    if isinstance(cagr_value, complex) or not np.isfinite(cagr_value):
+                                        # Fallback: cap at reasonable maximum
+                                        if equity_ratio > 1000.0:
+                                            cagr = 10000.0  # Cap at 10000% for extreme returns
+                                        elif equity_ratio < 0.01:
+                                            cagr = -100.0  # Cap losses at -100%
+                                        else:
+                                            cagr = 0.0
+                                    else:
+                                        cagr = float(cagr_value)
+                                        
+                                        # Cap CAGR at reasonable maximum (e.g., 10000% annual return)
+                                        max_cagr = 10000.0
+                                        if cagr > max_cagr:
+                                            cagr = max_cagr
+                                        elif cagr < -100.0:  # Cap losses at -100% (total loss)
+                                            cagr = -100.0
+                                except (OverflowError, FloatingPointError):
+                                    # If exp still overflows, use fallback
+                                    if equity_ratio > 1000.0:
+                                        cagr = 10000.0
+                                    else:
+                                        cagr = 0.0
+                        else:
+                            cagr = 0.0
+                                
+                    except (OverflowError, ValueError, ZeroDivisionError, FloatingPointError) as e:
+                        logger.warning(f"CAGR calculation overflow/error for symbol {symbol.ticker if symbol else 'portfolio'}: {e}. Using 0.0")
                         cagr = 0.0
-                    else:
-                        cagr = float(cagr_value)
                 else:
                     # If final equity is negative or zero, CAGR is not meaningful
                     cagr = 0.0
@@ -1399,14 +1508,71 @@ class BacktestExecutor:
                 total_return = ((final_equity - initial_equity) / initial_equity) * 100
                 
                 # Calculate CAGR - handle negative equity ratio to avoid complex numbers
+                # Also handle overflow for very large ratios or very small time periods
                 equity_ratio = final_equity / initial_equity
                 if equity_ratio > 0:
-                    cagr_value = ((equity_ratio ** (365.25 / days)) - 1) * 100
-                    # Ensure cagr is a real number (not complex)
-                    if isinstance(cagr_value, complex):
+                    try:
+                        # Use logarithmic calculation to avoid overflow: CAGR = (exp(ln(ratio) * (365.25/days)) - 1) * 100
+                        # This is mathematically equivalent but more numerically stable
+                        safe_days = max(days, 1)
+                        years = safe_days / 365.25
+                        
+                        # Use logarithms to avoid overflow in exponentiation
+                        # CAGR = (exp(ln(equity_ratio) / years) - 1) * 100
+                        # But we need to cap the exponent to prevent exp() overflow
+                        if equity_ratio > 0 and years > 0:
+                            # Cap equity ratio before taking log to prevent extreme values
+                            max_ratio = 1000.0
+                            min_ratio = 0.01
+                            capped_ratio = max(min_ratio, min(equity_ratio, max_ratio))
+                            
+                            log_ratio = np.log(capped_ratio)
+                            
+                            # Cap the exponent to prevent exp() overflow
+                            # exp(700) is near the limit for float64, so cap at 700
+                            max_exp_arg = 700.0
+                            exp_arg = log_ratio / years
+                            
+                            if exp_arg > max_exp_arg:
+                                # Extreme case: cap CAGR at maximum
+                                cagr = 10000.0
+                            elif exp_arg < -max_exp_arg:
+                                # Extreme loss case: cap at -100%
+                                cagr = -100.0
+                            else:
+                                try:
+                                    cagr_value = (np.exp(exp_arg) - 1) * 100
+                                    
+                                    # Ensure cagr is a real number (not complex or inf/nan)
+                                    if isinstance(cagr_value, complex) or not np.isfinite(cagr_value):
+                                        # Fallback: cap at reasonable maximum
+                                        if equity_ratio > 1000.0:
+                                            cagr = 10000.0  # Cap at 10000% for extreme returns
+                                        elif equity_ratio < 0.01:
+                                            cagr = -100.0  # Cap losses at -100%
+                                        else:
+                                            cagr = 0.0
+                                    else:
+                                        cagr = float(cagr_value)
+                                        
+                                        # Cap CAGR at reasonable maximum (e.g., 10000% annual return)
+                                        max_cagr = 10000.0
+                                        if cagr > max_cagr:
+                                            cagr = max_cagr
+                                        elif cagr < -100.0:  # Cap losses at -100% (total loss)
+                                            cagr = -100.0
+                                except (OverflowError, FloatingPointError):
+                                    # If exp still overflows, use fallback
+                                    if equity_ratio > 1000.0:
+                                        cagr = 10000.0
+                                    else:
+                                        cagr = 0.0
+                        else:
+                            cagr = 0.0
+                                
+                    except (OverflowError, ValueError, ZeroDivisionError, FloatingPointError) as e:
+                        logger.warning(f"CAGR calculation overflow/error for portfolio: {e}. Using 0.0")
                         cagr = 0.0
-                    else:
-                        cagr = float(cagr_value)
                 else:
                     # If final equity is negative or zero, CAGR is not meaningful
                     cagr = 0.0

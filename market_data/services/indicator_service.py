@@ -196,7 +196,7 @@ def compute_indicators_for_ohlcv(symbol, ohlcv_data):
     return indicator_values
 
 
-def compute_strategy_indicators_for_ohlcv(strategy, ohlcv_data, symbol):
+def compute_strategy_indicators_for_ohlcv(strategy, ohlcv_data, symbol, strategy_parameters=None):
     """
     Compute strategy's required indicators for OHLCV data
     
@@ -204,6 +204,7 @@ def compute_strategy_indicators_for_ohlcv(strategy, ohlcv_data, symbol):
         strategy: StrategyDefinition instance
         ohlcv_data: List of OHLCV dicts with timestamp, open, high, low, close, volume
         symbol: Symbol instance (for logging)
+        strategy_parameters: Optional dict of strategy parameters to use (overrides default_parameters)
     
     Returns:
         Dictionary mapping indicator names to their values aligned with ohlcv_data
@@ -224,8 +225,14 @@ def compute_strategy_indicators_for_ohlcv(strategy, ohlcv_data, symbol):
     # Store original order indices for alignment
     original_indices = list(range(len(df)))
     
-    # Get strategy parameters
-    strategy_params = strategy.default_parameters or {}
+    # Get strategy parameters - use provided parameters or fall back to default_parameters
+    if strategy_parameters is not None:
+        strategy_params = strategy_parameters.copy()
+        # Merge with defaults to ensure all required parameters are present
+        defaults = strategy.default_parameters or {}
+        strategy_params = {**defaults, **strategy_params}
+    else:
+        strategy_params = strategy.default_parameters or {}
     
     # Compute each required indicator
     indicator_values = {}

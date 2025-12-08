@@ -125,13 +125,22 @@ def run_backtest_task(self, backtest_id):
         )
         
         # Combine portfolio stats into the expected structure
+        # The executor returns stats with mode keys ('all', 'long', 'short') already
+        # But we need to ensure the structure is correct
         if None in all_statistics:
             portfolio_stats = all_statistics[None]
-            all_statistics[None] = {
-                'all': portfolio_stats.get('all', {}),
-                'long': portfolio_stats.get('long', {}),
-                'short': portfolio_stats.get('short', {}),
-            }
+            # If portfolio_stats is already a dict with 'all', 'long', 'short' keys, use it
+            # Otherwise, wrap it in the expected structure
+            if 'all' in portfolio_stats or 'long' in portfolio_stats or 'short' in portfolio_stats:
+                # Already in correct format
+                pass
+            else:
+                # Old format - wrap it
+                all_statistics[None] = {
+                    'all': portfolio_stats.get('all', portfolio_stats),  # Use portfolio_stats itself if no 'all' key
+                    'long': portfolio_stats.get('long', {}),
+                    'short': portfolio_stats.get('short', {}),
+                }
         
         statistics = all_statistics
         
@@ -151,6 +160,18 @@ def run_backtest_task(self, backtest_id):
             buy_count = sum(1 for t in mode_trades if t.get('trade_type') == 'buy')
             sell_count = sum(1 for t in mode_trades if t.get('trade_type') == 'sell')
             logger.info(f"  - Buy trades: {buy_count}, Sell trades: {sell_count}")
+            
+            # Validate: Strategy should generate at least 2 trades to be considered successful
+            # Less than 2 trades indicates potential issues:
+            # - 0 trades: No signals generated (possible indicator/computation issue)
+            # - 1 trade: Only one opportunity detected (possible data/split ratio issue)
+            if len(mode_trades) < 2:
+                logger.warning(
+                    f"⚠️ WARNING: Only {len(mode_trades)} trade(s) generated for position_mode={position_mode}. "
+                    f"This may indicate: "
+                    f"{'No signals generated - check indicator computation' if len(mode_trades) == 0 else 'Only one opportunity - check data period/split ratio'}. "
+                    f"Strategy execution may need investigation."
+                )
             
             for trade_data in mode_trades:
                 # Add position_mode to metadata
@@ -222,46 +243,88 @@ def run_backtest_task(self, backtest_id):
                 # Portfolio-level stats: store all/long/short breakdown in additional_stats
                 # Save the 'all' stats as the main record, with long/short in additional_stats
                 portfolio_all = stats.get('all', {})
-                if portfolio_all:
-                    BacktestStatistics.objects.create(
-                        backtest=backtest,
-                        symbol=None,
-                        **{k: v for k, v in portfolio_all.items() if k != 'additional_stats' and k != 'equity_curve'},
-                        equity_curve=portfolio_all.get('equity_curve', []),
-                        additional_stats={
-                            'long': stats.get('long', {}),
-                            'short': stats.get('short', {}),
-                        }
-                    )
+                # Always create portfolio stats, even if 'all' mode is empty
+                # This ensures portfolio stats exist for the frontend
+                if not portfolio_all or not portfolio_all.get('total_trades', 0):
+                    # Create empty portfolio stats if 'all' mode is empty or has no trades
+                    portfolio_all = {
+                        'total_trades': 0,
+                        'winning_trades': 0,
+                        'losing_trades': 0,
+                        'win_rate': 0,
+                        'total_pnl': 0,
+                        'total_pnl_percentage': 0,
+                        'average_pnl': 0,
+                        'average_winner': 0,
+                        'average_loser': 0,
+                        'profit_factor': 0,
+                        'max_drawdown': 0,
+                        'max_drawdown_duration': 0,
+                        'sharpe_ratio': 0,
+                        'cagr': 0,
+                        'total_return': 0,
+                        'equity_curve': [],
+                    }
+                
+                BacktestStatistics.objects.create(
+                    backtest=backtest,
+                    symbol=None,
+                    **{k: v for k, v in portfolio_all.items() if k != 'additional_stats' and k != 'equity_curve'},
+                    equity_curve=portfolio_all.get('equity_curve', []),
+                    additional_stats={
+                        'long': stats.get('long', {}),
+                        'short': stats.get('short', {}),
+                    }
+                )
             else:
                 # Symbol-specific stats: store all/long/short breakdown in additional_stats
                 # Similar to portfolio stats structure
                 symbol_all = stats.get('all', {})
-                if symbol_all:  # Only save if 'all' stats exist
-                    # Exclude equity_curve and additional_stats from main fields
-                    stats_to_save = {k: v for k, v in symbol_all.items() if k != 'equity_curve' and k != 'additional_stats'}
-                    equity_curve_all = symbol_all.get('equity_curve', [])
-                    
-                    # Get equity curves for long and short modes
-                    equity_curve_long = stats.get('long', {}).get('equity_curve', [])
-                    equity_curve_short = stats.get('short', {}).get('equity_curve', [])
-                    
-                    BacktestStatistics.objects.create(
-                        backtest=backtest,
-                        symbol=symbol,
-                        equity_curve=equity_curve_all,  # Store 'all' mode equity curve in main field
-                        additional_stats={
-                            'long': {
-                                **stats.get('long', {}),
-                                'equity_curve': equity_curve_long,  # Include equity curve in additional_stats
-                            },
-                            'short': {
-                                **stats.get('short', {}),
-                                'equity_curve': equity_curve_short,  # Include equity curve in additional_stats
-                            },
+                # Always save statistics even if empty (no trades) so frontend knows symbol was processed
+                # Exclude equity_curve and additional_stats from main fields
+                stats_to_save = {k: v for k, v in symbol_all.items() if k != 'equity_curve' and k != 'additional_stats'} if symbol_all else {}
+                equity_curve_all = symbol_all.get('equity_curve', []) if symbol_all else []
+                
+                # Get equity curves for long and short modes
+                equity_curve_long = stats.get('long', {}).get('equity_curve', [])
+                equity_curve_short = stats.get('short', {}).get('equity_curve', [])
+                
+                # If no stats were calculated (empty dict), create default empty statistics
+                if not symbol_all:
+                    stats_to_save = {
+                        'total_trades': 0,
+                        'winning_trades': 0,
+                        'losing_trades': 0,
+                        'win_rate': 0,
+                        'total_pnl': 0,
+                        'total_pnl_percentage': 0,
+                        'average_pnl': 0,
+                        'average_winner': 0,
+                        'average_loser': 0,
+                        'profit_factor': 0,
+                        'max_drawdown': 0,
+                        'max_drawdown_duration': 0,
+                        'sharpe_ratio': 0,
+                        'cagr': 0,
+                        'total_return': 0,
+                    }
+                
+                BacktestStatistics.objects.create(
+                    backtest=backtest,
+                    symbol=symbol,
+                    equity_curve=equity_curve_all,  # Store 'all' mode equity curve in main field
+                    additional_stats={
+                        'long': {
+                            **stats.get('long', {}),
+                            'equity_curve': equity_curve_long,  # Include equity curve in additional_stats
                         },
-                        **stats_to_save
-                    )
+                        'short': {
+                            **stats.get('short', {}),
+                            'equity_curve': equity_curve_short,  # Include equity curve in additional_stats
+                        },
+                    },
+                    **stats_to_save
+                )
         
         # Mark as completed
         backtest.status = 'completed'
