@@ -99,16 +99,29 @@ class SymbolViewSet(viewsets.ModelViewSet):
 
         # Get paginated queryset for response
         total_count = full_queryset.count()
-        paginated_queryset = full_queryset.order_by('-timestamp')
         
-        # Pagination
-        start = (page - 1) * page_size
-        end = start + page_size
-        paginated_queryset = paginated_queryset[start:end]
-
-        # Serialize paginated data
-        serializer = OHLCVSerializer(paginated_queryset, many=True)
-        results = serializer.data
+        # Check if this is a chart view (backtest_id or strategy_id provided)
+        # For chart views, return ALL data ordered by timestamp ascending (oldest to newest), no pagination
+        # For table views, use pagination with newest first
+        strategy_id = request.query_params.get('strategy_id')
+        backtest_id = request.query_params.get('backtest_id')
+        is_chart_view = bool(backtest_id or strategy_id)
+        
+        if is_chart_view:
+            # Chart view: return ALL data, ordered by timestamp ascending (oldest to newest)
+            # No pagination - return all OHLCV data for the chart
+            paginated_queryset = full_queryset.order_by('timestamp')
+            serializer = OHLCVSerializer(paginated_queryset, many=True)
+            results = serializer.data
+        else:
+            # Table view: use pagination with newest first
+            paginated_queryset = full_queryset.order_by('-timestamp')
+            # Pagination
+            start_idx = (page - 1) * page_size
+            end_idx = start_idx + page_size
+            paginated_queryset = paginated_queryset[start_idx:end_idx]
+            serializer = OHLCVSerializer(paginated_queryset, many=True)
+            results = serializer.data
 
         # Compute indicators on-the-fly using full dataset
         # Convert full queryset to list for pandas (need full dataset for accurate indicators)
@@ -135,8 +148,7 @@ class SymbolViewSet(viewsets.ModelViewSet):
         
         # If strategy_id or backtest_id is provided, ONLY compute strategy's required indicators
         # Otherwise, compute all enabled indicators
-        strategy_id = request.query_params.get('strategy_id')
-        backtest_id = request.query_params.get('backtest_id')
+        # (strategy_id and backtest_id already retrieved above for is_chart_view)
         
         if strategy_id or backtest_id:
             # For strategy/backtest views: ONLY compute strategy indicators (not all enabled indicators)
@@ -353,16 +365,32 @@ class SymbolViewSet(viewsets.ModelViewSet):
         logger = logging.getLogger(__name__)
         logger.info(f"Statistics calculated for {symbol.ticker}: {statistics}")
         
-        return Response({
-            'results': results,
-            'count': total_count,
-            'page': page,
-            'page_size': page_size,
-            'next': f'?page={page + 1}' if end < total_count else None,
-            'previous': f'?page={page - 1}' if page > 1 else None,
-            'indicators': indicators_metadata,  # Metadata about enabled indicators
-            'statistics': statistics if statistics else {}  # Statistics (volatility, etc.) - ensure it's always a dict
-        })
+        # Build response with appropriate pagination metadata
+        if is_chart_view:
+            # Chart view: no pagination (all data returned)
+            return Response({
+                'results': results,
+                'count': total_count,
+                'page': 1,
+                'page_size': total_count,  # Return total count as page_size to indicate all data
+                'next': None,
+                'previous': None,
+                'indicators': indicators_metadata,  # Metadata about enabled indicators
+                'statistics': statistics if statistics else {}  # Statistics (volatility, etc.) - ensure it's always a dict
+            })
+        else:
+            # Table view: include pagination metadata
+            end_idx = start_idx + page_size
+            return Response({
+                'results': results,
+                'count': total_count,
+                'page': page,
+                'page_size': page_size,
+                'next': f'?page={page + 1}' if end_idx < total_count else None,
+                'previous': f'?page={page - 1}' if page > 1 else None,
+                'indicators': indicators_metadata,  # Metadata about enabled indicators
+                'statistics': statistics if statistics else {}  # Statistics (volatility, etc.) - ensure it's always a dict
+            })
 
     @action(detail=True, methods=['post'], url_path='update-data', url_name='update-data')
     def update_data(self, request, pk=None):
