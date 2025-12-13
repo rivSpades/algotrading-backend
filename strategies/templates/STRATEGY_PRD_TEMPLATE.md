@@ -337,3 +337,6 @@ elif strategy_name == '[Strategy Name]':
 **Version:** [Version Number]  
 **Status:** [Draft / Review / Approved / Implemented]
 
+
+
+
