@@ -10,12 +10,15 @@ from datetime import datetime
 from decimal import Decimal
 from django.utils import timezone
 from django.db import models
+from django.db import connections
 import pytz
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from market_data.models import Symbol, OHLCV
 from strategies.models import StrategyDefinition
 from analytical_tools.indicators import compute_indicator
 from market_data.services.indicator_service import compute_indicators_for_ohlcv
 import logging
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -23,13 +26,14 @@ logger = logging.getLogger(__name__)
 class BacktestExecutor:
     """Executes backtests for trading strategies"""
     
-    def __init__(self, backtest, position_mode='all'):
+    def __init__(self, backtest, position_mode='all', preprocessed_data=None):
         """
         Initialize backtest executor
         
         Args:
             backtest: Backtest model instance
             position_mode: 'all' (both long and short), 'long' (only long positions), 'short' (only short positions)
+            preprocessed_data: Optional dict of pre-processed symbol data from Phase 1 {symbol: {'df': DataFrame, 'indicators': dict, 'test_df': DataFrame, 'price_cache': dict}}
         """
         self.backtest = backtest
         self.strategy = backtest.strategy
@@ -39,10 +43,27 @@ class BacktestExecutor:
         self.end_date = backtest.end_date
         self.split_ratio = backtest.split_ratio
         self.position_mode = position_mode  # 'all', 'long', or 'short'
+        self.preprocessed_data = preprocessed_data  # Pre-processed data from Phase 1
         
         # Filter symbols based on broker associations if broker is set
         all_symbols = list(backtest.symbols.all())
-        self.symbols = self._filter_symbols_by_broker(all_symbols, position_mode)
+        
+        # For initial data loading (position_mode='all'), filter to only active symbols with at least one trading capability
+        # This ensures we only load data for symbols that can actually be traded
+        # For other position modes, use position-specific filtering
+        if position_mode == 'all':
+            # For data loading, filter symbols that are active and have at least one trading capability
+            self.symbols = self._filter_symbols_for_data_loading(all_symbols)
+        else:
+            # For specific position modes, use position-specific filtering
+            self.symbols = self._filter_symbols_by_broker(all_symbols, position_mode)
+        
+        # If preprocessed_data is provided, filter symbols to only those that were pre-processed
+        if self.preprocessed_data:
+            # Only use symbols that exist in preprocessed_data and are in our filtered list
+            preprocessed_symbols = set(self.preprocessed_data.keys())
+            self.symbols = [s for s in self.symbols if s in preprocessed_symbols]
+            logger.info(f"[{self.position_mode.upper()}] Using {len(self.symbols)} pre-processed symbols (out of {len(preprocessed_symbols)} available)")
         
         # Initialize data storage
         self.ohlcv_data = {}  # {symbol: DataFrame}
@@ -82,6 +103,11 @@ class BacktestExecutor:
         
         filtered_symbols = []
         for symbol in symbols:
+            # First check if symbol is active
+            if symbol.status != 'active':
+                logger.debug(f"Symbol {symbol.ticker} is not active (status={symbol.status}), skipping")
+                continue
+            
             try:
                 association = SymbolBrokerAssociation.objects.get(
                     symbol=symbol,
@@ -89,6 +115,10 @@ class BacktestExecutor:
                 )
                 
                 # Check if symbol supports the requested position mode
+                # Filtering rules:
+                # - 'all' mode: symbols with both long_active=True AND short_active=True
+                # - 'long' mode: symbols with long_active=True
+                # - 'short' mode: symbols with short_active=True
                 if position_mode == 'all':
                     if association.long_active and association.short_active:
                         filtered_symbols.append(symbol)
@@ -112,21 +142,73 @@ class BacktestExecutor:
             )
         
         return filtered_symbols
+    
+    def _filter_symbols_for_data_loading(self, symbols):
+        """
+        Filter symbols for data loading: only active symbols with at least one trading capability
         
-    def load_data(self):
-        """Load OHLCV data for all symbols - uses ALL available data for each symbol"""
-        logger.info(f"Loading OHLCV data for {len(self.symbols)} symbols (using all available data)")
+        This ensures we only load OHLCV data for symbols that are:
+        - Active (status='active')
+        - Have at least one trading capability (long_active=True OR short_active=True)
         
-        for symbol in self.symbols:
+        Args:
+            symbols: List of Symbol instances
+        
+        Returns:
+            Filtered list of Symbol instances
+        """
+        if not self.broker:
+            # No broker set, filter by status only
+            filtered = [s for s in symbols if s.status == 'active']
+            logger.info(f"Filtered to {len(filtered)} active symbols (no broker filtering)")
+            return filtered
+        
+        # Import here to avoid circular imports
+        from live_trading.models import SymbolBrokerAssociation
+        from django.db.models import Q
+        
+        logger.info(f"Filtering {len(symbols)} symbols for data loading (active + at least one trading capability)")
+        
+        filtered_symbols = []
+        for symbol in symbols:
+            # First check if symbol is active
+            if symbol.status != 'active':
+                logger.debug(f"Symbol {symbol.ticker} is not active (status={symbol.status}), skipping")
+                continue
+            
+            try:
+                association = SymbolBrokerAssociation.objects.get(
+                    symbol=symbol,
+                    broker=self.broker
+                )
+                
+                # Include symbol if it has at least one trading capability
+                if association.long_active or association.short_active:
+                    filtered_symbols.append(symbol)
+                else:
+                    logger.debug(f"Symbol {symbol.ticker} has no active trading capabilities, skipping")
+            except SymbolBrokerAssociation.DoesNotExist:
+                # Symbol not associated with broker, skip it
+                logger.debug(f"Symbol {symbol.ticker} not associated with broker {self.broker.name}, skipping")
+                continue
+        
+        logger.info(f"Filtered to {len(filtered_symbols)} symbols for data loading (from {len(symbols)} total)")
+        return filtered_symbols
+        
+    def _load_data_for_symbol(self, symbol):
+        """Load OHLCV data for a single symbol (on-demand/lazy loading)"""
+        try:
+            # Check if already loaded
+            if symbol in self.ohlcv_data:
+                return self.ohlcv_data[symbol]
+            
+            logger.info(f"[{self.position_mode.upper()}] Loading OHLCV data for symbol: {symbol.ticker}")
+            
             # Fetch ALL OHLCV data for this symbol - no date filtering
-            # Each symbol will use its own full date range
             ohlcv_filter = {
                 'symbol': symbol,
                 'timeframe': 'daily',
             }
-            
-            # DO NOT filter by start_date or end_date - use all available data
-            # This allows each symbol to use its own full historical data range
             
             ohlcv_queryset = OHLCV.objects.filter(**ohlcv_filter).order_by('timestamp')
             
@@ -146,8 +228,9 @@ class BacktestExecutor:
                 })
             
             if not ohlcv_list:
-                logger.warning(f"No OHLCV data found for {symbol.ticker}")
-                continue
+                logger.warning(f"[{self.position_mode.upper()}] No OHLCV data found for {symbol.ticker}")
+                self.ohlcv_data[symbol] = pd.DataFrame()  # Store empty DataFrame to avoid reloading
+                return self.ohlcv_data[symbol]
             
             # Convert to DataFrame
             df = pd.DataFrame(ohlcv_list)
@@ -159,20 +242,82 @@ class BacktestExecutor:
             symbol_end = df['timestamp'].max().to_pydatetime()
             
             # Log the actual data range for this symbol
-            logger.info(f"Loaded {len(df)} rows for {symbol.ticker} (date range: {symbol_start.date()} to {symbol_end.date()})")
+            logger.info(f"[{self.position_mode.upper()}] Loaded {len(df)} rows for {symbol.ticker} (date range: {symbol_start.date()} to {symbol_end.date()})")
             
-            # Store the data - each symbol uses its own full date range
+            # Cache the loaded data
             self.ohlcv_data[symbol] = df
+            return df
+        except Exception as e:
+            logger.error(f"[{self.position_mode.upper()}] Error loading data for {symbol.ticker}: {str(e)}")
+            # Store empty DataFrame to avoid reloading
+            self.ohlcv_data[symbol] = pd.DataFrame()
+            raise
     
-    def compute_indicators(self):
-        """Compute required indicators for all symbols using strategy's required_tool_configs"""
-        logger.info("Computing indicators for all symbols")
+    def load_data(self):
+        """Load OHLCV data for all symbols in parallel - uses ALL available data for each symbol"""
+        logger.info(f"Loading OHLCV data for {len(self.symbols)} symbols in parallel (using all available data)")
         
-        # Use strategy's required_tool_configs to compute indicators
-        # This handles different parameter names (fast_period/slow_period vs short_period/long_period)
+        # Use ThreadPoolExecutor to load data in parallel
+        # Each symbol's data loading is independent, so parallel execution is safe
+        max_workers = min(len(self.symbols), 10)  # Limit to 10 threads to avoid overwhelming the system
+        
+        # Thread-safe dictionary to store results
+        data_lock = threading.Lock()
+        results = {}
+        
+        def process_symbol(symbol):
+            """Wrapper function to load data for a single symbol"""
+            try:
+                symbol_result, df = self._load_data_for_symbol(symbol)
+                with data_lock:
+                    if df is not None:
+                        results[symbol_result] = df
+                return symbol_result, df
+            except Exception as e:
+                logger.error(f"Failed to load data for {symbol.ticker}: {str(e)}")
+                # Close database connection in this thread
+                connections.close_all()
+                raise
+        
+        # Execute data loading in parallel
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_symbol = {
+                executor.submit(process_symbol, symbol): symbol 
+                for symbol in self.symbols
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_symbol):
+                symbol = future_to_symbol[future]
+                try:
+                    # Result is already stored in results dict by process_symbol
+                    future.result()  # This will raise if there was an exception
+                except Exception as e:
+                    logger.error(f"Exception in data loading for {symbol.ticker}: {str(e)}")
+                    # Close database connections in case of error
+                    connections.close_all()
+                    raise
+        
+        # Assign all results to self.ohlcv_data (thread-safe since all threads have completed)
+        self.ohlcv_data = results
+        
+        # Close all database connections after parallel execution
+        connections.close_all()
+        
+        logger.info(f"Completed loading OHLCV data for {len(self.ohlcv_data)} symbols")
+    
+    def _compute_indicators_for_symbol(self, symbol, df):
+        """Compute indicators for a single symbol (on-demand/lazy loading)"""
         from market_data.services.indicator_service import compute_strategy_indicators_for_ohlcv
         
-        for symbol, df in self.ohlcv_data.items():
+        try:
+            # Check if already computed
+            if symbol in self.indicators:
+                return self.indicators[symbol]
+            
+            logger.info(f"[{self.position_mode.upper()}] Computing indicators for symbol: {symbol.ticker}")
+            
             symbol_indicators = {}
             
             # Convert DataFrame to list of dicts for indicator service
@@ -223,8 +368,70 @@ class BacktestExecutor:
                     # Already a Series, just store it
                     symbol_indicators[indicator_key] = indicator_data
             
+            # Cache the computed indicators
             self.indicators[symbol] = symbol_indicators
-            logger.info(f"Computed {len(symbol_indicators)} indicators for {symbol.ticker}: {list(symbol_indicators.keys())}")
+            logger.info(f"[{self.position_mode.upper()}] Computed {len(symbol_indicators)} indicators for {symbol.ticker}")
+            
+            return symbol_indicators
+        except Exception as e:
+            logger.error(f"[{self.position_mode.upper()}] Error computing indicators for {symbol.ticker}: {str(e)}")
+            # Store empty dict to avoid recomputing
+            self.indicators[symbol] = {}
+            raise
+    
+    def compute_indicators(self):
+        """Compute required indicators for all symbols using strategy's required_tool_configs (parallel execution)"""
+        logger.info(f"Computing indicators for {len(self.ohlcv_data)} symbols in parallel")
+        
+        # Use ThreadPoolExecutor to compute indicators in parallel
+        # Each symbol's indicator computation is independent, so parallel execution is safe
+        max_workers = min(len(self.ohlcv_data), 10)  # Limit to 10 threads to avoid overwhelming the system
+        
+        # Thread-safe dictionary to store results
+        indicators_lock = threading.Lock()
+        results = {}
+        
+        def process_symbol(symbol, df):
+            """Wrapper function to compute indicators for a single symbol"""
+            try:
+                symbol_result, symbol_indicators = self._compute_indicators_for_symbol(symbol, df)
+                with indicators_lock:
+                    results[symbol_result] = symbol_indicators
+                logger.info(f"Computed {len(symbol_indicators)} indicators for {symbol_result.ticker}: {list(symbol_indicators.keys())[:5]}")
+                return symbol_result, symbol_indicators
+            except Exception as e:
+                logger.error(f"Failed to compute indicators for {symbol.ticker}: {str(e)}")
+                # Close database connection in this thread
+                connections.close_all()
+                raise
+        
+        # Execute indicator computation in parallel
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_symbol = {
+                executor.submit(process_symbol, symbol, df): symbol 
+                for symbol, df in self.ohlcv_data.items()
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_symbol):
+                symbol = future_to_symbol[future]
+                try:
+                    # Result is already stored in results dict by process_symbol
+                    future.result()  # This will raise if there was an exception
+                except Exception as e:
+                    logger.error(f"Exception in indicator computation for {symbol.ticker}: {str(e)}")
+                    # Close database connections in case of error
+                    connections.close_all()
+                    raise
+        
+        # Assign all results to self.indicators (thread-safe since all threads have completed)
+        self.indicators = results
+        
+        # Close all database connections after parallel execution
+        connections.close_all()
+        
+        logger.info(f"Completed computing indicators for {len(self.indicators)} symbols")
     
     def execute_strategy(self):
         """Execute strategy logic and generate trades
@@ -248,16 +455,16 @@ class BacktestExecutor:
         """Execute strategy for a single symbol (original implementation)"""
         symbol = self.symbols[0]
         
-        if symbol not in self.ohlcv_data:
-            return
-            
-        df = self.ohlcv_data[symbol]
-        indicators = self.indicators.get(symbol, {})
+        # Load data on-demand
+        df = self._load_data_for_symbol(symbol)
         
         # Validate we have data
         if df.empty:
-            logger.warning(f"No data available for symbol {symbol.ticker}, skipping")
+            logger.warning(f"[{self.position_mode.upper()}] No data available for symbol {symbol.ticker}, skipping")
             return
+        
+        # Compute indicators on-demand
+        indicators = self._compute_indicators_for_symbol(symbol, df)
         
         # Split data into training and testing
         split_idx = int(len(df) * self.split_ratio)
@@ -350,7 +557,8 @@ class BacktestExecutor:
     def _execute_strategy_multi_symbol(self):
         """Execute strategy for multiple symbols with shared portfolio capital
         
-        Optimized version using price cache for fast lookups instead of DataFrame filtering.
+        Phase 2: Uses pre-processed data from Phase 1 (if available) or loads on-demand.
+        Collects events and processes them chronologically with shared capital.
         """
         logger.info(f"Executing multi-symbol strategy with shared capital for {len(self.symbols)} symbols")
         
@@ -365,74 +573,88 @@ class BacktestExecutor:
         # Track previous indicator values per symbol
         prev_indicators = {}  # {symbol: {indicator_name: value}}
         
-        # Prepare data for all symbols
-        symbol_data = {}  # {symbol: {'df': DataFrame, 'test_df': DataFrame, 'indicators': dict}}
-        
-        # Build timestamp-to-price lookup dictionaries for fast access (O(1) instead of O(n) DataFrame filtering)
-        symbol_price_cache = {}  # {symbol: {timestamp: price}}
-        
-        for symbol in self.symbols:
-            if symbol not in self.ohlcv_data:
-                continue
-            
-            df = self.ohlcv_data[symbol]
-            indicators = self.indicators.get(symbol, {})
-            
-            if df.empty:
-                continue
-            
-            # Split data
-            split_idx = int(len(df) * self.split_ratio)
-            if split_idx >= len(df):
-                split_idx = max(0, len(df) - 1)
-            
-            train_df = df.iloc[:split_idx]
-            test_df = df.iloc[split_idx:]
-            
-            if test_df.empty:
-                continue
-            
-            # Build price cache - O(n) once instead of O(n*m) repeatedly
-            # This avoids expensive DataFrame filtering in the main loop
-            price_cache = {}
-            for idx, row in test_df.iterrows():
-                timestamp = row['timestamp']
-                if pd.notna(row['close']):
-                    price_cache[timestamp] = float(row['close'])
-            symbol_price_cache[symbol] = price_cache
-            
-            symbol_data[symbol] = {
-                'df': df,
-                'test_df': test_df,
-                'indicators': indicators
-            }
-            positions[symbol] = None
-            prev_indicators[symbol] = None
-        
-        if not symbol_data:
-            logger.warning("No valid symbol data for multi-symbol execution")
-            return
+        # Store processed symbol data for later chronological processing
+        symbol_data = {}  # {symbol: {'df': DataFrame, 'test_df': DataFrame, 'indicators': dict, 'price_cache': dict}}
         
         # Create a merged timeline of all events from all symbols
         # Collect all timestamps with their corresponding symbol and row data
         all_events = []  # List of (timestamp, symbol, row_index, row_data)
         
-        for symbol, data in symbol_data.items():
-            test_df = data['test_df']
+        # Single loop: for each symbol, use pre-processed data or load on-demand, then collect events
+        for symbol in self.symbols:
+            # Check if we have pre-processed data for this symbol
+            if self.preprocessed_data and symbol in self.preprocessed_data:
+                # Use pre-processed data from Phase 1
+                preprocessed = self.preprocessed_data[symbol]
+                df = preprocessed['df']
+                indicators = preprocessed['indicators']
+                test_df = preprocessed['test_df']
+                price_cache = preprocessed['price_cache']
+                logger.debug(f"[{self.position_mode.upper()}] Using pre-processed data for {symbol.ticker}")
+            else:
+                # Load data on-demand (fallback if preprocessed_data not available)
+                logger.info(f"[{self.position_mode.upper()}] Loading data on-demand for {symbol.ticker}")
+                df = self._load_data_for_symbol(symbol)
+                
+                if df.empty:
+                    logger.warning(f"[{self.position_mode.upper()}] No data available for symbol {symbol.ticker}, skipping")
+                    continue
+                
+                # Compute indicators on-demand
+                indicators = self._compute_indicators_for_symbol(symbol, df)
+                
+                # Split data
+                split_idx = int(len(df) * self.split_ratio)
+                if split_idx >= len(df):
+                    split_idx = max(0, len(df) - 1)
+                
+                train_df = df.iloc[:split_idx]
+                test_df = df.iloc[split_idx:]
+                
+                if test_df.empty:
+                    logger.warning(f"[{self.position_mode.upper()}] No test data available for symbol {symbol.ticker} after split, skipping")
+                    continue
+                
+                # Build price cache
+                price_cache = {}
+                for idx, row in test_df.iterrows():
+                    timestamp = row['timestamp']
+                    if pd.notna(row['close']):
+                        price_cache[timestamp] = float(row['close'])
+            
+            # Store symbol data for chronological processing
+            symbol_data[symbol] = {
+                'df': df,
+                'test_df': test_df,
+                'indicators': indicators,
+                'price_cache': price_cache
+            }
+            positions[symbol] = None
+            prev_indicators[symbol] = None
+            
+            # Collect all events from this symbol's test data
+            symbol_event_count = 0
             for idx, row in test_df.iterrows():
                 timestamp = row['timestamp']
                 if pd.notna(row['close']):
                     all_events.append((timestamp, symbol, idx, row))
+                    symbol_event_count += 1
+            
+            logger.info(f"[{self.position_mode.upper()}] Collected {symbol_event_count} events for {symbol.ticker} (total events so far: {len(all_events)})")
+        
+        if not symbol_data:
+            logger.warning("No valid symbol data for multi-symbol execution")
+            return
         
         # Sort all events chronologically
         all_events.sort(key=lambda x: x[0])
         
-        logger.info(f"Processing {len(all_events)} events across {len(symbol_data)} symbols chronologically")
+        logger.info(f"[{self.position_mode.upper()}] Starting strategy execution: processing {len(all_events)} events chronologically across {len(symbol_data)} symbols with shared capital")
         
         # Helper function to get current price for a symbol at a timestamp (uses cache)
         def get_price_at_timestamp(symbol, timestamp):
             """Get price for symbol at timestamp using cached lookup (O(1) dict lookup)"""
-            price_cache = symbol_price_cache.get(symbol, {})
+            price_cache = symbol_data[symbol]['price_cache']
             # Find the closest timestamp <= current timestamp
             # Since events are processed chronologically, we can use the last known price
             valid_timestamps = [ts for ts in price_cache.keys() if ts <= timestamp]
@@ -448,8 +670,26 @@ class BacktestExecutor:
         if first_event_timestamp:
             portfolio_equity_curve.append((first_event_timestamp, initial_capital))
         
-        # Process events chronologically with shared capital
+        # Track logging state for progress updates
+        last_logged_symbol = None
+        processed_symbols = set()
+        event_count = 0
+        log_interval = 1000  # Log progress every 1000 events
+        
+        # Process events chronologically with shared capital (strategy execution happens here)
         for timestamp, symbol, idx, row in all_events:
+            event_count += 1
+            
+            # Log when we switch to a new symbol (first time we see it chronologically)
+            if symbol != last_logged_symbol:
+                if symbol not in processed_symbols:
+                    logger.info(f"[{self.position_mode.upper()}] Processing events for symbol: {symbol.ticker}")
+                    processed_symbols.add(symbol)
+                last_logged_symbol = symbol
+            
+            # Periodic progress logging
+            if event_count % log_interval == 0:
+                logger.info(f"[{self.position_mode.upper()}] Processed {event_count}/{len(all_events)} events (currently: {symbol.ticker} @ {timestamp.date()})")
             price = float(row['close'])
             position = positions[symbol]
             indicators = symbol_data[symbol]['indicators']
@@ -526,6 +766,8 @@ class BacktestExecutor:
             # Update portfolio equity curve
             portfolio_equity_curve.append((timestamp, float(portfolio_equity)))
         
+        logger.info(f"[{self.position_mode.upper()}] Completed chronological event processing: {len(all_events)} events processed")
+        
         # Close any open positions at the end
         final_timestamp = all_events[-1][0] if all_events else None
         for symbol, position in positions.items():
@@ -546,6 +788,8 @@ class BacktestExecutor:
         for symbol in self.symbols:
             if symbol in symbol_data:
                 self.equity_curves[symbol] = portfolio_equity_curve
+        
+        logger.info(f"[{self.position_mode.upper()}] Multi-symbol execution complete: {len([t for t in self.trades])} trades generated")
     
     def _process_trade_signal(self, symbol, timestamp, price, signal, position, capital, bet_size_pct, equity_curve, indicators, row_idx, current_equity=None):
         """Process a trade signal and return updated capital, position, and equity curve

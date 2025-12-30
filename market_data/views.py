@@ -79,6 +79,102 @@ class SymbolViewSet(viewsets.ModelViewSet):
             return SymbolListSerializer
         return SymbolSerializer
 
+    @action(detail=False, methods=['get'], url_path='random', url_name='random')
+    def random(self, request):
+        """Get a random selection of symbols
+        
+        Query parameters:
+        - count: Number of symbols to return (required)
+        - status: Filter by status (default: 'active')
+        - exchange: Filter by exchange code (optional)
+        - broker_id: Filter by broker ID - only return symbols linked to this broker (optional)
+        """
+        count = request.query_params.get('count')
+        if not count:
+            return Response({
+                'error': 'count parameter is required'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            count = int(count)
+            if count <= 0:
+                return Response({
+                    'error': 'count must be a positive integer'
+                }, status=status.HTTP_400_BAD_REQUEST)
+        except ValueError:
+            return Response({
+                'error': 'count must be a valid integer'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Build queryset with filters
+        queryset = Symbol.objects.select_related('exchange', 'provider').all()
+        
+        # Filter by status (default to 'active')
+        status_filter = request.query_params.get('status', 'active')
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+        
+        # Filter by exchange code if provided
+        exchange_code = request.query_params.get('exchange', None)
+        if exchange_code:
+            queryset = queryset.filter(exchange__code=exchange_code)
+        
+        # Filter by broker if provided (only symbols linked to the broker with at least one active flag)
+        broker_id = request.query_params.get('broker_id', None)
+        if broker_id:
+            try:
+                from live_trading.models import SymbolBrokerAssociation
+                from django.db.models import Q
+                
+                # Get symbols linked to this broker with at least one trading capability (long_active or short_active)
+                # Filter by status first on the association's symbol relationship
+                associations = SymbolBrokerAssociation.objects.filter(
+                    broker_id=broker_id,
+                    symbol__status=status_filter if status_filter else 'active'
+                ).filter(
+                    Q(long_active=True) | Q(short_active=True)
+                ).select_related('symbol')
+                
+                # Get symbol tickers from associations
+                symbol_tickers = list(associations.values_list('symbol__ticker', flat=True).distinct())
+                
+                # Filter queryset to only include symbols from associations by ticker
+                if symbol_tickers:
+                    queryset = queryset.filter(ticker__in=symbol_tickers)
+                else:
+                    # No symbols match, return empty queryset
+                    queryset = queryset.none()
+            except Exception as e:
+                return Response({
+                    'error': f'Invalid broker_id: {str(e)}'
+                }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Get total count for validation
+        total_count = queryset.count()
+        
+        if total_count == 0:
+            return Response({
+                'results': [],
+                'count': 0,
+                'total_available': 0
+            })
+        
+        # If requested count exceeds available symbols, return all
+        if count > total_count:
+            count = total_count
+        
+        # Get random symbols using order_by('?') - Django's random ordering
+        random_symbols = list(queryset.order_by('?')[:count])
+        
+        # Serialize results
+        serializer = SymbolListSerializer(random_symbols, many=True)
+        
+        return Response({
+            'results': serializer.data,
+            'count': len(random_symbols),
+            'total_available': total_count
+        })
+
     @action(detail=True, methods=['get'])
     def ohlcv(self, request, pk=None):
         """Get OHLCV data for a symbol with pagination and on-the-fly indicator computation"""

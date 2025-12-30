@@ -4,14 +4,18 @@ Celery tasks for backtest execution
 
 from celery import shared_task
 from django.utils import timezone
+from django.db import connections
 from .models import Backtest, Trade, BacktestStatistics
 from .services.backtest_executor import BacktestExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
+import threading
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
 
-@shared_task(bind=True, name='backtest_engine.run_backtest')
+@shared_task(bind=True, name='backtest_engine.run_backtest', time_limit=48 * 60 * 60, soft_time_limit=48 * 60 * 60)
 def run_backtest_task(self, backtest_id):
     """
     Execute a backtest asynchronously
@@ -43,66 +47,264 @@ def run_backtest_task(self, backtest_id):
             meta={'progress': 10, 'message': 'Initializing backtest...'}
         )
         
-        # Initialize executor
-        executor = BacktestExecutor(backtest)
-        
-        # Update progress: 20% - Loading data
+        # Phase 1: Pre-process all symbols in parallel (ONCE, before the 3 modes)
+        # Load data and compute indicators for all symbols that will be used
+        logger.info("Phase 1: Pre-processing all symbols (load data -> compute indicators)")
         self.update_state(
             state='PROGRESS',
-            meta={'progress': 20, 'message': 'Loading OHLCV data...'}
+            meta={'progress': 12, 'message': 'Pre-processing symbols...'}
         )
         
-        # Load data
-        executor.load_data()
+        # Get symbols from the backtest (already filtered by user selection: specific symbols, random selection, or "select all")
+        from live_trading.models import SymbolBrokerAssociation
+        from django.db.models import Q
         
-        if not executor.ohlcv_data:
-            raise ValueError("No OHLCV data available for backtest symbols")
+        all_symbols = list(backtest.symbols.all())
         
-        # Update progress: 40% - Computing indicators
+        if backtest.broker:
+            # Filter to only symbols from backtest.symbols that are:
+            # - Active status
+            # - Linked to the broker with at least one trading capability (long_active or short_active)
+            # Symbol model uses 'ticker' as primary key, not 'id'
+            symbol_tickers = [s.ticker for s in all_symbols]
+            associations = SymbolBrokerAssociation.objects.filter(
+                broker=backtest.broker,
+                symbol__ticker__in=symbol_tickers,
+                symbol__status='active'
+            ).filter(
+                Q(long_active=True) | Q(short_active=True)
+            )
+            symbols_to_preprocess = [assoc.symbol for assoc in associations.select_related('symbol')]
+        else:
+            # No broker - filter by status only from the selected symbols
+            symbols_to_preprocess = [s for s in all_symbols if s.status == 'active']
+        
+        logger.info(f"Phase 1: Pre-processing {len(symbols_to_preprocess)} symbols in parallel")
+        
+        # Pre-process in parallel
+        preprocessed_data = {}  # {symbol: {'df': DataFrame, 'indicators': dict, 'test_df': DataFrame, 'price_cache': dict}}
+        preprocessed_lock = threading.Lock()
+        
+        def preprocess_symbol(symbol):
+            """Load data and compute indicators for a single symbol (Phase 1)"""
+            try:
+                logger.info(f"Pre-processing symbol: {symbol.ticker}")
+                
+                # Load OHLCV data directly (no executor needed, we already have filtered symbols)
+                from market_data.models import OHLCV
+                ohlcv_filter = {
+                    'symbol': symbol,
+                    'timeframe': 'daily',
+                }
+                ohlcv_queryset = OHLCV.objects.filter(**ohlcv_filter).order_by('timestamp')
+                
+                # Convert to list of dicts
+                ohlcv_list = []
+                for ohlcv in ohlcv_queryset.values('timestamp', 'open', 'high', 'low', 'close', 'volume'):
+                    timestamp = ohlcv['timestamp']
+                    if hasattr(timestamp, 'isoformat'):
+                        timestamp = timestamp.isoformat()
+                    ohlcv_list.append({
+                        'timestamp': timestamp,
+                        'open': float(ohlcv['open']),
+                        'high': float(ohlcv['high']),
+                        'low': float(ohlcv['low']),
+                        'close': float(ohlcv['close']),
+                        'volume': float(ohlcv['volume'])
+                    })
+                
+                if not ohlcv_list:
+                    return symbol, None
+                
+                # Convert to DataFrame
+                df = pd.DataFrame(ohlcv_list)
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                df = df.sort_values('timestamp').reset_index(drop=True)
+                
+                if df.empty:
+                    return symbol, None
+                
+                # Compute indicators directly (no executor needed)
+                from market_data.services.indicator_service import compute_strategy_indicators_for_ohlcv
+                ohlcv_list_for_indicators = df.to_dict('records')
+                indicator_values = compute_strategy_indicators_for_ohlcv(
+                    backtest.strategy, ohlcv_list_for_indicators, symbol, strategy_parameters=backtest.strategy_parameters
+                )
+                
+                # Convert indicator values to pandas Series aligned with DataFrame index
+                indicators = {}
+                for indicator_key, indicator_data in indicator_values.items():
+                    if isinstance(indicator_data, dict) and 'values' in indicator_data:
+                        values = indicator_data['values']
+                        if isinstance(values, list):
+                            if len(values) < len(df):
+                                values.extend([None] * (len(df) - len(values)))
+                            elif len(values) > len(df):
+                                values = values[:len(df)]
+                            series = pd.Series(values, index=df.index[:len(values)])
+                            indicators[indicator_key] = series
+                            # Also add base name for backward compatibility
+                            base_name = indicator_key.split('_')[0]
+                            if base_name not in indicators:
+                                indicators[base_name] = series
+                    elif isinstance(indicator_data, list):
+                        values = indicator_data
+                        if len(values) < len(df):
+                            values.extend([None] * (len(df) - len(values)))
+                        elif len(values) > len(df):
+                            values = values[:len(df)]
+                        series = pd.Series(values, index=df.index[:len(values)])
+                        indicators[indicator_key] = series
+                        base_name = indicator_key.split('_')[0]
+                        if base_name not in indicators:
+                            indicators[base_name] = series
+                    elif isinstance(indicator_data, pd.Series):
+                        indicators[indicator_key] = indicator_data
+                
+                # Split data
+                split_idx = int(len(df) * backtest.split_ratio)
+                if split_idx >= len(df):
+                    split_idx = max(0, len(df) - 1)
+                train_df = df.iloc[:split_idx]
+                test_df = df.iloc[split_idx:]
+                
+                if test_df.empty:
+                    return symbol, None
+                
+                # Build price cache for fast lookups
+                price_cache = {}
+                for idx, row in test_df.iterrows():
+                    timestamp = row['timestamp']
+                    if pd.notna(row['close']):
+                        price_cache[timestamp] = float(row['close'])
+                
+                with preprocessed_lock:
+                    preprocessed_data[symbol] = {
+                        'df': df,
+                        'indicators': indicators,
+                        'test_df': test_df,
+                        'price_cache': price_cache
+                    }
+                
+                return symbol, True
+            except Exception as e:
+                logger.error(f"Error pre-processing {symbol.ticker}: {str(e)}")
+                connections.close_all()
+                return symbol, None
+        
+        # Execute Phase 1 in parallel
+        max_workers = min(len(symbols_to_preprocess), 10)  # Limit threads
+        if symbols_to_preprocess:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(preprocess_symbol, symbol): symbol for symbol in symbols_to_preprocess}
+                for future in as_completed(futures):
+                    future.result()  # Raise exception if any occurred
+        
+        logger.info(f"Phase 1 complete: Pre-processed {len(preprocessed_data)} symbols")
         self.update_state(
             state='PROGRESS',
-            meta={'progress': 40, 'message': 'Computing indicators...'}
+            meta={'progress': 18, 'message': f'Pre-processed {len(preprocessed_data)} symbols'}
         )
         
-        # Compute indicators
-        executor.compute_indicators()
+        # Phase 2: Execute strategy three times: ALL, LONG, and SHORT in parallel
+        # Each mode uses the pre-processed data from Phase 1
+        self.update_state(
+            state='PROGRESS',
+            meta={'progress': 20, 'message': 'Executing strategy for all position modes...'}
+        )
         
-        # Update progress: 60% - Executing strategy
-        # Execute strategy three times: ALL, LONG, and SHORT
-        # This creates three separate strategy runs as if they were different strategies
         all_trades_by_mode = {}
         all_statistics = {}
         
+        def execute_position_mode(position_mode):
+            """Execute strategy for a single position mode (thread-safe helper)
+            
+            Note: Cannot call self.update_state() from within threads.
+            State updates must be done from the main task thread.
+            """
+            try:
+                logger.info(f"[{position_mode.upper()}] Starting strategy execution (Phase 2)")
+                
+                # Create a new executor instance for this mode with pre-processed data
+                mode_executor = BacktestExecutor(backtest, position_mode=position_mode, preprocessed_data=preprocessed_data)
+                
+                # Execute strategy for this mode (data/indicators loaded on-demand)
+                logger.info(f"[{position_mode.upper()}] Executing strategy logic...")
+                mode_executor.execute_strategy()
+                
+                # Log trade counts for debugging
+                buy_trades = [t for t in mode_executor.trades if t.get('trade_type') == 'buy']
+                sell_trades = [t for t in mode_executor.trades if t.get('trade_type') == 'sell']
+                logger.info(f"[{position_mode.upper()}] Generated {len(mode_executor.trades)} trades: {len(buy_trades)} buy, {len(sell_trades)} sell")
+                
+                if not mode_executor.trades:
+                    logger.warning(f"[{position_mode.upper()}] No trades generated for backtest {backtest_id}")
+                
+                # Calculate statistics for this mode
+                logger.info(f"[{position_mode.upper()}] Calculating statistics...")
+                mode_stats = mode_executor.calculate_statistics()
+                
+                logger.info(f"[{position_mode.upper()}] Completed strategy execution")
+                
+                return position_mode, mode_executor.trades, mode_stats
+            except Exception as e:
+                logger.error(f"[{position_mode.upper()}] Error executing strategy: {str(e)}")
+                # Close database connection in this thread
+                connections.close_all()
+                raise
+        
+        # Execute all three position modes in parallel
+        logger.info("Starting parallel execution of strategy for all position modes (all, long, short)")
+        mode_stats_results = {}
+        results_lock = threading.Lock()
+        
+        with ThreadPoolExecutor(max_workers=3) as executor_pool:
+            # Submit all three position mode tasks
+            future_to_mode = {
+                executor_pool.submit(execute_position_mode, mode): mode 
+                for mode in ['all', 'long', 'short']
+            }
+            
+            # Update progress as each mode completes (from main thread)
+            completed_count = 0
+            total_modes = 3
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_mode):
+                position_mode = future_to_mode[future]
+                try:
+                    mode_result, trades, stats = future.result()
+                    with results_lock:
+                        all_trades_by_mode[mode_result] = trades
+                        mode_stats_results[mode_result] = stats
+                    completed_count += 1
+                    
+                    # Update progress from main thread (20% to 70% for execution)
+                    progress = 20 + int((completed_count / total_modes) * 50)
+                    self.update_state(
+                        state='PROGRESS',
+                        meta={'progress': progress, 'message': f'Completed {completed_count}/{total_modes} position modes...'}
+                    )
+                    
+                    logger.info(f"[{position_mode.upper()}] Results collected successfully ({completed_count}/{total_modes})")
+                except Exception as e:
+                    logger.error(f"[{position_mode.upper()}] Exception in strategy execution: {str(e)}")
+                    # Close database connections in case of error
+                    connections.close_all()
+                    raise
+        
+        # Close database connections after parallel execution
+        connections.close_all()
+        
+        # Update progress: 70% - All execution modes completed
+        self.update_state(
+            state='PROGRESS',
+            meta={'progress': 70, 'message': 'Strategy execution completed for all modes'}
+        )
+        
+        # Process statistics from all modes
         for position_mode in ['all', 'long', 'short']:
-            logger.info(f"Executing strategy with position_mode={position_mode}")
-            
-            self.update_state(
-                state='PROGRESS',
-                meta={'progress': 60 + (position_mode == 'long' and 5 or position_mode == 'short' and 10 or 0), 
-                      'message': f'Executing strategy ({position_mode.upper()} positions)...'}
-            )
-            
-            # Create a new executor instance for each mode
-            mode_executor = BacktestExecutor(backtest, position_mode=position_mode)
-            mode_executor.ohlcv_data = executor.ohlcv_data  # Reuse loaded data
-            mode_executor.indicators = executor.indicators  # Reuse computed indicators
-            
-            # Execute strategy for this mode
-            mode_executor.execute_strategy()
-            
-            # Store trades for this mode (will be saved later)
-            all_trades_by_mode[position_mode] = mode_executor.trades
-            
-            # Log trade counts for debugging
-            buy_trades = [t for t in mode_executor.trades if t.get('trade_type') == 'buy']
-            sell_trades = [t for t in mode_executor.trades if t.get('trade_type') == 'sell']
-            logger.info(f"Generated {len(mode_executor.trades)} trades for position_mode={position_mode}: {len(buy_trades)} buy, {len(sell_trades)} sell")
-            
-            if not mode_executor.trades:
-                logger.warning(f"No trades generated for backtest {backtest_id} with position_mode={position_mode}")
-            
-            # Calculate statistics for this mode
-            mode_stats = mode_executor.calculate_statistics()
+            mode_stats = mode_stats_results.get(position_mode, {})
             
             # Store portfolio-level statistics
             if None in mode_stats:
@@ -118,10 +320,10 @@ def run_backtest_task(self, backtest_id):
                     all_statistics[symbol][position_mode] = symbol_stats
                     logger.info(f"Stored symbol-level statistics for {symbol.ticker} ({position_mode}): {len(symbol_stats)} fields")
         
-        # Update progress: 80% - Calculating statistics
+        # Update progress: 70% - Calculating statistics
         self.update_state(
             state='PROGRESS',
-            meta={'progress': 80, 'message': 'Calculating statistics...'}
+            meta={'progress': 70, 'message': 'Calculating statistics...'}
         )
         
         # Combine portfolio stats into the expected structure
@@ -144,10 +346,10 @@ def run_backtest_task(self, backtest_id):
         
         statistics = all_statistics
         
-        # Update progress: 90% - Saving results
+        # Update progress: 80% - Saving results
         self.update_state(
             state='PROGRESS',
-            meta={'progress': 90, 'message': 'Saving trades and statistics...'}
+            meta={'progress': 80, 'message': 'Saving trades and statistics...'}
         )
         
         # Save trades from all modes (ALL, LONG, SHORT)
@@ -447,6 +649,9 @@ def run_backtest_task(self, backtest_id):
         
         logger.info(f"Backtest {backtest_id} completed successfully")
         
+        # Calculate total trades count from all modes
+        total_trades_count = sum(len(trades) for trades in all_trades_by_mode.values())
+        
         # Update progress: 100% - Completed
         self.update_state(
             state='SUCCESS',
@@ -456,7 +661,7 @@ def run_backtest_task(self, backtest_id):
         return {
             'status': 'completed',
             'backtest_id': backtest_id,
-            'trades_count': len(executor.trades),
+            'trades_count': total_trades_count,
             'statistics_count': len(statistics)
         }
         

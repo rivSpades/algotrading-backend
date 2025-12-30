@@ -180,3 +180,4 @@ class Command(BaseCommand):
         self.stdout.write(f'  Final provider: {symbol.provider.code if symbol.provider else None}')
         self.stdout.write(f'  Final status: {symbol.status}\n')
 
+

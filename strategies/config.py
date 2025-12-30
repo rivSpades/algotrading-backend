@@ -28,6 +28,7 @@ Steps:
                 'parameter_mapping': {},
                 'display_name': 'Gap Returns',
                 'locked': True,
+                'subchart': True,  # Display in subchart
             },
             {
                 'tool_name': 'RollingSTD',
@@ -35,6 +36,7 @@ Steps:
                 'parameter_mapping': {'period': 'std_period'},
                 'display_name': 'Standard Deviation (Bias-Safe)',
                 'locked': False,
+                'subchart': True,  # Display in subchart
             },
         ],
         'globally_enabled': False,

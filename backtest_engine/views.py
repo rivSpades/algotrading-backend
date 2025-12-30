@@ -118,12 +118,18 @@ class BacktestViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_404_NOT_FOUND
                 )
             
-            # Get broker associations - only symbols with at least one active flag
-            # The executor will automatically filter symbols by position mode eligibility
+            # Get broker associations - filter by status='active' and broker association flags
+            # Since backtest runs all three modes ('all', 'long', 'short'), we include symbols compatible with any mode
+            # The executor will further filter symbols per mode:
+            #   - 'all' mode: symbols with both long_active=True AND short_active=True
+            #   - 'long' mode: symbols with long_active=True
+            #   - 'short' mode: symbols with short_active=True
+            # For initial filtering, include symbols with status='active' and at least one active flag
             associations = SymbolBrokerAssociation.objects.filter(
-                broker=broker
+                broker=broker,
+                symbol__status='active'  # Only active symbols
             ).filter(
-                Q(long_active=True) | Q(short_active=True)
+                Q(long_active=True) | Q(short_active=True)  # At least one active flag (covers all three modes)
             )
             
             # Filter by exchange if provided
@@ -137,10 +143,11 @@ class BacktestViewSet(viewsets.ModelViewSet):
                         status=status.HTTP_404_NOT_FOUND
                     )
             
-            # Get symbols from associations
+            # Get symbols from associations (already filtered for active status)
             symbols = [assoc.symbol for assoc in associations.select_related('symbol')]
             
             # If specific symbol_tickers provided, further filter to only those
+            # If symbol_tickers is empty, use all broker symbols (select all)
             if symbol_tickers and len(symbol_tickers) > 0:
                 symbols = [s for s in symbols if s.ticker in symbol_tickers]
             
@@ -151,22 +158,26 @@ class BacktestViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
         else:
-            # Normal symbol selection from tickers
+            # Normal symbol selection from tickers (no broker filtering)
             if not symbol_tickers or len(symbol_tickers) == 0:
-                return Response(
-                    {'error': 'symbol_tickers is required when broker_id is not provided'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            for ticker in symbol_tickers:
-                try:
-                    symbol = Symbol.objects.get(ticker=ticker)
-                    symbols.append(symbol)
-                except Symbol.DoesNotExist:
+                # If no broker_id and no symbol_tickers, fetch all active symbols
+                symbols = list(Symbol.objects.filter(status='active'))
+                if not symbols:
                     return Response(
-                        {'error': f'Symbol {ticker} not found'},
-                        status=status.HTTP_404_NOT_FOUND
+                        {'error': 'No active symbols found. Please provide symbol_tickers or use broker-based filtering.'},
+                        status=status.HTTP_400_BAD_REQUEST
                     )
+            else:
+                # Filter to only requested tickers - only active symbols
+                for ticker in symbol_tickers:
+                    try:
+                        symbol = Symbol.objects.get(ticker=ticker, status='active')
+                        symbols.append(symbol)
+                    except Symbol.DoesNotExist:
+                        return Response(
+                            {'error': f'Symbol {ticker} not found or is not active'},
+                            status=status.HTTP_404_NOT_FOUND
+                        )
         
         # Get or create strategy assignment (for parameter merging)
         strategy_assignment = None
