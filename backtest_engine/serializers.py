@@ -229,13 +229,27 @@ class BacktestCreateSerializer(serializers.Serializer):
     strategy_id = serializers.IntegerField(required=True)
     symbol_tickers = serializers.ListField(
         child=serializers.CharField(),
-        required=True,
-        min_length=1
+        required=False,  # Optional when broker filtering is used
+        allow_empty=True
     )
+    broker_id = serializers.IntegerField(required=False, allow_null=True, help_text="Optional broker ID for broker-aware symbol filtering")
+    exchange_code = serializers.CharField(required=False, allow_blank=True, allow_null=True, help_text="Optional exchange code when filtering by broker")
     start_date = serializers.DateTimeField(required=False, allow_null=True)
     end_date = serializers.DateTimeField(required=False, allow_null=True)
     split_ratio = serializers.FloatField(required=False, default=0.7, min_value=0.0, max_value=1.0)
     strategy_parameters = serializers.JSONField(required=False, default=dict)
     initial_capital = serializers.DecimalField(required=False, default=10000.0, max_digits=20, decimal_places=2, min_value=Decimal('0.01'))
     bet_size_percentage = serializers.FloatField(required=False, default=100.0, min_value=0.1, max_value=100.0, help_text="Percentage of available capital to bet per trade")
+    
+    def validate(self, data):
+        """Validate that either symbol_tickers is provided or broker_id is provided"""
+        symbol_tickers = data.get('symbol_tickers', [])
+        broker_id = data.get('broker_id')
+        
+        if not broker_id and (not symbol_tickers or len(symbol_tickers) == 0):
+            raise serializers.ValidationError(
+                "Either 'symbol_tickers' must be provided, or 'broker_id' must be provided for broker-based filtering."
+            )
+        
+        return data
 

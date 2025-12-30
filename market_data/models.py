@@ -25,11 +25,16 @@ class Exchange(models.Model):
 
 
 class Provider(models.Model):
-    """Data provider model (e.g., Alpha Vantage, Yahoo Finance)"""
+    """Data provider model (e.g., Alpha Vantage, Yahoo Finance, Polygon)"""
     name = models.CharField(max_length=100, unique=True)
     code = models.CharField(max_length=50, unique=True)
-    api_key = models.CharField(max_length=255, blank=True, null=True)
-    base_url = models.URLField(blank=True, null=True)
+    api_key = models.CharField(max_length=255, blank=True, null=True, help_text="API key or access key")
+    base_url = models.URLField(blank=True, null=True, help_text="Base URL for API or S3 endpoint")
+    # Additional fields for S3-based providers (e.g., Polygon)
+    access_key_id = models.CharField(max_length=255, blank=True, null=True, help_text="S3 Access Key ID")
+    secret_access_key = models.CharField(max_length=255, blank=True, null=True, help_text="S3 Secret Access Key")
+    endpoint_url = models.URLField(blank=True, null=True, help_text="S3 endpoint URL (e.g., https://files.massive.com)")
+    bucket_name = models.CharField(max_length=255, blank=True, null=True, help_text="S3 bucket name for flat files")
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

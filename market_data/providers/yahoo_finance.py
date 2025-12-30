@@ -52,7 +52,10 @@ class YahooFinanceProvider:
             if period:
                 hist = stock.history(period=period, interval=interval)
             elif start_date and end_date:
-                hist = stock.history(start=start_date, end=end_date, interval=interval)
+                # Yahoo Finance's history() method excludes the end_date (end_date is exclusive)
+                # To include the end_date, we need to add 1 day to it
+                end_date_inclusive = end_date + timedelta(days=1)
+                hist = stock.history(start=start_date, end=end_date_inclusive, interval=interval)
             elif start_date:
                 # If only start_date, fetch until today
                 hist = stock.history(start=start_date, interval=interval)
@@ -76,12 +79,14 @@ class YahooFinanceProvider:
                 if timezone.is_naive(dt):
                     dt = timezone.make_aware(dt)
                 
+                # With auto_adjust=True, Yahoo Finance returns adjusted prices
+                # The Open, High, Low, Close are all adjusted for splits and dividends
                 data.append({
                     'timestamp': dt,
                     'open': float(row['Open']),
                     'high': float(row['High']),
                     'low': float(row['Low']),
-                    'close': float(row['Close']),
+                    'close': float(row['Close']),  # Already adjusted when auto_adjust=True
                     'volume': int(row['Volume']) if 'Volume' in row else 0
                 })
             
@@ -124,6 +129,12 @@ class YahooFinanceProvider:
                 result[ticker] = []
         
         return result
+
+
+
+
+
+
 
 
 

@@ -98,18 +98,75 @@ class BacktestViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
         
-        # Get symbols
-        symbol_tickers = data['symbol_tickers']
+        # Get symbols - either from provided tickers or broker-based filtering
         symbols = []
-        for ticker in symbol_tickers:
+        symbol_tickers = data.get('symbol_tickers', [])
+        broker_id = data.get('broker_id')
+        exchange_code = data.get('exchange_code', '')
+        
+        if broker_id:
+            # Broker-based filtering - get all symbols with at least one active flag
+            # The backtest executor will filter by position mode automatically
+            from live_trading.models import Broker, SymbolBrokerAssociation
+            from market_data.models import Exchange
+            
             try:
-                symbol = Symbol.objects.get(ticker=ticker)
-                symbols.append(symbol)
-            except Symbol.DoesNotExist:
+                broker = Broker.objects.get(id=broker_id)
+            except Broker.DoesNotExist:
                 return Response(
-                    {'error': f'Symbol {ticker} not found'},
+                    {'error': f'Broker with id {broker_id} not found'},
                     status=status.HTTP_404_NOT_FOUND
                 )
+            
+            # Get broker associations - only symbols with at least one active flag
+            # The executor will automatically filter symbols by position mode eligibility
+            associations = SymbolBrokerAssociation.objects.filter(
+                broker=broker
+            ).filter(
+                Q(long_active=True) | Q(short_active=True)
+            )
+            
+            # Filter by exchange if provided
+            if exchange_code:
+                try:
+                    exchange = Exchange.objects.get(code=exchange_code)
+                    associations = associations.filter(symbol__exchange=exchange)
+                except Exchange.DoesNotExist:
+                    return Response(
+                        {'error': f'Exchange with code {exchange_code} not found'},
+                        status=status.HTTP_404_NOT_FOUND
+                    )
+            
+            # Get symbols from associations
+            symbols = [assoc.symbol for assoc in associations.select_related('symbol')]
+            
+            # If specific symbol_tickers provided, further filter to only those
+            if symbol_tickers and len(symbol_tickers) > 0:
+                symbols = [s for s in symbols if s.ticker in symbol_tickers]
+            
+            if not symbols:
+                exchange_text = f" on exchange {exchange_code}" if exchange_code else ""
+                return Response(
+                    {'error': f'No symbols found for broker {broker.name}{exchange_text}'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        else:
+            # Normal symbol selection from tickers
+            if not symbol_tickers or len(symbol_tickers) == 0:
+                return Response(
+                    {'error': 'symbol_tickers is required when broker_id is not provided'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            for ticker in symbol_tickers:
+                try:
+                    symbol = Symbol.objects.get(ticker=ticker)
+                    symbols.append(symbol)
+                except Symbol.DoesNotExist:
+                    return Response(
+                        {'error': f'Symbol {ticker} not found'},
+                        status=status.HTTP_404_NOT_FOUND
+                    )
         
         # Get or create strategy assignment (for parameter merging)
         strategy_assignment = None
@@ -146,11 +203,22 @@ class BacktestViewSet(viewsets.ModelViewSet):
             from django.utils import timezone
             end_date = timezone.now()  # Set to current date for display purposes only
         
+        # Broker is already loaded if broker_id was provided (for symbol filtering)
+        # Just get it again here for the backtest model
+        broker = None
+        if broker_id:
+            from live_trading.models import Broker
+            try:
+                broker = Broker.objects.get(id=broker_id)
+            except Broker.DoesNotExist:
+                pass  # Already handled in symbol filtering section above
+        
         # Create backtest
         backtest = Backtest.objects.create(
             name=data.get('name', ''),
             strategy=strategy,
             strategy_assignment=strategy_assignment,
+            broker=broker,
             start_date=start_date,
             end_date=end_date,
             split_ratio=data.get('split_ratio', 0.7),

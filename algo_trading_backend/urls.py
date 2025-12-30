@@ -23,4 +23,5 @@ urlpatterns = [
     path('api/', include('analytical_tools.urls')),
     path('api/', include('strategies.urls')),
     path('api/', include('backtest_engine.urls')),
+    path('api/', include('live_trading.urls')),
 ]

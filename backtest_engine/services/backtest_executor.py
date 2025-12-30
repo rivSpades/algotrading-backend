@@ -34,17 +34,84 @@ class BacktestExecutor:
         self.backtest = backtest
         self.strategy = backtest.strategy
         self.parameters = backtest.strategy_parameters
-        self.symbols = list(backtest.symbols.all())
+        self.broker = backtest.broker
         self.start_date = backtest.start_date
         self.end_date = backtest.end_date
         self.split_ratio = backtest.split_ratio
         self.position_mode = position_mode  # 'all', 'long', or 'short'
+        
+        # Filter symbols based on broker associations if broker is set
+        all_symbols = list(backtest.symbols.all())
+        self.symbols = self._filter_symbols_by_broker(all_symbols, position_mode)
         
         # Initialize data storage
         self.ohlcv_data = {}  # {symbol: DataFrame}
         self.indicators = {}  # {symbol: {indicator_name: Series}}
         self.trades = []  # List of trade dicts
         self.equity_curves = {}  # {symbol: [(timestamp, equity), ...]}
+    
+    def _filter_symbols_by_broker(self, symbols, position_mode):
+        """
+        Filter symbols based on broker associations and position mode
+        
+        If a broker is set on the backtest, only include symbols that:
+        - Are associated with the broker
+        - Support the requested position mode (based on long_active/short_active flags)
+        
+        Filtering rules:
+        - 'all' mode: symbols with both long_active=True AND short_active=True
+        - 'long' mode: symbols with long_active=True
+        - 'short' mode: symbols with short_active=True
+        
+        Args:
+            symbols: List of Symbol instances
+            position_mode: 'all', 'long', or 'short'
+        
+        Returns:
+            Filtered list of Symbol instances
+        """
+        if not self.broker:
+            # No broker set, return all symbols
+            logger.debug(f"No broker set on backtest, using all {len(symbols)} symbols")
+            return symbols
+        
+        # Import here to avoid circular imports
+        from live_trading.models import SymbolBrokerAssociation
+        
+        logger.info(f"Filtering {len(symbols)} symbols for broker {self.broker.name} with position_mode={position_mode}")
+        
+        filtered_symbols = []
+        for symbol in symbols:
+            try:
+                association = SymbolBrokerAssociation.objects.get(
+                    symbol=symbol,
+                    broker=self.broker
+                )
+                
+                # Check if symbol supports the requested position mode
+                if position_mode == 'all':
+                    if association.long_active and association.short_active:
+                        filtered_symbols.append(symbol)
+                elif position_mode == 'long':
+                    if association.long_active:
+                        filtered_symbols.append(symbol)
+                elif position_mode == 'short':
+                    if association.short_active:
+                        filtered_symbols.append(symbol)
+            except SymbolBrokerAssociation.DoesNotExist:
+                # Symbol not associated with broker, skip it
+                logger.debug(f"Symbol {symbol.ticker} not associated with broker {self.broker.name}, skipping")
+                continue
+        
+        logger.info(f"Filtered to {len(filtered_symbols)} symbols for position_mode={position_mode} (from {len(symbols)} total)")
+        
+        if not filtered_symbols:
+            logger.warning(
+                f"No symbols available for broker {self.broker.name} with position_mode={position_mode}. "
+                f"This may indicate missing broker associations or incompatible position mode."
+            )
+        
+        return filtered_symbols
         
     def load_data(self):
         """Load OHLCV data for all symbols - uses ALL available data for each symbol"""

@@ -394,53 +394,167 @@ class SymbolViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'], url_path='update-data', url_name='update-data')
     def update_data(self, request, pk=None):
-        """Trigger background task to update symbol OHLCV data"""
+        """Trigger background task to update symbol OHLCV data (incremental update from latest timestamp)"""
         from .tasks import fetch_ohlcv_data_task
+        from .services.ohlcv_service import OHLCVService
+        from datetime import timedelta
         
         symbol = self.get_object()
-        start_date = request.data.get('start_date')
-        end_date = request.data.get('end_date')
-        period = request.data.get('period')
-        replace_existing = request.data.get('replace_existing', False)
-
-        # Trigger Celery task
+        
+        # Get the symbol's provider - required for update
+        if not symbol.provider:
+            return Response({
+                'error': f'Symbol {symbol.ticker} does not have a data provider configured. Please fetch data first.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        provider_code = symbol.provider.code
+        
+        # Get the latest timestamp in the database
+        latest_timestamp = OHLCVService.get_latest_timestamp(symbol, timeframe='daily')
+        
+        if latest_timestamp is None:
+            return Response({
+                'error': f'No OHLCV data found for {symbol.ticker}. Please use "Fetch Data" to fetch initial data first.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Normalize latest_timestamp to date if it's a datetime
+        if isinstance(latest_timestamp, timezone.datetime):
+            latest_date = latest_timestamp.date()
+        else:
+            latest_date = latest_timestamp
+        
+        # Get current time and today's date
+        now = timezone.now()
+        today = now.date()
+        
+        # Calculate days since latest data
+        days_diff = (today - latest_date).days
+        
+        # If data is already up to date (latest is today or yesterday), check if update is needed
+        # End date logic: after 10pm UTC use today, before 10pm UTC use yesterday
+        current_hour_utc = now.hour
+        if current_hour_utc >= 22:  # 10pm UTC (22:00)
+            end_date = today
+        else:
+            end_date = today - timedelta(days=1)
+        
+        # If latest_date is already >= end_date, no update needed
+        if latest_date >= end_date:
+            return Response({
+                'message': f'Data is already up to date. Latest data point: {latest_date}, End date: {end_date}',
+                'symbol': symbol.ticker,
+                'latest_timestamp': latest_date.isoformat(),
+                'end_date': end_date.isoformat()
+            }, status=status.HTTP_200_OK)
+        
+        # For incremental updates with Alpaca provider, fetch from 1 year before latest_date
+        # This ensures we have a large enough historical range that works properly with Alpaca's API
+        # The filtering logic in fetch_ohlcv_data_task will automatically skip dates we already have
+        # Using 1 year back ensures proper chunking and avoids 403 errors with small recent date ranges
+        start_date = latest_date - timedelta(days=365)  # 1 year back from latest_date
+        
+        # Ensure start_date is not before 2016-01-01 (Alpaca data starts from 2016)
+        min_start_date = timezone.datetime(2016, 1, 1).date()
+        if start_date < min_start_date:
+            start_date = min_start_date
+        
+        # Convert to ISO format strings
+        start_date_str = start_date.strftime('%Y-%m-%d')
+        end_date_str = end_date.strftime('%Y-%m-%d')
+        
+        # Trigger Celery task with symbol's provider and incremental update using date range
         task = fetch_ohlcv_data_task.delay(
             ticker=symbol.ticker,
-            start_date=start_date,
-            end_date=end_date,
-            period=period,
-            replace_existing=replace_existing
+            start_date=start_date_str,
+            end_date=end_date_str,
+            period=None,  # Use date range, not period
+            replace_existing=False,  # Don't replace, only add new data
+            broker_id=None,
+            provider_code=provider_code
         )
 
         return Response({
-            'message': 'OHLCV data fetch task started',
+            'message': f'OHLCV data update task started (from {start_date_str} to {end_date_str}) using provider {provider_code}',
             'task_id': task.id,
-            'symbol': symbol.ticker
+            'symbol': symbol.ticker,
+            'provider': provider_code,
+            'start_date': start_date_str,
+            'end_date': end_date_str
         }, status=status.HTTP_202_ACCEPTED)
     
     @action(detail=True, methods=['post'], url_path='refetch-data', url_name='refetch-data')
     def refetch_data(self, request, pk=None):
-        """Refetch all OHLCV data for a symbol (replaces existing)"""
-        from .tasks import fetch_ohlcv_data_task
+        """Refetch all OHLCV data for a symbol (deletes existing and fetches all again)"""
+        from .tasks import fetch_ohlcv_data_task, delete_ohlcv_data_task
+        from django.db import transaction
         
         symbol = self.get_object()
+        
+        # Get provider code from request (optional - defaults to symbol's current provider)
+        provider_code = request.data.get('provider_code')
+        
+        if provider_code:
+            # Validate that the provider exists
+            from .models import Provider
+            try:
+                provider = Provider.objects.get(code=provider_code, is_active=True)
+            except Provider.DoesNotExist:
+                return Response({
+                    'error': f'Provider with code {provider_code} not found or is not active.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            # Use symbol's current provider if no provider_code provided
+            if not symbol.provider:
+                return Response({
+                    'error': f'Symbol {symbol.ticker} does not have a data provider configured. Please specify a provider_code or fetch data first.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            provider_code = symbol.provider.code
+        
+        # Get date parameters from request (optional - defaults to max period)
         start_date = request.data.get('start_date')
         end_date = request.data.get('end_date')
-        period = request.data.get('period', 'max')  # Default to max period
+        period = request.data.get('period')
+        
+        # If dates are provided, don't use period (period should only be used if dates are not provided)
+        # If neither dates nor period are provided, default to 'max'
+        if not start_date and not end_date and not period:
+            period = 'max'
 
-        # Trigger Celery task with replace_existing=True
+        # Delete all existing OHLCV data for this symbol first
+        # We do this synchronously to ensure it completes before refetch
+        from .models import OHLCV, Provider
+        deleted_count, _ = OHLCV.objects.filter(symbol=symbol).delete()
+        
+        # Update provider if it's different from current provider
+        update_fields = ['status', 'validation_status', 'validation_reason']
+        current_provider_code = symbol.provider.code if symbol.provider else None
+        if provider_code != current_provider_code:
+            symbol.provider = Provider.objects.get(code=provider_code, is_active=True)
+            update_fields.append('provider')
+        
+        # Disable the symbol (will be re-enabled after successful refetch and validation)
+        symbol.status = 'disabled'
+        symbol.validation_status = 'invalid'
+        symbol.validation_reason = 'OHLCV data deleted for refetch'
+        symbol.save(update_fields=update_fields)
+
+        # Trigger Celery task to fetch all data again with the symbol's provider
         task = fetch_ohlcv_data_task.delay(
             ticker=symbol.ticker,
             start_date=start_date,
             end_date=end_date,
             period=period,
-            replace_existing=True
+            replace_existing=False,  # Not needed since we already deleted
+            broker_id=None,
+            provider_code=provider_code
         )
 
         return Response({
-            'message': 'OHLCV data refetch task started (will replace existing data)',
+            'message': f'OHLCV data refetch task started (deleted {deleted_count} records, will fetch all data again) using provider {provider_code}',
             'task_id': task.id,
-            'symbol': symbol.ticker
+            'symbol': symbol.ticker,
+            'provider': provider_code,
+            'deleted_count': deleted_count
         }, status=status.HTTP_202_ACCEPTED)
 
     @action(detail=False, methods=['get'])
@@ -521,62 +635,90 @@ class SymbolViewSet(viewsets.ModelViewSet):
     
     @action(detail=False, methods=['post'], url_path='fetch-ohlcv', url_name='fetch-ohlcv')
     def fetch_ohlcv(self, request):
-        """Fetch OHLCV data for one or more symbols, or by exchange"""
+        """Fetch OHLCV data for one or more symbols, or by exchange, or by broker"""
         from .tasks import (
             fetch_ohlcv_data_task,
             fetch_ohlcv_data_multiple_symbols_task,
-            fetch_ohlcv_data_by_exchange_task
+            fetch_ohlcv_data_by_exchange_task,
+            fetch_ohlcv_data_by_broker_task
         )
         
         ticker = request.data.get('ticker')
         tickers = request.data.get('tickers', [])
         exchange_code = request.data.get('exchange_code')
+        broker_id = request.data.get('broker_id')
         start_date = request.data.get('start_date')
         end_date = request.data.get('end_date')
         period = request.data.get('period')
         replace_existing = request.data.get('replace_existing', False)
+        provider_code = request.data.get('provider_code', 'YAHOO')  # Default to YAHOO for backward compatibility
+        
+        # If only broker_id is provided (without exchange_code, ticker, or tickers), fetch for all broker symbols
+        if broker_id and not exchange_code and not ticker and (not tickers or len(tickers) == 0):
+            task = fetch_ohlcv_data_by_broker_task.delay(
+                broker_id=broker_id,
+                start_date=start_date,
+                end_date=end_date,
+                period=period,
+                replace_existing=replace_existing,
+                provider_code=provider_code
+            )
+            return Response({
+                'message': f'OHLCV data fetch task started for broker {broker_id}',
+                'task_id': task.id,
+                'broker_id': broker_id
+            }, status=status.HTTP_202_ACCEPTED)
         
         if exchange_code:
             # Fetch by exchange
             task = fetch_ohlcv_data_by_exchange_task.delay(
                 exchange_code=exchange_code,
+                broker_id=broker_id,
                 start_date=start_date,
                 end_date=end_date,
                 period=period,
-                replace_existing=replace_existing
+                replace_existing=replace_existing,
+                provider_code=provider_code
             )
             return Response({
-                'message': f'OHLCV data fetch task started for exchange {exchange_code}',
+                'message': f'OHLCV data fetch task started for exchange {exchange_code}' + (f' (broker {broker_id})' if broker_id else ''),
                 'task_id': task.id,
-                'exchange_code': exchange_code
+                'exchange_code': exchange_code,
+                'broker_id': broker_id
             }, status=status.HTTP_202_ACCEPTED)
         elif tickers and len(tickers) > 0:
             # Fetch for multiple symbols
             task = fetch_ohlcv_data_multiple_symbols_task.delay(
                 tickers=tickers,
+                broker_id=broker_id,
                 start_date=start_date,
                 end_date=end_date,
                 period=period,
-                replace_existing=replace_existing
+                replace_existing=replace_existing,
+                provider_code=provider_code
             )
             return Response({
-                'message': f'OHLCV data fetch task started for {len(tickers)} symbols',
+                'message': f'OHLCV data fetch task started for {len(tickers)} symbols' + (f' (broker {broker_id})' if broker_id else ''),
                 'task_id': task.id,
-                'tickers': tickers
+                'tickers': tickers,
+                'broker_id': broker_id
             }, status=status.HTTP_202_ACCEPTED)
         elif ticker:
             # Fetch for single symbol
             task = fetch_ohlcv_data_task.delay(
                 ticker=ticker,
+                broker_id=broker_id,
                 start_date=start_date,
                 end_date=end_date,
                 period=period,
-                replace_existing=replace_existing
+                replace_existing=replace_existing,
+                provider_code=provider_code
             )
             return Response({
-                'message': f'OHLCV data fetch task started for {ticker}',
+                'message': f'OHLCV data fetch task started for {ticker}' + (f' (broker {broker_id})' if broker_id else ''),
                 'task_id': task.id,
-                'ticker': ticker
+                'ticker': ticker,
+                'broker_id': broker_id
             }, status=status.HTTP_202_ACCEPTED)
         else:
             return Response({
@@ -585,18 +727,28 @@ class SymbolViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['post'], url_path='delete-ohlcv', url_name='delete-ohlcv')
     def delete_ohlcv(self, request):
-        """Delete OHLCV data for one or more symbols, or by exchange"""
+        """Delete OHLCV data for one or more symbols, by exchange, or all"""
         from .tasks import (
             delete_ohlcv_data_task,
             delete_ohlcv_data_multiple_symbols_task,
-            delete_ohlcv_data_by_exchange_task
+            delete_ohlcv_data_by_exchange_task,
+            delete_all_ohlcv_data_task
         )
         
+        delete_all = request.data.get('delete_all', False)
         ticker = request.data.get('ticker')
         tickers = request.data.get('tickers', [])
         exchange_code = request.data.get('exchange_code')
         
-        if exchange_code:
+        if delete_all:
+            # Delete all OHLCV data
+            task = delete_all_ohlcv_data_task.delay()
+            return Response({
+                'message': 'OHLCV data deletion task started for all symbols',
+                'task_id': task.id,
+                'delete_all': True
+            }, status=status.HTTP_202_ACCEPTED)
+        elif exchange_code:
             # Delete by exchange
             task = delete_ohlcv_data_by_exchange_task.delay(exchange_code=exchange_code)
             return Response({
@@ -622,7 +774,7 @@ class SymbolViewSet(viewsets.ModelViewSet):
             }, status=status.HTTP_202_ACCEPTED)
         else:
             return Response({
-                'error': 'Must provide either ticker, tickers (list), or exchange_code'
+                'error': 'Must provide either delete_all=true, ticker, tickers (list), or exchange_code'
             }, status=status.HTTP_400_BAD_REQUEST)
 
 
@@ -951,13 +1103,18 @@ class TaskExecutionViewSet(viewsets.ViewSet):
                 if task_result.successful():
                     result = task_result.result
                     if isinstance(result, dict):
+                        # Normalize status: 'success' -> 'completed'
+                        task_status = result.get('status', 'completed')
+                        if task_status == 'success':
+                            task_status = 'completed'
                         return Response({
                             'task_id': task_id,
-                            'status': result.get('status', 'completed'),
+                            'status': task_status,
                             'progress': result.get('progress', 100),
                             'message': result.get('message', 'Task completed'),
                             'ready': True,
-                            'success': True
+                            'success': True,
+                            'result': result  # Include full result for onComplete callback
                         })
                     else:
                         return Response({

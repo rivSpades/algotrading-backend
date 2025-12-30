@@ -93,3 +93,9 @@ Se conseguir entrar no shell do PostgreSQL, está funcionando! Digite `\q` para 
 
 
 
+
+
+
+
+
+

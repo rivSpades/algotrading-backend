@@ -48,6 +48,7 @@ INSTALLED_APPS = [
     'analytical_tools',
     'strategies',
     'backtest_engine',
+    'live_trading',
 ]
 
 MIDDLEWARE = [

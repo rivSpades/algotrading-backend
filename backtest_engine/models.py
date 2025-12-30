@@ -29,6 +29,14 @@ class Backtest(models.Model):
         help_text="Strategy assignment used (if available)"
     )
     symbols = models.ManyToManyField(Symbol, related_name='backtests', help_text="Symbols included in this backtest")
+    broker = models.ForeignKey(
+        'live_trading.Broker',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='backtests',
+        help_text="Broker used for this backtest (optional - used for broker-aware symbol filtering)"
+    )
     start_date = models.DateTimeField(help_text="Backtest start date")
     end_date = models.DateTimeField(help_text="Backtest end date")
     split_ratio = models.FloatField(
