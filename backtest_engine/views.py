@@ -280,38 +280,85 @@ class BacktestViewSet(viewsets.ModelViewSet):
         if symbol_ticker:
             trades = trades.filter(symbol__ticker=symbol_ticker)
         
-        # Filter by mode (position mode) - use metadata.position_mode to ensure each mode has independent bankroll
-        # Each mode (ALL, LONG, SHORT) is executed separately with its own capital, so we must filter by position_mode
-        # Only filter if mode is explicitly provided in query params
+        # Get mode from query params (for independent_bet_amounts injection, not for filtering)
+        # We DON'T filter trades by mode here because the frontend needs to switch modes without reloading
+        # The frontend will filter by mode on the client side
         mode = request.query_params.get('mode', None)
         if mode:
             mode = mode.lower()
-            if mode in ['long', 'short', 'all']:
-                # Filter by metadata.position_mode using JSON field lookup
-                # This ensures we only get trades from the specific mode execution (which has its own bankroll)
-                trades = trades.filter(metadata__position_mode=mode)
-        # If mode is not provided, return trades from all modes (useful for getAllBacktestTrades)
+            if mode not in ['long', 'short', 'all']:
+                mode = None  # Invalid mode, ignore it
         
         # Order by entry timestamp
         trades = trades.order_by('entry_timestamp')
+        
+        # If symbol filter is present, inject independent bet_amounts from symbol statistics
+        # This ensures "Total Invested" matches the independent equity curve for individual symbol views
+        # Use the mode parameter to get the correct mode's independent_bet_amounts, but don't filter trades
+        independent_bet_amounts = {}
+        if symbol_ticker:
+            try:
+                symbol = Symbol.objects.get(ticker=symbol_ticker)
+                symbol_stats = backtest.statistics.filter(symbol=symbol).first()
+                if symbol_stats and symbol_stats.additional_stats:
+                    # Get the mode from query params (default to 'all') for independent_bet_amounts lookup
+                    stats_mode = mode if mode else 'all'
+                    mode_stats = symbol_stats.additional_stats.get(stats_mode, {})
+                    independent_bet_amounts = mode_stats.get('independent_bet_amounts', {})
+            except Symbol.DoesNotExist:
+                pass
+        
+        # Convert trades queryset to list so we can modify metadata
+        trades_list = list(trades)
+        
+        # Inject independent bet_amount into trade metadata if available
+        # Only inject for trades that match the requested mode (if mode is specified)
+        # This ensures each mode's trades get the correct mode's independent_bet_amounts
+        if independent_bet_amounts:
+            from django.utils import timezone as tz
+            for trade in trades_list:
+                # If mode is specified, only inject for trades matching that mode
+                # Otherwise, inject for all trades (when mode is not specified, default to 'all' mode's stats)
+                trade_metadata = trade.metadata if isinstance(trade.metadata, dict) else {}
+                trade_mode = trade_metadata.get('position_mode')
+                
+                # Check if this trade matches the requested mode
+                should_inject = True
+                if mode and trade_mode:
+                    should_inject = (trade_mode == mode)
+                
+                if should_inject and trade.entry_timestamp:
+                    # Convert entry_timestamp to ISO string format for lookup
+                    entry_ts_str = trade.entry_timestamp.isoformat()
+                    # Also try without timezone info in case keys are stored differently
+                    entry_ts_str_naive = trade.entry_timestamp.replace(tzinfo=None).isoformat()
+                    
+                    independent_bet = independent_bet_amounts.get(entry_ts_str) or independent_bet_amounts.get(entry_ts_str_naive)
+                    if independent_bet is not None:
+                        # Create a copy of metadata and add independent bet_amount
+                        if not isinstance(trade.metadata, dict):
+                            trade.metadata = {}
+                        else:
+                            trade.metadata = dict(trade.metadata)  # Create a copy
+                        trade.metadata['independent_bet_amount'] = independent_bet
         
         # Check if pagination should be disabled
         no_pagination = request.query_params.get('no_pagination', 'false').lower() == 'true'
         
         if no_pagination:
             # Return all trades without pagination (not recommended for large datasets)
-            serializer = TradeSerializer(trades, many=True)
+            serializer = TradeSerializer(trades_list, many=True)
             return Response(serializer.data)
         
-        # Apply pagination (default behavior)
+        # Apply pagination (default behavior) - need to paginate the list
         paginator = TradePagination()
-        page = paginator.paginate_queryset(trades, request)
+        page = paginator.paginate_queryset(trades_list, request)
         if page is not None:
             serializer = TradeSerializer(page, many=True)
             return paginator.get_paginated_response(serializer.data)
         
         # Fallback to non-paginated response if pagination not requested
-        serializer = TradeSerializer(trades, many=True)
+        serializer = TradeSerializer(trades_list, many=True)
         return Response(serializer.data)
     
     @action(detail=True, methods=['get'])

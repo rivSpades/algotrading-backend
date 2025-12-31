@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import threading
 import pandas as pd
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,48 @@ def run_backtest_task(self, backtest_id):
         
         logger.info(f"Phase 1: Pre-processing {len(symbols_to_preprocess)} symbols in parallel")
         
+        # OPTIMIZATION: Bulk load all OHLCV data in a single query instead of N queries
+        # This dramatically reduces database round-trips (10-50x faster for large symbol sets)
+        logger.info(f"Bulk loading OHLCV data for {len(symbols_to_preprocess)} symbols...")
+        from market_data.models import OHLCV
+        
+        symbol_tickers = [s.ticker for s in symbols_to_preprocess]
+        ticker_to_symbol = {s.ticker: s for s in symbols_to_preprocess}
+        
+        # Single bulk query for all OHLCV data
+        bulk_ohlcv_queryset = OHLCV.objects.filter(
+            symbol__ticker__in=symbol_tickers,
+            timeframe='daily'
+        ).select_related('symbol').order_by('symbol__ticker', 'timestamp')
+        
+        # Group OHLCV data by symbol ticker in memory (much faster than N queries)
+        bulk_ohlcv_data = {}
+        for ohlcv in bulk_ohlcv_queryset.values('symbol__ticker', 'timestamp', 'open', 'high', 'low', 'close', 'volume'):
+            ticker = ohlcv['symbol__ticker']
+            if ticker not in bulk_ohlcv_data:
+                bulk_ohlcv_data[ticker] = []
+            
+            timestamp = ohlcv['timestamp']
+            if hasattr(timestamp, 'isoformat'):
+                timestamp = timestamp.isoformat()
+            
+            bulk_ohlcv_data[ticker].append({
+                'timestamp': timestamp,
+                'open': float(ohlcv['open']),
+                'high': float(ohlcv['high']),
+                'low': float(ohlcv['low']),
+                'close': float(ohlcv['close']),
+                'volume': float(ohlcv['volume'])
+            })
+        
+        # Create symbol->data mapping
+        bulk_ohlcv_by_symbol = {}
+        for ticker, data in bulk_ohlcv_data.items():
+            if ticker in ticker_to_symbol:
+                bulk_ohlcv_by_symbol[ticker_to_symbol[ticker]] = data
+        
+        logger.info(f"Bulk loaded OHLCV data for {len(bulk_ohlcv_by_symbol)} symbols")
+        
         # Pre-process in parallel
         preprocessed_data = {}  # {symbol: {'df': DataFrame, 'indicators': dict, 'test_df': DataFrame, 'price_cache': dict}}
         preprocessed_lock = threading.Lock()
@@ -90,28 +133,12 @@ def run_backtest_task(self, backtest_id):
             try:
                 logger.info(f"Pre-processing symbol: {symbol.ticker}")
                 
-                # Load OHLCV data directly (no executor needed, we already have filtered symbols)
-                from market_data.models import OHLCV
-                ohlcv_filter = {
-                    'symbol': symbol,
-                    'timeframe': 'daily',
-                }
-                ohlcv_queryset = OHLCV.objects.filter(**ohlcv_filter).order_by('timestamp')
+                # OPTIMIZATION: Use bulk-loaded OHLCV data instead of individual query
+                if symbol not in bulk_ohlcv_by_symbol:
+                    logger.warning(f"No OHLCV data found for symbol {symbol.ticker} in bulk load")
+                    return symbol, None
                 
-                # Convert to list of dicts
-                ohlcv_list = []
-                for ohlcv in ohlcv_queryset.values('timestamp', 'open', 'high', 'low', 'close', 'volume'):
-                    timestamp = ohlcv['timestamp']
-                    if hasattr(timestamp, 'isoformat'):
-                        timestamp = timestamp.isoformat()
-                    ohlcv_list.append({
-                        'timestamp': timestamp,
-                        'open': float(ohlcv['open']),
-                        'high': float(ohlcv['high']),
-                        'low': float(ohlcv['low']),
-                        'close': float(ohlcv['close']),
-                        'volume': float(ohlcv['volume'])
-                    })
+                ohlcv_list = bulk_ohlcv_by_symbol[symbol]
                 
                 if not ohlcv_list:
                     return symbol, None
@@ -191,14 +218,62 @@ def run_backtest_task(self, backtest_id):
                 logger.error(f"Error pre-processing {symbol.ticker}: {str(e)}")
                 connections.close_all()
                 return symbol, None
+            finally:
+                # Always close connections in thread to prevent connection leaks
+                connections.close_all()
         
-        # Execute Phase 1 in parallel
-        max_workers = min(len(symbols_to_preprocess), 10)  # Limit threads
+        # OPTIMIZATION: Increase thread pool size based on CPU cores and symbol count
+        # For I/O-bound tasks (database queries, indicator computation), use 2-3x CPU cores
+        cpu_count = os.cpu_count() or 4
+        # Scale workers based on symbol count and available CPU cores
+        # Cap at 50 to prevent excessive resource usage, but allow more than 10 for large jobs
+        base_workers = max(cpu_count * 3, 20)  # At least 20 workers if 3x CPU cores is less
+        max_workers = min(len(symbols_to_preprocess), base_workers, 50)
+        
+        logger.info(f"Using {max_workers} worker threads for preprocessing (CPU cores: {cpu_count}, symbols: {len(symbols_to_preprocess)})")
+        
+        # OPTIMIZATION: Batch processing for very large symbol sets to prevent memory issues
+        BATCH_SIZE = 1000  # Process 1000 symbols at a time
+        all_preprocessed_data = {}
+        
         if symbols_to_preprocess:
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {executor.submit(preprocess_symbol, symbol): symbol for symbol in symbols_to_preprocess}
-                for future in as_completed(futures):
-                    future.result()  # Raise exception if any occurred
+            # Process in batches if we have a very large number of symbols
+            if len(symbols_to_preprocess) > BATCH_SIZE:
+                logger.info(f"Processing {len(symbols_to_preprocess)} symbols in batches of {BATCH_SIZE}")
+                
+                for batch_start in range(0, len(symbols_to_preprocess), BATCH_SIZE):
+                    batch_end = min(batch_start + BATCH_SIZE, len(symbols_to_preprocess))
+                    batch_symbols = symbols_to_preprocess[batch_start:batch_end]
+                    batch_num = (batch_start // BATCH_SIZE) + 1
+                    total_batches = (len(symbols_to_preprocess) + BATCH_SIZE - 1) // BATCH_SIZE
+                    
+                    logger.info(f"Processing batch {batch_num}/{total_batches}: symbols {batch_start} to {batch_end-1}")
+                    
+                    # Process batch in parallel
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = {executor.submit(preprocess_symbol, symbol): symbol for symbol in batch_symbols}
+                        for future in as_completed(futures):
+                            future.result()  # Raise exception if any occurred
+                    
+                    # Merge batch results
+                    all_preprocessed_data.update(preprocessed_data)
+                    preprocessed_data = {}  # Reset for next batch
+                    
+                    # Update progress
+                    progress = 12 + int((batch_end / len(symbols_to_preprocess)) * 6)  # 12-18% for Phase 1
+                    self.update_state(
+                        state='PROGRESS',
+                        meta={'progress': progress, 'message': f'Pre-processed batch {batch_num}/{total_batches} ({batch_end}/{len(symbols_to_preprocess)} symbols)'}
+                    )
+                
+                # Use accumulated preprocessed data
+                preprocessed_data = all_preprocessed_data
+            else:
+                # Process all symbols at once for smaller sets
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {executor.submit(preprocess_symbol, symbol): symbol for symbol in symbols_to_preprocess}
+                    for future in as_completed(futures):
+                        future.result()  # Raise exception if any occurred
         
         logger.info(f"Phase 1 complete: Pre-processed {len(preprocessed_data)} symbols")
         self.update_state(
@@ -252,6 +327,9 @@ def run_backtest_task(self, backtest_id):
                 # Close database connection in this thread
                 connections.close_all()
                 raise
+            finally:
+                # Always close connections in thread to prevent connection leaks
+                connections.close_all()
         
         # Execute all three position modes in parallel
         logger.info("Starting parallel execution of strategy for all position modes (all, long, short)")
@@ -361,7 +439,17 @@ def run_backtest_task(self, backtest_id):
             # Count buy vs sell trades for logging
             buy_count = sum(1 for t in mode_trades if t.get('trade_type') == 'buy')
             sell_count = sum(1 for t in mode_trades if t.get('trade_type') == 'sell')
+            
+            # Count completed positions (entry + exit) - a long requires buy with exit_timestamp, a short requires sell with exit_timestamp
+            long_count = sum(1 for t in mode_trades if t.get('trade_type') == 'buy' and t.get('exit_timestamp') is not None)
+            short_count = sum(1 for t in mode_trades if t.get('trade_type') == 'sell' and t.get('exit_timestamp') is not None)
+            open_long_count = sum(1 for t in mode_trades if t.get('trade_type') == 'buy' and t.get('exit_timestamp') is None)
+            open_short_count = sum(1 for t in mode_trades if t.get('trade_type') == 'sell' and t.get('exit_timestamp') is None)
+            
             logger.info(f"  - Buy trades: {buy_count}, Sell trades: {sell_count}")
+            logger.info(f"  - Completed LONG positions: {long_count}, Completed SHORT positions: {short_count}")
+            if open_long_count > 0 or open_short_count > 0:
+                logger.info(f"  - Open positions: {open_long_count} long, {open_short_count} short")
             
             # Validate: Strategy should generate at least 2 trades to be considered successful
             # Less than 2 trades indicates potential issues:
@@ -495,6 +583,9 @@ def run_backtest_task(self, backtest_id):
             """Round value to specified decimal places and validate database limits
             
             If value exceeds database limit, raises ValueError (indicates bad data/calculation error)
+            
+            Fields with max_digits=10, decimal_places=4 (percentage fields) have limit of 10^6
+            Fields with max_digits=20, decimal_places=8 (PnL fields) have limit of 10^12
             """
             if value is None:
                 return None
@@ -508,22 +599,25 @@ def run_backtest_task(self, backtest_id):
             # Round to specified decimal places
             rounded_value = round(float_value, decimal_places)
             
-            # Validate database limits for DecimalField(max_digits=20, decimal_places=8)
-            # The database requires values to be strictly less than 10^12 (absolute value)
+            # Determine field type and validation limit based on field name
+            # Percentage fields (max_digits=10, decimal_places=4): limit is 10^6
+            percentage_fields = ['win_rate', 'total_pnl_percentage', 'profit_factor', 'max_drawdown', 
+                               'sharpe_ratio', 'cagr', 'total_return']
+            
+            if field_name in percentage_fields:
+                # Validate database limits for DecimalField(max_digits=10, decimal_places=4)
+                # The database requires values to be strictly less than 10^6 (absolute value)
+                max_value = 10**6
+            else:
+                # Validate database limits for DecimalField(max_digits=20, decimal_places=8)
+                # The database requires values to be strictly less than 10^12 (absolute value)
+                max_value = 10**12
+            
             # If value exceeds limit, this indicates bad data or calculation error - raise error
-            if rounded_value >= 10**12:
+            if abs(rounded_value) >= max_value:
                 symbol_info = f"Symbol: {symbol.ticker if symbol and hasattr(symbol, 'ticker') else 'portfolio-level'}"
                 error_msg = (
-                    f"Value {rounded_value} for field '{field_name}' exceeds database limit (10^12). "
-                    f"This likely indicates bad data or a calculation error. "
-                    f"{symbol_info}"
-                )
-                logger.error(error_msg)
-                raise ValueError(error_msg)
-            elif rounded_value <= -(10**12):
-                symbol_info = f"Symbol: {symbol.ticker if symbol and hasattr(symbol, 'ticker') else 'portfolio-level'}"
-                error_msg = (
-                    f"Value {rounded_value} for field '{field_name}' exceeds database limit (-10^12). "
+                    f"Value {rounded_value} for field '{field_name}' exceeds database limit ({max_value}). "
                     f"This likely indicates bad data or a calculation error. "
                     f"{symbol_info}"
                 )
@@ -588,13 +682,16 @@ def run_backtest_task(self, backtest_id):
                 # Similar to portfolio stats structure
                 symbol_all = stats.get('all', {})
                 # Always save statistics even if empty (no trades) so frontend knows symbol was processed
-                # Exclude equity_curve and additional_stats from main fields
-                stats_to_save = {k: v for k, v in symbol_all.items() if k != 'equity_curve' and k != 'additional_stats'} if symbol_all else {}
+                # Exclude equity_curve, independent_bet_amounts, and additional_stats from main fields
+                stats_to_save = {k: v for k, v in symbol_all.items() if k not in ['equity_curve', 'independent_bet_amounts', 'additional_stats']} if symbol_all else {}
                 equity_curve_all = symbol_all.get('equity_curve', []) if symbol_all else []
+                independent_bet_amounts_all = symbol_all.get('independent_bet_amounts', {}) if symbol_all else {}
                 
-                # Get equity curves for long and short modes
+                # Get equity curves and independent bet amounts for long and short modes
                 equity_curve_long = stats.get('long', {}).get('equity_curve', [])
                 equity_curve_short = stats.get('short', {}).get('equity_curve', [])
+                independent_bet_amounts_long = stats.get('long', {}).get('independent_bet_amounts', {})
+                independent_bet_amounts_short = stats.get('short', {}).get('independent_bet_amounts', {})
                 
                 # If no stats were calculated (empty dict), create default empty statistics
                 if not symbol_all:
@@ -630,13 +727,18 @@ def run_backtest_task(self, backtest_id):
                     symbol=symbol,
                     equity_curve=equity_curve_all,  # Store 'all' mode equity curve in main field
                     additional_stats={
+                        'all': {
+                            'independent_bet_amounts': independent_bet_amounts_all,  # Store independent bet amounts for 'all' mode
+                        },
                         'long': {
-                            **stats.get('long', {}),
+                            **{k: v for k, v in stats.get('long', {}).items() if k not in ['equity_curve', 'independent_bet_amounts']},
                             'equity_curve': equity_curve_long,  # Include equity curve in additional_stats
+                            'independent_bet_amounts': independent_bet_amounts_long,  # Store independent bet amounts for 'long' mode
                         },
                         'short': {
-                            **stats.get('short', {}),
+                            **{k: v for k, v in stats.get('short', {}).items() if k not in ['equity_curve', 'independent_bet_amounts']},
                             'equity_curve': equity_curve_short,  # Include equity curve in additional_stats
+                            'independent_bet_amounts': independent_bet_amounts_short,  # Store independent bet amounts for 'short' mode
                         },
                     },
                     **stats_to_save

@@ -6,7 +6,7 @@ Executes trading strategies on historical data and generates trades and statisti
 import pandas as pd
 import numpy as np
 from typing import List, Dict, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from django.utils import timezone
 from django.db import models
@@ -19,6 +19,8 @@ from analytical_tools.indicators import compute_indicator
 from market_data.services.indicator_service import compute_indicators_for_ohlcv
 import logging
 import threading
+import bisect
+import heapq
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +82,8 @@ class BacktestExecutor:
         - Support the requested position mode (based on long_active/short_active flags)
         
         Filtering rules:
-        - 'all' mode: symbols with both long_active=True AND short_active=True
+        - 'all' mode: symbols with at least one trading capability (long_active=True OR short_active=True)
+          The signal generation will respect broker flags (no short trades if short_active=False, etc.)
         - 'long' mode: symbols with long_active=True
         - 'short' mode: symbols with short_active=True
         
@@ -116,11 +119,14 @@ class BacktestExecutor:
                 
                 # Check if symbol supports the requested position mode
                 # Filtering rules:
-                # - 'all' mode: symbols with both long_active=True AND short_active=True
+                # - 'all' mode: symbols with at least one trading capability (long_active=True OR short_active=True)
+                #   This allows 'all' mode to trade longs on symbols that only support long, shorts on symbols that only support short,
+                #   and both on symbols that support both
                 # - 'long' mode: symbols with long_active=True
                 # - 'short' mode: symbols with short_active=True
                 if position_mode == 'all':
-                    if association.long_active and association.short_active:
+                    # Include if at least one trading capability is active
+                    if association.long_active or association.short_active:
                         filtered_symbols.append(symbol)
                 elif position_mode == 'long':
                     if association.long_active:
@@ -518,7 +524,7 @@ class BacktestExecutor:
             
             # Generate signal - let the strategy-specific signal function handle indicator validation
             # Different strategies may use different parameter names (fast_period/slow_period vs short_period/long_period)
-            signal = self._generate_signal(row, indicator_values, position, prev_indicator_values)
+            signal = self._generate_signal(row, indicator_values, position, prev_indicator_values, symbol)
             
             if signal:
                 logger.info(f"[{self.position_mode.upper()}] Signal at {timestamp}: {signal}")
@@ -574,11 +580,11 @@ class BacktestExecutor:
         prev_indicators = {}  # {symbol: {indicator_name: value}}
         
         # Store processed symbol data for later chronological processing
-        symbol_data = {}  # {symbol: {'df': DataFrame, 'test_df': DataFrame, 'indicators': dict, 'price_cache': dict}}
+        symbol_data = {}  # {symbol: {'df': DataFrame, 'test_df': DataFrame, 'indicators': dict, 'price_cache': dict, 'sorted_timestamps': list}}
         
-        # Create a merged timeline of all events from all symbols
-        # Collect all timestamps with their corresponding symbol and row data
-        all_events = []  # List of (timestamp, symbol, row_index, row_data)
+        # OPTIMIZATION: Collect events per symbol (will merge later using heapq for efficiency)
+        # This avoids sorting 20M+ events at once
+        symbol_events = {}  # {symbol: list of (timestamp, symbol, idx, row)}
         
         # Single loop: for each symbol, use pre-processed data or load on-demand, then collect events
         for symbol in self.symbols:
@@ -622,45 +628,62 @@ class BacktestExecutor:
                     if pd.notna(row['close']):
                         price_cache[timestamp] = float(row['close'])
             
+            # OPTIMIZATION: Create sorted timestamp list for binary search price lookups
+            # This enables O(log n) lookups instead of O(n) list comprehension
+            sorted_timestamps = sorted(price_cache.keys())
+            
             # Store symbol data for chronological processing
             symbol_data[symbol] = {
                 'df': df,
                 'test_df': test_df,
                 'indicators': indicators,
-                'price_cache': price_cache
+                'price_cache': price_cache,
+                'sorted_timestamps': sorted_timestamps  # For binary search
             }
             positions[symbol] = None
             prev_indicators[symbol] = None
             
-            # Collect all events from this symbol's test data
-            symbol_event_count = 0
+            # OPTIMIZATION: Collect events per symbol (already sorted by timestamp in test_df)
+            # This allows us to use heapq.merge() instead of sorting all events at once
+            symbol_event_list = []
             for idx, row in test_df.iterrows():
                 timestamp = row['timestamp']
                 if pd.notna(row['close']):
-                    all_events.append((timestamp, symbol, idx, row))
-                    symbol_event_count += 1
+                    symbol_event_list.append((timestamp, symbol, idx, row))
             
-            logger.info(f"[{self.position_mode.upper()}] Collected {symbol_event_count} events for {symbol.ticker} (total events so far: {len(all_events)})")
+            if symbol_event_list:
+                symbol_events[symbol] = symbol_event_list
+                logger.info(f"[{self.position_mode.upper()}] Collected {len(symbol_event_list)} events for {symbol.ticker}")
         
         if not symbol_data:
             logger.warning("No valid symbol data for multi-symbol execution")
             return
         
-        # Sort all events chronologically
-        all_events.sort(key=lambda x: x[0])
+        # OPTIMIZATION: Merge sorted event lists using heapq.merge (more efficient than sorting all at once)
+        # heapq.merge efficiently merges multiple sorted iterators in O(n) time with O(k) space
+        # where k = number of symbols, vs O(n log n) time with O(n) space for full sort
+        if symbol_events:
+            all_events = list(heapq.merge(*symbol_events.values(), key=lambda x: x[0]))
+            logger.info(f"[{self.position_mode.upper()}] Merged {len(all_events)} events from {len(symbol_events)} symbols using heapq.merge")
+        else:
+            all_events = []
+            logger.warning(f"[{self.position_mode.upper()}] No events collected from any symbol")
         
         logger.info(f"[{self.position_mode.upper()}] Starting strategy execution: processing {len(all_events)} events chronologically across {len(symbol_data)} symbols with shared capital")
         
-        # Helper function to get current price for a symbol at a timestamp (uses cache)
+        # OPTIMIZATION: Binary search for price lookup (O(log n) instead of O(n))
         def get_price_at_timestamp(symbol, timestamp):
-            """Get price for symbol at timestamp using cached lookup (O(1) dict lookup)"""
+            """Get price for symbol at timestamp using binary search (O(log n))"""
             price_cache = symbol_data[symbol]['price_cache']
-            # Find the closest timestamp <= current timestamp
-            # Since events are processed chronologically, we can use the last known price
-            valid_timestamps = [ts for ts in price_cache.keys() if ts <= timestamp]
-            if valid_timestamps:
+            sorted_timestamps = symbol_data[symbol]['sorted_timestamps']
+            
+            # Binary search for the closest timestamp <= current timestamp
+            # bisect_right returns the position where timestamp would be inserted
+            pos = bisect.bisect_right(sorted_timestamps, timestamp)
+            
+            if pos > 0:
                 # Get the most recent price (closest to timestamp)
-                closest_ts = max(valid_timestamps)
+                closest_ts = sorted_timestamps[pos - 1]
                 return price_cache[closest_ts]
             return None
         
@@ -676,6 +699,11 @@ class BacktestExecutor:
         event_count = 0
         log_interval = 1000  # Log progress every 1000 events
         
+        # OPTIMIZATION: Cache last known price per symbol as we process chronologically
+        # Since events are processed in chronological order, we can track the last price
+        # for each symbol and use it instead of doing expensive lookups
+        last_known_price = {}  # {symbol: last_price} - tracks price as we process chronologically
+        
         # Process events chronologically with shared capital (strategy execution happens here)
         for timestamp, symbol, idx, row in all_events:
             event_count += 1
@@ -690,7 +718,11 @@ class BacktestExecutor:
             # Periodic progress logging
             if event_count % log_interval == 0:
                 logger.info(f"[{self.position_mode.upper()}] Processed {event_count}/{len(all_events)} events (currently: {symbol.ticker} @ {timestamp.date()})")
+            
+            # OPTIMIZATION: Update last known price for current symbol (we process chronologically)
             price = float(row['close'])
+            last_known_price[symbol] = price
+            
             position = positions[symbol]
             indicators = symbol_data[symbol]['indicators']
             prev_indicator_values = prev_indicators[symbol]
@@ -708,7 +740,7 @@ class BacktestExecutor:
             
             # Generate signal for this symbol - let the strategy-specific signal function handle indicator validation
             # Different strategies may use different parameter names (fast_period/slow_period vs short_period/long_period)
-            signal = self._generate_signal(row, indicator_values, position, prev_indicator_values)
+            signal = self._generate_signal(row, indicator_values, position, prev_indicator_values, symbol)
             
             if indicator_values:
                 prev_indicators[symbol] = indicator_values.copy()
@@ -716,19 +748,46 @@ class BacktestExecutor:
             # Calculate CURRENT portfolio equity BEFORE processing trade
             # This includes cash + mark-to-market value of all open positions
             # We need this to calculate bet_amount correctly (bet_size_pct of current equity, not just cash)
+            # This ensures bet_amount scales with portfolio performance
             current_portfolio_equity = portfolio_capital
             for sym, pos in positions.items():
                 if pos is not None:
-                    # Use cached price lookup instead of DataFrame filtering
-                    sym_current_price = get_price_at_timestamp(sym, timestamp)
-                    if sym_current_price is None:
-                        # Fallback: use entry price if no cache entry found
-                        sym_current_price = pos['entry_price']
+                    # Use current event's price for the symbol we're processing (most accurate)
+                    if sym == symbol:
+                        sym_current_price = price  # Use current event price
+                    elif sym in last_known_price:
+                        # Use last known price for other symbols (fast and accurate enough)
+                        sym_current_price = last_known_price[sym]
+                    else:
+                        # Fallback to binary search lookup (still fast - O(log n))
+                        sym_current_price = get_price_at_timestamp(sym, timestamp)
+                        if sym_current_price is None:
+                            # Final fallback: use entry price
+                            sym_current_price = pos['entry_price']
                     
                     if pos['type'] == 'buy':
                         current_portfolio_equity += sym_current_price * pos['quantity']
                     else:  # short
                         current_portfolio_equity -= sym_current_price * pos['quantity']
+            
+            # Stop processing if portfolio equity is negative (account blowup)
+            # Individual symbol statistics will still be calculated independently starting with full initial capital
+            if current_portfolio_equity <= 0:
+                logger.info(f"[{self.position_mode.upper()}] Portfolio equity ({current_portfolio_equity:.2f}) <= 0. Stopping execution (account blown up). Individual symbol stats will still be calculated independently.")
+                # Close any open positions at current timestamp before stopping (to record final state)
+                for sym, pos in positions.items():
+                    if pos is not None:
+                        # Use current event's price for the symbol, or fallback to entry price
+                        if sym == symbol:
+                            close_price = price
+                        elif sym in last_known_price:
+                            close_price = last_known_price[sym]
+                        else:
+                            close_price = pos['entry_price']  # Fallback
+                        portfolio_capital = self._close_position_at_end(sym, pos, close_price, timestamp, portfolio_capital)
+                # Update final portfolio equity curve point
+                portfolio_equity_curve.append((timestamp, float(portfolio_capital)))
+                break  # Stop processing remaining events
             
             # Process trade: calculate bet_amount from total equity, but pass cash capital
             # This ensures bet_amount scales with portfolio performance while maintaining correct cash tracking
@@ -737,31 +796,95 @@ class BacktestExecutor:
                 [], indicators, idx, current_equity=current_portfolio_equity  # Pass equity for bet_amount calculation
             )
             
+            # In "all" mode, if we closed a position and should flip, handle it here after recalculating portfolio equity
+            # (We disabled the flip logic inside _process_trade_signal for multi-symbol mode)
+            if self.position_mode == 'all' and new_position is None and position is not None:
+                # We closed a position - check if we should flip to opposite position
+                # But first check if broker allows the opposite position type
+                should_flip = False
+                flip_signal = None
+                
+                if position['type'] == 'buy':
+                    # Closed long, check if we can open short
+                    if self.broker and symbol:
+                        from live_trading.models import SymbolBrokerAssociation
+                        try:
+                            association = SymbolBrokerAssociation.objects.get(symbol=symbol, broker=self.broker)
+                            should_flip = association.short_active
+                        except SymbolBrokerAssociation.DoesNotExist:
+                            should_flip = False
+                    else:
+                        should_flip = True  # No broker = allow flip
+                    
+                    if should_flip:
+                        flip_signal = 'sell'
+                else:
+                    # Closed short, check if we can open long
+                    if self.broker and symbol:
+                        from live_trading.models import SymbolBrokerAssociation
+                        try:
+                            association = SymbolBrokerAssociation.objects.get(symbol=symbol, broker=self.broker)
+                            should_flip = association.long_active
+                        except SymbolBrokerAssociation.DoesNotExist:
+                            should_flip = False
+                    else:
+                        should_flip = True  # No broker = allow flip
+                    
+                    if should_flip:
+                        flip_signal = 'buy'
+                
+                if should_flip and flip_signal:
+                    # Recalculate portfolio equity after the close
+                    equity_after_close = portfolio_capital
+                    for sym, pos in positions.items():
+                        if sym != symbol and pos is not None:  # Exclude current symbol (position is now None)
+                            if sym in last_known_price:
+                                sym_current_price = last_known_price[sym]
+                            else:
+                                sym_current_price = get_price_at_timestamp(sym, timestamp)
+                                if sym_current_price is None:
+                                    sym_current_price = pos['entry_price']
+                            
+                            if pos['type'] == 'buy':
+                                equity_after_close += sym_current_price * pos['quantity']
+                            else:  # short
+                                equity_after_close -= sym_current_price * pos['quantity']
+                    
+                    # Process the flip with recalculated equity
+                    portfolio_capital, new_position, _ = self._process_trade_signal(
+                        symbol, timestamp, price, flip_signal, None, portfolio_capital, bet_size_pct,
+                        [], indicators, idx, current_equity=equity_after_close
+                    )
+                else:
+                    logger.debug(f"{symbol.ticker} Skipping flip: broker doesn't allow {'short' if position['type'] == 'buy' else 'long'}")
+            
             # Update position for this symbol BEFORE calculating equity
             positions[symbol] = new_position
             
-            # Calculate portfolio equity AFTER trade (much faster with cache)
-            # This replaces the expensive DataFrame filtering with O(1) dictionary lookups
+            # Calculate portfolio equity AFTER trade (for equity curve)
+            # Use current event's price for the current symbol (most accurate)
+            # For other symbols, use last known price (fast and accurate enough)
+            # NOTE: new_position is already in positions[symbol] after line above, so we don't need to add it separately
             portfolio_equity = portfolio_capital
             for sym, pos in positions.items():
                 if pos is not None:
-                    # Use cached price lookup instead of DataFrame filtering
-                    sym_current_price = get_price_at_timestamp(sym, timestamp)
-                    if sym_current_price is None:
-                        # Fallback: use entry price if no cache entry found
-                        sym_current_price = pos['entry_price']
+                    # Use current event's price for the symbol we're processing (most accurate)
+                    if sym == symbol:
+                        sym_current_price = price  # Use current event price
+                    elif sym in last_known_price:
+                        # Use last known price for other symbols (fast and accurate enough)
+                        sym_current_price = last_known_price[sym]
+                    else:
+                        # Fallback to binary search lookup (still fast - O(log n))
+                        sym_current_price = get_price_at_timestamp(sym, timestamp)
+                        if sym_current_price is None:
+                            # Final fallback: use entry price
+                            sym_current_price = pos['entry_price']
                     
                     if pos['type'] == 'buy':
                         portfolio_equity += sym_current_price * pos['quantity']
                     else:  # short
                         portfolio_equity -= sym_current_price * pos['quantity']
-            
-            # Also include the new position if any (use current event price)
-            if new_position is not None:
-                if new_position['type'] == 'buy':
-                    portfolio_equity += price * new_position['quantity']
-                else:
-                    portfolio_equity -= price * new_position['quantity']
             
             # Update portfolio equity curve
             portfolio_equity_curve.append((timestamp, float(portfolio_equity)))
@@ -803,11 +926,22 @@ class BacktestExecutor:
         # Otherwise use capital (for single-symbol or when equity not provided)
         equity_for_bet = current_equity if current_equity is not None else capital
         
+        # For multi-symbol mode: if equity is negative, don't open new positions (account blown up)
+        # This check is done at the loop level in _execute_strategy_multi_symbol, but this is a safety check
+        # Individual symbol statistics are calculated independently, so they won't be affected by portfolio blowup
+        if equity_for_bet <= 0:
+            logger.debug(f"{symbol.ticker} Skipping position opening: equity ({equity_for_bet:.2f}) <= 0 (account blown up)")
+            return capital, position, equity_curve
+        
         # Execute trades based on signal
         if signal == 'buy' and position is None:
             # Open long position
             bet_amount = float(equity_for_bet * bet_size_pct)
             quantity = float(bet_amount / price)
+            # Ensure bet_amount and quantity are positive (safety check)
+            if bet_amount <= 0 or quantity <= 0:
+                logger.warning(f"{symbol.ticker} Skipping long entry: bet_amount={bet_amount:.2f}, quantity={quantity:.4f} (must be > 0)")
+                return capital, position, equity_curve
             position = {
                 'type': 'buy',
                 'entry_price': float(price),
@@ -823,6 +957,11 @@ class BacktestExecutor:
             # Open short position
             bet_amount = float(equity_for_bet * bet_size_pct)
             quantity = float(bet_amount / price)
+            # Ensure bet_amount and quantity are positive (safety check)
+            # Note: Even with negative equity, we use minimum bet_amount to record the trade
+            if bet_amount <= 0 or quantity <= 0:
+                logger.warning(f"{symbol.ticker} Skipping short entry: bet_amount={bet_amount:.2f}, quantity={quantity:.4f} (must be > 0)")
+                return capital, position, equity_curve
             position = {
                 'type': 'sell',
                 'entry_price': float(price),
@@ -835,7 +974,7 @@ class BacktestExecutor:
             logger.debug(f"{symbol.ticker} SHORT ENTRY @ {price} on {timestamp}, quantity: {quantity:.4f}, bet_amount: ${bet_amount:.2f}, capital after: ${capital:.2f}")
         
         elif signal == 'sell' and position is not None and position['type'] == 'buy':
-            # Close long position
+            # Close long position (EXIT)
             exit_price = float(price)
             bet_amount = float(position.get('bet_amount', position['entry_price'] * position['quantity']))
             pnl = float((exit_price - position['entry_price']) * position['quantity'])
@@ -850,10 +989,10 @@ class BacktestExecutor:
                 is_long=True
             )
             
-            # Record trade
+            # Record trade (completed long position: entry + exit)
             trade = {
                 'symbol': symbol,
-                'trade_type': 'buy',
+                'trade_type': 'buy',  # 'buy' indicates long position
                 'entry_price': float(position['entry_price']),
                 'exit_price': exit_price,
                 'entry_timestamp': position['entry_timestamp'],
@@ -864,7 +1003,11 @@ class BacktestExecutor:
                 'is_winner': pnl > 0,
                 'max_drawdown': float(max_drawdown) if max_drawdown is not None else None,
                 'metadata': {
-                    'bet_amount': float(bet_amount)
+                    'bet_amount': float(bet_amount),
+                    'action_type': 'long_exit',  # This trade represents closing a long position
+                    'position_type': 'long',  # The position type that was closed
+                    'entry_action': 'long_entry',  # When this position was opened (entry)
+                    'exit_action': 'long_exit'  # When this position was closed (exit)
                 }
             }
             self.trades.append(trade)
@@ -875,10 +1018,19 @@ class BacktestExecutor:
             logger.debug(f"{symbol.ticker} LONG EXIT @ {exit_price} on {timestamp}, PnL: {pnl:.2f}, bet_amount returned: ${bet_amount:.2f}, capital after: ${capital:.2f}")
             
             # In ALL mode, immediately open opposite position (short) since crossover already happened
-            if self.position_mode == 'all':
-                # After closing, the new equity is the updated capital (for single-symbol)
-                # For multi-symbol, the caller should recalculate portfolio equity
-                # Use updated capital as equity (works for single-symbol; multi-symbol handles separately)
+            # BUT: Only if broker allows short AND in single-symbol mode (current_equity provided), don't flip here - caller will handle it after recalculating portfolio equity
+            # Check broker capabilities before flipping
+            short_allowed = True  # Default to True if no broker or no association
+            if self.broker and symbol:
+                from live_trading.models import SymbolBrokerAssociation
+                try:
+                    association = SymbolBrokerAssociation.objects.get(symbol=symbol, broker=self.broker)
+                    short_allowed = association.short_active
+                except SymbolBrokerAssociation.DoesNotExist:
+                    short_allowed = False
+            
+            if self.position_mode == 'all' and current_equity is None and short_allowed:
+                # Single-symbol mode: can flip here using updated capital, but only if broker allows short
                 equity_after_close = capital  # Capital now includes the closed position's PnL
                 bet_amount = float(equity_after_close * bet_size_pct)
                 quantity = float(bet_amount / price)
@@ -892,9 +1044,11 @@ class BacktestExecutor:
                 # Increase capital by bet amount (cash received from selling borrowed shares)
                 capital = float(capital + bet_amount)
                 logger.debug(f"{symbol.ticker} SHORT ENTRY (after long exit) @ {price} on {timestamp}, quantity: {quantity:.4f}, bet_amount: ${bet_amount:.2f}, capital after: ${capital:.2f}")
+            elif self.position_mode == 'all' and current_equity is None and not short_allowed:
+                logger.debug(f"{symbol.ticker} Skipping flip to short: broker doesn't allow short (short_active=False)")
         
         elif signal == 'buy' and position is not None and position['type'] == 'sell':
-            # Close short position
+            # Close short position (EXIT)
             exit_price = float(price)
             bet_amount = float(position.get('bet_amount', position['entry_price'] * position['quantity']))
             pnl = float((position['entry_price'] - exit_price) * position['quantity'])
@@ -909,10 +1063,10 @@ class BacktestExecutor:
                 is_long=False
             )
             
-            # Record trade
+            # Record trade (completed short position: entry + exit)
             trade = {
                 'symbol': symbol,
-                'trade_type': 'sell',
+                'trade_type': 'sell',  # 'sell' indicates short position
                 'entry_price': float(position['entry_price']),
                 'exit_price': exit_price,
                 'entry_timestamp': position['entry_timestamp'],
@@ -923,7 +1077,11 @@ class BacktestExecutor:
                 'is_winner': pnl > 0,
                 'max_drawdown': float(max_drawdown) if max_drawdown is not None else None,
                 'metadata': {
-                    'bet_amount': float(bet_amount)
+                    'bet_amount': float(bet_amount),
+                    'action_type': 'short_exit',  # This trade represents closing a short position
+                    'position_type': 'short',  # The position type that was closed
+                    'entry_action': 'short_entry',  # When this position was opened (entry)
+                    'exit_action': 'short_exit'  # When this position was closed (exit)
                 }
             }
             self.trades.append(trade)
@@ -934,7 +1092,19 @@ class BacktestExecutor:
             logger.debug(f"{symbol.ticker} SHORT EXIT @ {exit_price} on {timestamp}, PnL: {pnl:.2f}, bet_amount returned: ${bet_amount:.2f}, capital after: ${capital:.2f}")
             
             # In ALL mode, immediately open opposite position (long) since crossover already happened
-            if self.position_mode == 'all':
+            # BUT: Only if broker allows long AND in single-symbol mode (current_equity provided), don't flip here - caller will handle it after recalculating portfolio equity
+            # Check broker capabilities before flipping
+            long_allowed = True  # Default to True if no broker or no association
+            if self.broker and symbol:
+                from live_trading.models import SymbolBrokerAssociation
+                try:
+                    association = SymbolBrokerAssociation.objects.get(symbol=symbol, broker=self.broker)
+                    long_allowed = association.long_active
+                except SymbolBrokerAssociation.DoesNotExist:
+                    long_allowed = False
+            
+            if self.position_mode == 'all' and current_equity is None and long_allowed:
+                # Single-symbol mode: can flip here using updated capital, but only if broker allows long
                 bet_amount = float(capital * bet_size_pct)
                 quantity = float(bet_amount / price)
                 position = {
@@ -947,6 +1117,8 @@ class BacktestExecutor:
                 # Reduce capital by bet amount (cash spent to buy shares)
                 capital = float(capital - bet_amount)
                 logger.debug(f"{symbol.ticker} LONG ENTRY (after short exit) @ {price} on {timestamp}, quantity: {quantity:.4f}, bet_amount: ${bet_amount:.2f}, capital after: ${capital:.2f}")
+            elif self.position_mode == 'all' and current_equity is None and not long_allowed:
+                logger.debug(f"{symbol.ticker} Skipping flip to long: broker doesn't allow long (long_active=False)")
         
         # Update equity curve
         current_equity = capital
@@ -971,10 +1143,10 @@ class BacktestExecutor:
             bet_amount = float(position.get('bet_amount', position['entry_price'] * position['quantity']))
             pnl = float((exit_price - position['entry_price']) * position['quantity'])
             
-            # Record trade
+            # Record trade (completed long position closed at end of backtest)
             trade = {
                 'symbol': symbol,
-                'trade_type': 'buy',
+                'trade_type': 'buy',  # 'buy' indicates long position
                 'entry_price': float(position['entry_price']),
                 'exit_price': exit_price,
                 'entry_timestamp': position['entry_timestamp'],
@@ -986,7 +1158,9 @@ class BacktestExecutor:
                 'max_drawdown': None,
                 'metadata': {
                     'closed_at_end': True,
-                    'bet_amount': float(bet_amount)
+                    'bet_amount': float(bet_amount),
+                    'action_type': 'long_exit',  # Clear: this is exiting a long position
+                    'position_type': 'long'  # The position type that was closed
                 }
             }
             self.trades.append(trade)
@@ -994,15 +1168,15 @@ class BacktestExecutor:
             capital = float(capital + bet_amount + pnl)
             logger.debug(f"{symbol.ticker} LONG POSITION CLOSED AT END @ {exit_price}, PnL: {pnl:.2f}, capital: ${capital:.2f}")
         else:
-            # Close short position
+            # Close short position (EXIT)
             exit_price = final_price
             bet_amount = float(position.get('bet_amount', position['entry_price'] * position['quantity']))
             pnl = float((position['entry_price'] - exit_price) * position['quantity'])
             
-            # Record trade
+            # Record trade (completed short position closed at end of backtest)
             trade = {
                 'symbol': symbol,
-                'trade_type': 'sell',
+                'trade_type': 'sell',  # 'sell' indicates short position
                 'entry_price': float(position['entry_price']),
                 'exit_price': exit_price,
                 'entry_timestamp': position['entry_timestamp'],
@@ -1014,7 +1188,9 @@ class BacktestExecutor:
                 'max_drawdown': None,
                 'metadata': {
                     'closed_at_end': True,
-                    'bet_amount': float(bet_amount)
+                    'bet_amount': float(bet_amount),
+                    'action_type': 'short_exit',  # Clear: this is exiting a short position
+                    'position_type': 'short'  # The position type that was closed
                 }
             }
             self.trades.append(trade)
@@ -1024,7 +1200,7 @@ class BacktestExecutor:
         
         return capital
     
-    def _generate_signal(self, row: pd.Series, indicators: Dict, position: Optional[Dict], prev_indicators: Optional[Dict] = None) -> Optional[str]:
+    def _generate_signal(self, row: pd.Series, indicators: Dict, position: Optional[Dict], prev_indicators: Optional[Dict] = None, symbol: Symbol = None) -> Optional[str]:
         """
         Generate trading signal based on strategy logic
         
@@ -1033,6 +1209,7 @@ class BacktestExecutor:
             indicators: Dictionary of indicator values
             position: Current position (if any)
             prev_indicators: Previous indicator values (for crossover detection)
+            symbol: Symbol instance (needed to check broker flags in 'all' mode)
         
         Returns:
             'buy', 'sell', or None
@@ -1040,11 +1217,11 @@ class BacktestExecutor:
         strategy_name = self.strategy.name
         
         if strategy_name == 'Simple Moving Average Crossover':
-            return self._sma_crossover_signal(row, indicators, position, prev_indicators)
+            return self._sma_crossover_signal(row, indicators, position, prev_indicators, symbol)
         elif strategy_name == 'Moving Average Crossover':
-            return self._moving_average_crossover_signal(row, indicators, position, prev_indicators)
+            return self._moving_average_crossover_signal(row, indicators, position, prev_indicators, symbol)
         elif strategy_name == 'Gap-Up and Gap-Down':
-            return self._gap_up_gap_down_signal(row, indicators, position)
+            return self._gap_up_gap_down_signal(row, indicators, position, symbol)
         elif strategy_name == 'RSI Mean Reversion':
             return self._rsi_mean_reversion_signal(row, indicators)
         elif strategy_name == 'Bollinger Bands Breakout':
@@ -1055,7 +1232,7 @@ class BacktestExecutor:
             logger.warning(f"Unknown strategy: {strategy_name}")
             return None
     
-    def _sma_crossover_signal(self, row: pd.Series, indicators: Dict, position: Optional[Dict], prev_indicators: Optional[Dict] = None) -> Optional[str]:
+    def _sma_crossover_signal(self, row: pd.Series, indicators: Dict, position: Optional[Dict], prev_indicators: Optional[Dict] = None, symbol: Symbol = None) -> Optional[str]:
         """
         SMA Crossover strategy signal - supports both long and short positions
         - Long entry: fast SMA crosses above slow SMA
@@ -1090,6 +1267,19 @@ class BacktestExecutor:
             logger.debug(f"SMA crossover: Missing previous indicators. prev_fast={prev_fast_sma}, prev_slow={prev_slow_sma}, prev_keys={list(prev_indicators.keys())}")
             return None
         
+        # Check broker flags for 'all' mode - respect what the broker actually allows
+        long_allowed = True
+        short_allowed = True
+        if self.position_mode == 'all' and self.broker and symbol:
+            from live_trading.models import SymbolBrokerAssociation
+            try:
+                association = SymbolBrokerAssociation.objects.get(symbol=symbol, broker=self.broker)
+                long_allowed = association.long_active
+                short_allowed = association.short_active
+            except SymbolBrokerAssociation.DoesNotExist:
+                long_allowed = False
+                short_allowed = False
+        
         # Check if we have an open position
         has_position = position is not None
         position_type = position['type'] if has_position else None
@@ -1097,12 +1287,12 @@ class BacktestExecutor:
         # Detect crossover: fast crosses above slow (golden cross)
         if prev_fast_sma <= prev_slow_sma and fast_sma > slow_sma:
             if not has_position:
-                # No position: Enter LONG (only if position_mode allows longs)
-                if self.position_mode in ('all', 'long'):
+                # No position: Enter LONG (only if position_mode allows longs AND broker allows it)
+                if self.position_mode in ('all', 'long') and long_allowed:
                     logger.info(f"[{self.position_mode.upper()}] LONG ENTRY signal: Fast SMA ({fast_sma:.2f}) crossed above Slow SMA ({slow_sma:.2f})")
                     return 'buy'
                 else:
-                    logger.debug(f"[{self.position_mode.upper()}] LONG ENTRY signal ignored (position_mode={self.position_mode})")
+                    logger.debug(f"[{self.position_mode.upper()}] LONG ENTRY signal ignored (position_mode={self.position_mode}, long_allowed={long_allowed})")
             elif position_type == 'sell':
                 # Short position open: Exit SHORT (close short = buy) - always allowed
                 logger.info(f"[{self.position_mode.upper()}] SHORT EXIT signal: Fast SMA ({fast_sma:.2f}) crossed above Slow SMA ({slow_sma:.2f})")
@@ -1111,12 +1301,12 @@ class BacktestExecutor:
         # Detect crossover: fast crosses below slow (death cross)
         elif prev_fast_sma >= prev_slow_sma and fast_sma < slow_sma:
             if not has_position:
-                # No position: Enter SHORT (only if position_mode allows shorts)
-                if self.position_mode in ('all', 'short'):
+                # No position: Enter SHORT (only if position_mode allows shorts AND broker allows it)
+                if self.position_mode in ('all', 'short') and short_allowed:
                     logger.info(f"[{self.position_mode.upper()}] SHORT ENTRY signal: Fast SMA ({fast_sma:.2f}) crossed below Slow SMA ({slow_sma:.2f})")
                     return 'sell'
                 else:
-                    logger.debug(f"[{self.position_mode.upper()}] SHORT ENTRY signal ignored (position_mode={self.position_mode})")
+                    logger.debug(f"[{self.position_mode.upper()}] SHORT ENTRY signal ignored (position_mode={self.position_mode}, short_allowed={short_allowed})")
             elif position_type == 'buy':
                 # Long position open: Exit LONG (close long = sell) - always allowed
                 logger.info(f"[{self.position_mode.upper()}] LONG EXIT signal: Fast SMA ({fast_sma:.2f}) crossed below Slow SMA ({slow_sma:.2f})")
@@ -1124,7 +1314,7 @@ class BacktestExecutor:
         
         return None
     
-    def _moving_average_crossover_signal(self, row: pd.Series, indicators: Dict, position: Optional[Dict], prev_indicators: Optional[Dict] = None) -> Optional[str]:
+    def _moving_average_crossover_signal(self, row: pd.Series, indicators: Dict, position: Optional[Dict], prev_indicators: Optional[Dict] = None, symbol: Symbol = None) -> Optional[str]:
         """
         Moving Average Crossover strategy signal - supports LONG and SHORT modes only (ALL disabled)
         - Long entry: Short SMA crosses above Long SMA
@@ -1194,7 +1384,7 @@ class BacktestExecutor:
         
         return None
     
-    def _gap_up_gap_down_signal(self, row: pd.Series, indicators: Dict, position: Optional[Dict]) -> Optional[str]:
+    def _gap_up_gap_down_signal(self, row: pd.Series, indicators: Dict, position: Optional[Dict], symbol: Symbol = None) -> Optional[str]:
         """
         Gap-Up and Gap-Down strategy signal
         - Long entry: returns > threshold × std (gap-up)
@@ -1222,6 +1412,19 @@ class BacktestExecutor:
             logger.debug(f"Gap-Up and Gap-Down: Missing indicators. returns={returns}, std={std}, keys={list(indicators.keys())}")
             return None
         
+        # Check broker flags for 'all' mode - respect what the broker actually allows
+        long_allowed = True
+        short_allowed = True
+        if self.position_mode == 'all' and self.broker and symbol:
+            from live_trading.models import SymbolBrokerAssociation
+            try:
+                association = SymbolBrokerAssociation.objects.get(symbol=symbol, broker=self.broker)
+                long_allowed = association.long_active
+                short_allowed = association.short_active
+            except SymbolBrokerAssociation.DoesNotExist:
+                long_allowed = False
+                short_allowed = False
+        
         # Check if we have an open position
         has_position = position is not None
         position_type = position['type'] if has_position else None  # "buy" or "sell"
@@ -1233,8 +1436,50 @@ class BacktestExecutor:
         long_signal = returns > long_threshold
         short_signal = returns < short_threshold
         
+        # EXIT CONDITIONS (check exits first, before entries/flips)
+        # Exit LONG if opposite signal (gap-down) or mode doesn't allow long
+        if has_position and position_type == 'buy':
+            if self.position_mode == 'short':
+                # Mode doesn't allow long, must exit
+                logger.info(f"[{self.position_mode.upper()}] LONG EXIT signal: mode doesn't allow long")
+                return 'sell'
+            elif self.position_mode == 'long' and short_signal:
+                # LONG mode: exit long when we get opposite (short) signal
+                logger.info(f"[{self.position_mode.upper()}] LONG EXIT signal: returns ({returns:.4f})")
+                return 'sell'
+            elif self.position_mode == 'all' and short_signal:
+                if short_allowed:
+                    # Short signal AND broker allows short - flip to short (handled by flip logic below)
+                    # Don't return here, let the flip logic handle it
+                    pass
+                else:
+                    # Short signal but broker doesn't allow short - exit long but don't enter short
+                    logger.info(f"[{self.position_mode.upper()}] LONG EXIT signal (short not allowed): returns ({returns:.4f})")
+                    return 'sell'
+        
+        # Exit SHORT if opposite signal (gap-up) or mode doesn't allow short
+        if has_position and position_type == 'sell':
+            if self.position_mode == 'long':
+                # Mode doesn't allow short, must exit
+                logger.info(f"[{self.position_mode.upper()}] SHORT EXIT signal: mode doesn't allow short")
+                return 'buy'
+            elif self.position_mode == 'short' and long_signal:
+                # SHORT mode: exit short when we get opposite (long) signal
+                logger.info(f"[{self.position_mode.upper()}] SHORT EXIT signal: returns ({returns:.4f})")
+                return 'buy'
+            elif self.position_mode == 'all' and long_signal:
+                if long_allowed:
+                    # Long signal AND broker allows long - flip to long (handled by flip logic below)
+                    # Don't return here, let the flip logic handle it
+                    pass
+                else:
+                    # Long signal but broker doesn't allow long - exit short but don't enter long
+                    logger.info(f"[{self.position_mode.upper()}] SHORT EXIT signal (long not allowed): returns ({returns:.4f})")
+                    return 'buy'
+        
+        # ENTRY/FLIP CONDITIONS (check after exits)
         # LONG ENTRY/FLIP
-        if long_signal:
+        if long_signal and long_allowed:
             if self.position_mode in ('long', 'all'):
                 if not has_position:
                     # No position: Enter LONG
@@ -1246,29 +1491,16 @@ class BacktestExecutor:
                     return 'buy'
         
         # SHORT ENTRY/FLIP
-        if short_signal:
+        if short_signal and short_allowed:
             if self.position_mode in ('short', 'all'):
                 if not has_position:
                     # No position: Enter SHORT
                     logger.info(f"[{self.position_mode.upper()}] SHORT ENTRY signal: returns ({returns:.4f}) < -threshold×std ({short_threshold:.4f})")
                     return 'sell'
                 elif self.position_mode == 'all' and position_type == 'buy':
-                    # Long position open in ALL mode: Flip to SHORT
+                    # Long position open in ALL mode: Flip to SHORT (only if short_allowed)
                     logger.info(f"[{self.position_mode.upper()}] FLIP LONG→SHORT: returns ({returns:.4f}) < -threshold×std ({short_threshold:.4f})")
                     return 'sell'
-        
-        # EXIT CONDITIONS
-        # Exit LONG if opposite signal (gap-down) or mode doesn't allow long
-        if has_position and position_type == 'buy':
-            if short_signal or self.position_mode == 'short':
-                logger.info(f"[{self.position_mode.upper()}] LONG EXIT signal: returns ({returns:.4f})")
-                return 'sell'
-        
-        # Exit SHORT if opposite signal (gap-up) or mode doesn't allow short
-        if has_position and position_type == 'sell':
-            if long_signal or self.position_mode == 'long':
-                logger.info(f"[{self.position_mode.upper()}] SHORT EXIT signal: returns ({returns:.4f})")
-                return 'buy'
         
         return None
     
@@ -1328,14 +1560,36 @@ class BacktestExecutor:
         stats = {}
         
         # Per-symbol statistics
+        # IMPORTANT: Always include stats for all symbols in self.symbols, even if they have 0 trades
+        # This ensures frontend always has a complete stats structure for each mode
         for symbol in self.symbols:
             symbol_trades = [t for t in self.trades if t['symbol'] == symbol]
             
             if not symbol_trades:
-                continue
-            
-            symbol_stats = self._calculate_symbol_statistics(symbol, symbol_trades)
-            stats[symbol] = symbol_stats
+                # Return empty statistics structure with all fields set to 0/None
+                # This ensures consistency across all modes
+                stats[symbol] = {
+                    'total_trades': 0,
+                    'winning_trades': 0,
+                    'losing_trades': 0,
+                    'win_rate': 0,
+                    'total_pnl': 0,
+                    'total_pnl_percentage': 0,
+                    'average_pnl': 0,
+                    'average_winner': 0,
+                    'average_loser': 0,
+                    'profit_factor': 0,
+                    'max_drawdown': 0,
+                    'max_drawdown_duration': 0,
+                    'sharpe_ratio': 0,
+                    'cagr': 0,
+                    'total_return': 0,
+                    'equity_curve': [],
+                    'independent_bet_amounts': {},
+                }
+            else:
+                symbol_stats = self._calculate_symbol_statistics(symbol, symbol_trades)
+                stats[symbol] = symbol_stats
         
         # Portfolio-level statistics are calculated separately for each position_mode
         # This is handled in the task which runs the executor multiple times
@@ -1371,11 +1625,14 @@ class BacktestExecutor:
         profit_factor = gross_profit / gross_loss if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0)
         
         # Equity curve - always calculate from trades for clean, consistent chart
+        # IMPORTANT: For individual symbol statistics in multi-symbol backtests, this calculates
+        # an INDEPENDENT equity curve starting with the full initial_capital, not the shared portfolio equity.
+        # This ensures each symbol's performance is shown as if it was traded independently with the full bankroll.
         # This ensures:
         # 1. Equity curve matches total_pnl (calculated from trades only)
         # 2. Clean chart with points only at trade exits (not every data row)
-        # 3. Consistency between single-symbol and multi-symbol backtests
-        equity_curve_data = self._calculate_symbol_equity_curve_from_trades(trades, initial_capital)
+        # 3. Each symbol's equity curve starts at initial_capital and is independent of the global portfolio
+        equity_curve_data, independent_bet_amounts = self._calculate_symbol_equity_curve_from_trades(trades, initial_capital)
         # Convert to list of tuples for compatibility with drawdown calculation
         equity_curve = [
             (pd.to_datetime(point['timestamp']), point['equity'])
@@ -1423,8 +1680,6 @@ class BacktestExecutor:
                 # For symbol-level stats, this should match total_pnl_percentage (within rounding)
                 total_return = ((final_equity - initial_equity) / initial_equity) * 100
                 
-                # Ensure total_return matches total_pnl_percentage for symbol-level stats
-                # (they should be mathematically equivalent, but use equity curve value for consistency)
                 # Round to match the precision of total_pnl_percentage
                 total_return = round(total_return, 4)
                 
@@ -1521,17 +1776,30 @@ class BacktestExecutor:
             'cagr': round(cagr, 4),
             'total_return': round(total_return, 4),
             'equity_curve': equity_curve_data,
+            'independent_bet_amounts': independent_bet_amounts,  # Map entry_timestamp -> bet_amount for individual symbol view
         }
     
-    def _calculate_symbol_equity_curve_from_trades(self, trades: List[Dict], initial_capital: float) -> List[Dict]:
-        """Calculate symbol-specific equity curve from trades only (for multi-symbol backtests)
+    def _calculate_symbol_equity_curve_from_trades(self, trades: List[Dict], initial_capital: float) -> tuple[List[Dict], Dict]:
+        """Calculate symbol-specific equity curve by simulating independent trading
         
-        This ensures the equity curve matches total_pnl which is calculated from trades only.
+        This simulates what would have happened if this symbol was traded independently
+        with the full initial_capital. It processes trades chronologically, tracking cash
+        and positions to build an equity curve that matches what bet_amounts would have
+        been if trading independently.
+        
+        The equity curve shows equity at each point, which should match what bet_amount
+        would be calculated from (equity * bet_size_pct).
+        
+        Returns:
+            tuple: (equity_curve_data, independent_bet_amounts)
+                - equity_curve_data: List of {timestamp, equity} dicts
+                - independent_bet_amounts: Dict mapping entry_timestamp (ISO string) to bet_amount (float)
         """
         equity_curve_data = []
+        independent_bet_amounts = {}  # Map entry_timestamp -> bet_amount
         
         if not trades:
-            return equity_curve_data
+            return equity_curve_data, independent_bet_amounts
         
         # Helper to normalize timestamps
         def normalize_timestamp(ts):
@@ -1543,86 +1811,196 @@ class BacktestExecutor:
                 ts = timezone.make_aware(ts)
             return ts
         
-        # Get all trades with exits, sort by exit timestamp (when PnL is realized)
-        trades_with_exits = [t for t in trades if t.get('exit_timestamp') and t.get('pnl') is not None]
+        # Get bet_size_pct from backtest
+        bet_size_pct = float(self.backtest.bet_size_percentage) / 100.0
         
-        if trades_with_exits:
-            # Sort trades by exit timestamp to process chronologically
-            sorted_trades = sorted(trades_with_exits, key=lambda t: normalize_timestamp(t['exit_timestamp']) or datetime.min)
+        # Deduplicate trades - keep only unique trades by (entry_timestamp, exit_timestamp, entry_price, exit_price)
+        # This handles cases where the same trade appears multiple times in the database
+        seen_trades = {}
+        unique_trades = []
+        for trade in trades:
+            entry_ts = normalize_timestamp(trade.get('entry_timestamp'))
+            exit_ts = normalize_timestamp(trade.get('exit_timestamp'))
+            entry_price = trade.get('entry_price')
+            exit_price = trade.get('exit_price')
             
-            # Find the earliest timestamp (entry or exit) to start the curve
-            all_timestamps = []
-            for trade in trades:
-                if trade.get('entry_timestamp'):
-                    all_timestamps.append(normalize_timestamp(trade['entry_timestamp']))
-                if trade.get('exit_timestamp'):
-                    all_timestamps.append(normalize_timestamp(trade['exit_timestamp']))
-            
-            earliest_ts = min(all_timestamps) if all_timestamps else None
-            
-            # Start with initial capital at earliest timestamp
-            if earliest_ts:
-                equity_curve_data.append({
-                    'timestamp': earliest_ts.isoformat() if hasattr(earliest_ts, 'isoformat') else str(earliest_ts),
-                    'equity': initial_capital
+            # Create a unique key for this trade
+            trade_key = (entry_ts, exit_ts, entry_price, exit_price)
+            if trade_key not in seen_trades:
+                seen_trades[trade_key] = trade
+                unique_trades.append(trade)
+        
+        # Build list of all trade events (entry and exit) from unique trades only
+        events = []
+        for trade in unique_trades:
+            if trade.get('entry_timestamp'):
+                events.append({
+                    'type': 'entry',
+                    'timestamp': normalize_timestamp(trade['entry_timestamp']),
+                    'trade': trade
                 })
+            if trade.get('exit_timestamp') and trade.get('pnl') is not None:
+                events.append({
+                    'type': 'exit',
+                    'timestamp': normalize_timestamp(trade['exit_timestamp']),
+                    'trade': trade
+                })
+        
+        if not events:
+            return equity_curve_data, independent_bet_amounts
+        
+        # Sort events chronologically
+        events.sort(key=lambda e: (e['timestamp'] or datetime.min, 0 if e['type'] == 'exit' else 1))  # Process exits before entries at same timestamp
+        
+        # Simulate independent trading: track cash
+        cash = initial_capital
+        position = None  # {type: 'buy'|'sell', entry_price: float, quantity: float}
+        
+        # Start with initial capital
+        first_timestamp = events[0]['timestamp']
+        if first_timestamp:
+            equity_curve_data.append({
+                'timestamp': first_timestamp.isoformat() if hasattr(first_timestamp, 'isoformat') else str(first_timestamp),
+                'equity': initial_capital
+            })
+        
+        # Process events chronologically
+        for event in events:
+            trade = event['trade']
+            timestamp = event['timestamp']
             
-            # Track cumulative PnL as trades exit (when PnL is realized)
-            cumulative_pnl = 0.0
-            for trade in sorted_trades:
-                cumulative_pnl += float(trade['pnl'])
-                exit_ts = normalize_timestamp(trade['exit_timestamp'])
+            if event['type'] == 'entry':
+                # If there's already a position open, close it first (can't have overlapping positions for individual symbol)
+                if position is not None:
+                    # Close existing position at current price (use entry price as approximation)
+                    close_price = float(trade['entry_price'])
+                    if position['type'] == 'buy':
+                        # Sell the shares
+                        close_value = close_price * position['quantity']
+                        cash += close_value
+                    else:  # short
+                        # Buy back the shares
+                        close_value = close_price * position['quantity']
+                        cash -= close_value
+                    position = None
                 
-                current_equity = initial_capital + cumulative_pnl
+                # Calculate current equity (cash only, no open position)
+                current_equity = cash
+                
+                # Calculate bet_amount from current equity (10% of equity)
+                bet_amount = float(current_equity * bet_size_pct)
+                if bet_amount <= 0 or current_equity <= 0:
+                    continue  # Skip if can't bet
+                
+                # Store independent bet_amount for this trade entry
+                entry_timestamp_str = timestamp.isoformat() if hasattr(timestamp, 'isoformat') else str(timestamp)
+                independent_bet_amounts[entry_timestamp_str] = round(bet_amount, 2)
+                
+                # Open position
+                entry_price = float(trade['entry_price'])
+                quantity = float(bet_amount / entry_price)
+                
+                if trade['trade_type'] == 'buy':
+                    position = {
+                        'type': 'buy',
+                        'entry_price': entry_price,
+                        'quantity': quantity
+                    }
+                    cash -= bet_amount  # Spend cash to buy shares
+                else:  # sell (short)
+                    position = {
+                        'type': 'sell',
+                        'entry_price': entry_price,
+                        'quantity': quantity
+                    }
+                    cash += bet_amount  # Receive cash from short sale
+                
+                # Calculate equity after opening position (cash + position value)
+                current_equity = cash
+                if position is not None:
+                    if position['type'] == 'buy':
+                        current_equity += entry_price * position['quantity']  # Cash + shares value
+                    else:  # short
+                        current_equity -= entry_price * position['quantity']  # Cash - liability
+                
                 equity_curve_data.append({
-                    'timestamp': exit_ts.isoformat() if hasattr(exit_ts, 'isoformat') else str(exit_ts),
+                    'timestamp': timestamp.isoformat() if hasattr(timestamp, 'isoformat') else str(timestamp),
                     'equity': round(current_equity, 2)
                 })
-            
-            # Sort by timestamp to ensure chronological order BEFORE final point adjustment
-            equity_curve_data.sort(key=lambda x: pd.to_datetime(x['timestamp']))
-            
-            # Remove duplicates (same timestamp, keep the one with correct equity)
-            seen_timestamps = {}
-            for point in equity_curve_data:
-                ts_key = point['timestamp']
-                # Keep the last equity value for each timestamp (most up-to-date)
-                seen_timestamps[ts_key] = point
-            equity_curve_data = list(seen_timestamps.values())
-            equity_curve_data.sort(key=lambda x: pd.to_datetime(x['timestamp']))
-            
-            # Ensure final point matches total_pnl exactly
-            if equity_curve_data:
-                total_pnl = sum(t['pnl'] for t in trades)
-                final_equity = initial_capital + total_pnl
-                # Get the latest timestamp from trades
-                latest_ts = max((normalize_timestamp(t.get('exit_timestamp') or t.get('entry_timestamp')) for t in trades if t.get('exit_timestamp') or t.get('entry_timestamp')), default=earliest_ts)
                 
-                # Normalize the last point's timestamp for comparison
-                last_point_ts = pd.to_datetime(equity_curve_data[-1]['timestamp'])
-                if timezone.is_naive(last_point_ts):
-                    last_point_ts = timezone.make_aware(last_point_ts)
+            elif event['type'] == 'exit':
+                if position is None:
+                    continue  # No position to close
                 
-                # Compare timestamps properly
-                if latest_ts and latest_ts != last_point_ts:
-                    # Add new point if latest trade timestamp is different
+                # Close position - calculate PnL based on our independent quantity
+                exit_price = float(trade['exit_price'])
+                
+                if position['type'] == 'buy':
+                    # Calculate PnL: (exit_price - entry_price) * quantity
+                    pnl = (exit_price - position['entry_price']) * position['quantity']
+                    # Sell the shares - receive exit_price * quantity
+                    cash += exit_price * position['quantity']
+                else:  # short
+                    # Calculate PnL: (entry_price - exit_price) * quantity (reversed for short)
+                    pnl = (position['entry_price'] - exit_price) * position['quantity']
+                    # Buy back the shares - pay exit_price * quantity
+                    cash -= exit_price * position['quantity']
+                
+                position = None
+                
+                # Equity after closing position is just cash (no open position)
+                current_equity = cash
+                
+                equity_curve_data.append({
+                    'timestamp': timestamp.isoformat() if hasattr(timestamp, 'isoformat') else str(timestamp),
+                    'equity': round(current_equity, 2)
+                })
+        
+        # After processing all events, sort and clean up
+        equity_curve_data.sort(key=lambda x: pd.to_datetime(x['timestamp']))
+        
+        # Remove duplicates (same timestamp, keep the last one which is most up-to-date)
+        seen_timestamps = {}
+        for point in equity_curve_data:
+            ts_key = point['timestamp']
+            seen_timestamps[ts_key] = point
+        equity_curve_data = list(seen_timestamps.values())
+        equity_curve_data.sort(key=lambda x: pd.to_datetime(x['timestamp']))
+        
+        # CRITICAL: Ensure the first point always starts with initial_capital
+        if equity_curve_data and abs(float(equity_curve_data[0].get('equity', 0)) - initial_capital) > 0.01:
+            equity_curve_data[0]['equity'] = initial_capital
+        
+        # If there are open positions at the end, mark-to-market them
+        if position is not None and equity_curve_data:
+            # Use the last trade's exit price to mark-to-market
+            last_trade_with_exit = None
+            for trade in trades:
+                if trade.get('exit_timestamp'):
+                    if last_trade_with_exit is None or normalize_timestamp(trade['exit_timestamp']) > normalize_timestamp(last_trade_with_exit.get('exit_timestamp')):
+                        last_trade_with_exit = trade
+            
+            if last_trade_with_exit:
+                final_price = float(last_trade_with_exit['exit_price'])
+                final_equity = cash
+                if position['type'] == 'buy':
+                    final_equity += final_price * position['quantity']
+                else:  # short
+                    final_equity -= final_price * position['quantity']
+                
+                # Update or add final point
+                latest_ts = max((normalize_timestamp(t.get('exit_timestamp') or t.get('entry_timestamp')) 
+                               for t in trades if t.get('exit_timestamp') or t.get('entry_timestamp')), 
+                              default=None)
+                if latest_ts:
                     equity_curve_data.append({
                         'timestamp': latest_ts.isoformat() if hasattr(latest_ts, 'isoformat') else str(latest_ts),
                         'equity': round(final_equity, 2)
                     })
-                    # Re-sort after adding
                     equity_curve_data.sort(key=lambda x: pd.to_datetime(x['timestamp']))
-                else:
-                    # Just update equity value
-                    equity_curve_data[-1]['equity'] = round(final_equity, 2)
-            
-            # Ensure final point matches total_pnl
-            if equity_curve_data:
-                total_pnl = sum(t['pnl'] for t in trades)
-                final_equity = initial_capital + total_pnl
-                equity_curve_data[-1]['equity'] = round(final_equity, 2)
-        else:
-            # No trades with exits - create simple curve
+        
+        # Ensure we have at least initial and final points if no events processed
+        if len(equity_curve_data) == 0:
             all_timestamps = []
             for trade in trades:
                 if trade.get('entry_timestamp'):
@@ -1631,29 +2009,27 @@ class BacktestExecutor:
             if all_timestamps:
                 earliest_ts = min(all_timestamps)
                 latest_ts = max(all_timestamps)
-                total_pnl = sum(t['pnl'] for t in trades)
+                total_pnl = sum(t.get('pnl', 0) for t in trades if t.get('pnl') is not None)
                 equity_curve_data = [
                     {'timestamp': earliest_ts.isoformat() if hasattr(earliest_ts, 'isoformat') else str(earliest_ts), 'equity': initial_capital},
                     {'timestamp': latest_ts.isoformat() if hasattr(latest_ts, 'isoformat') else str(latest_ts), 'equity': round(initial_capital + total_pnl, 2)}
                 ]
             else:
                 now = timezone.now()
-                total_pnl = sum(t['pnl'] for t in trades)
+                total_pnl = sum(t.get('pnl', 0) for t in trades if t.get('pnl') is not None)
                 equity_curve_data = [
                     {'timestamp': now.isoformat(), 'equity': initial_capital},
-                    {'timestamp': now.isoformat(), 'equity': round(initial_capital + total_pnl, 2)}
+                    {'timestamp': (now + timedelta(days=1)).isoformat(), 'equity': round(initial_capital + total_pnl, 2)}
                 ]
         
-        # Ensure we have at least initial and final points
-        if len(equity_curve_data) == 0:
-            now = timezone.now()
-            total_pnl = sum(t['pnl'] for t in trades)
-            equity_curve_data = [
-                {'timestamp': now.isoformat(), 'equity': initial_capital},
-                {'timestamp': now.isoformat(), 'equity': round(initial_capital + total_pnl, 2)}
-            ]
+        # CRITICAL: Ensure the first point always starts with initial_capital (independent equity curve)
+        if equity_curve_data:
+            equity_curve_data.sort(key=lambda x: pd.to_datetime(x['timestamp']))
+            first_point = equity_curve_data[0]
+            if abs(float(first_point.get('equity', 0)) - initial_capital) > 0.01:
+                first_point['equity'] = initial_capital
         
-        return equity_curve_data
+        return equity_curve_data, independent_bet_amounts
     
     def _calculate_portfolio_statistics(self, trade_type_filter: Optional[str] = None) -> Dict:
         """
@@ -1701,20 +2077,20 @@ class BacktestExecutor:
         else:
             max_drawdown = 0
         
-        # Equity curve and CAGR - use the equity curve from this executor instance
-        # Each executor instance (ALL, LONG, SHORT) has its own equity curve
+        # Equity curve and CAGR - calculate portfolio equity curve from all trades chronologically
+        # This ensures the equity curve matches total_pnl calculation and has reasonable size (points only at trade exits)
+        # Each executor instance (ALL, LONG, SHORT) has its own equity curve stored in self.equity_curves
         equity_curve_data = []
         max_drawdown_duration = 0
         sharpe_ratio = 0
         cagr = 0
         total_return = 0
         
-        # Calculate portfolio equity curve from all trades chronologically
-        # This ensures the equity curve matches total_pnl calculation
         initial_capital = float(self.backtest.initial_capital)
-        equity_curve_data = []
         
         if all_trades:
+            # Calculate portfolio equity curve from all trades chronologically
+            # This ensures the equity curve matches total_pnl calculation
             # Helper to normalize timestamps
             def normalize_timestamp(ts):
                 if ts is None:
@@ -1816,24 +2192,31 @@ class BacktestExecutor:
                         {'timestamp': latest_ts.isoformat() if hasattr(latest_ts, 'isoformat') else str(latest_ts), 'equity': round(initial_capital + total_pnl, 2)}
                     ]
                 else:
+                    # No timestamps available - use current time with 1 day difference
                     now = timezone.now()
                     equity_curve_data = [
                         {'timestamp': now.isoformat(), 'equity': initial_capital},
-                        {'timestamp': now.isoformat(), 'equity': round(initial_capital + total_pnl, 2)}
+                        {'timestamp': (now + timedelta(days=1)).isoformat(), 'equity': round(initial_capital + total_pnl, 2)}
                     ]
         
         # Ensure we have at least initial and final points
         if len(equity_curve_data) == 0:
+            # No equity curve data - use current time with 1 day difference
             now = timezone.now()
             equity_curve_data = [
                 {'timestamp': now.isoformat(), 'equity': initial_capital},
-                {'timestamp': now.isoformat(), 'equity': round(initial_capital + total_pnl, 2)}
+                {'timestamp': (now + timedelta(days=1)).isoformat(), 'equity': round(initial_capital + total_pnl, 2)}
             ]
         elif len(equity_curve_data) == 1:
-            # Add final point if only one point exists
+            # Add final point if only one point exists - ensure different timestamp
             final_equity = initial_capital + total_pnl
+            first_ts = pd.to_datetime(equity_curve_data[0]['timestamp'])
+            if timezone.is_naive(first_ts):
+                first_ts = timezone.make_aware(first_ts)
+            # Add 1 day to ensure different timestamp for CAGR calculation
+            final_ts = first_ts + timedelta(days=1)
             equity_curve_data.append({
-                'timestamp': equity_curve_data[0]['timestamp'],
+                'timestamp': final_ts.isoformat(),
                 'equity': round(final_equity, 2)
             })
         else:

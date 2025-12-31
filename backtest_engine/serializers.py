@@ -102,7 +102,6 @@ class BacktestStatisticsSerializer(serializers.ModelSerializer):
         # Extract LONG and SHORT stats from additional_stats
         if obj.additional_stats and isinstance(obj.additional_stats, dict):
             long_stats = obj.additional_stats.get('long', {})
-            short_stats = obj.additional_stats.get('short', {})
             
             if long_stats:
                 long_equity_curve = extract_equity_curve_arrays(long_stats.get('equity_curve'))
@@ -127,28 +126,30 @@ class BacktestStatisticsSerializer(serializers.ModelSerializer):
                     'equity_curve_y': long_equity_curve['y'],
                 }
             
-            if short_stats:
-                short_equity_curve = extract_equity_curve_arrays(short_stats.get('equity_curve'))
-                result['short'] = {
-                    'total_trades': short_stats.get('total_trades', 0),
-                    'winning_trades': short_stats.get('winning_trades', 0),
-                    'losing_trades': short_stats.get('losing_trades', 0),
-                    'win_rate': round(float(short_stats.get('win_rate', 0)), 2) if short_stats.get('win_rate') else None,
-                    'total_pnl': round(float(short_stats.get('total_pnl', 0)), 2) if short_stats.get('total_pnl') is not None else None,
-                    'total_pnl_percentage': round(float(short_stats.get('total_pnl_percentage', 0)), 2) if short_stats.get('total_pnl_percentage') is not None else None,
-                    'average_pnl': round(float(short_stats.get('average_pnl', 0)), 2) if short_stats.get('average_pnl') is not None else None,
-                    'average_winner': round(float(short_stats.get('average_winner', 0)), 2) if short_stats.get('average_winner') is not None else None,
-                    'average_loser': round(float(short_stats.get('average_loser', 0)), 2) if short_stats.get('average_loser') is not None else None,
-                    'profit_factor': round(float(short_stats.get('profit_factor', 0)), 2) if short_stats.get('profit_factor') is not None else None,
-                    'max_drawdown': round(float(short_stats.get('max_drawdown', 0)), 2) if short_stats.get('max_drawdown') is not None else None,
-                    'max_drawdown_duration': short_stats.get('max_drawdown_duration'),
-                    'sharpe_ratio': round(float(short_stats.get('sharpe_ratio', 0)), 2) if short_stats.get('sharpe_ratio') is not None else None,
-                    'cagr': round(float(short_stats.get('cagr', 0)), 2) if short_stats.get('cagr') is not None else None,
-                    'total_return': round(float(short_stats.get('total_return', 0)), 2) if short_stats.get('total_return') is not None else None,
-                    'equity_curve': short_stats.get('equity_curve', []),
-                    'equity_curve_x': short_equity_curve['x'],
-                    'equity_curve_y': short_equity_curve['y'],
-                }
+            # Always include 'short' mode structure, even if empty (for consistency)
+            # Check if short_stats exists in additional_stats (not just if it's truthy, since empty dict is falsy)
+            short_stats = obj.additional_stats.get('short', {}) if obj.additional_stats else {}
+            short_equity_curve = extract_equity_curve_arrays(short_stats.get('equity_curve') if isinstance(short_stats, dict) else None)
+            result['short'] = {
+                'total_trades': short_stats.get('total_trades', 0) if isinstance(short_stats, dict) else 0,
+                'winning_trades': short_stats.get('winning_trades', 0) if isinstance(short_stats, dict) else 0,
+                'losing_trades': short_stats.get('losing_trades', 0) if isinstance(short_stats, dict) else 0,
+                'win_rate': round(float(short_stats.get('win_rate', 0)), 2) if (isinstance(short_stats, dict) and short_stats.get('win_rate')) else None,
+                'total_pnl': round(float(short_stats.get('total_pnl', 0)), 2) if (isinstance(short_stats, dict) and short_stats.get('total_pnl') is not None) else None,
+                'total_pnl_percentage': round(float(short_stats.get('total_pnl_percentage', 0)), 2) if (isinstance(short_stats, dict) and short_stats.get('total_pnl_percentage') is not None) else None,
+                'average_pnl': round(float(short_stats.get('average_pnl', 0)), 2) if (isinstance(short_stats, dict) and short_stats.get('average_pnl') is not None) else None,
+                'average_winner': round(float(short_stats.get('average_winner', 0)), 2) if (isinstance(short_stats, dict) and short_stats.get('average_winner') is not None) else None,
+                'average_loser': round(float(short_stats.get('average_loser', 0)), 2) if (isinstance(short_stats, dict) and short_stats.get('average_loser') is not None) else None,
+                'profit_factor': round(float(short_stats.get('profit_factor', 0)), 2) if (isinstance(short_stats, dict) and short_stats.get('profit_factor') is not None) else None,
+                'max_drawdown': round(float(short_stats.get('max_drawdown', 0)), 2) if (isinstance(short_stats, dict) and short_stats.get('max_drawdown') is not None) else None,
+                'max_drawdown_duration': short_stats.get('max_drawdown_duration') if isinstance(short_stats, dict) else None,
+                'sharpe_ratio': round(float(short_stats.get('sharpe_ratio', 0)), 2) if (isinstance(short_stats, dict) and short_stats.get('sharpe_ratio') is not None) else None,
+                'cagr': round(float(short_stats.get('cagr', 0)), 2) if (isinstance(short_stats, dict) and short_stats.get('cagr') is not None) else None,
+                'total_return': round(float(short_stats.get('total_return', 0)), 2) if (isinstance(short_stats, dict) and short_stats.get('total_return') is not None) else None,
+                'equity_curve': short_stats.get('equity_curve', []) if isinstance(short_stats, dict) else [],
+                'equity_curve_x': short_equity_curve['x'],
+                'equity_curve_y': short_equity_curve['y'],
+            }
         
         return result
 

@@ -1,7 +1,7 @@
 """
 Data Validation Service
 Validates OHLCV data for quality issues: missing values, duplicates, outliers,
-OHLCV logical constraints, and extreme single-day price jumps
+OHLCV logical constraints, large time gaps, extreme price jumps, and suspicious patterns
 """
 
 import pandas as pd
@@ -18,7 +18,9 @@ def validate_ohlcv_data(ohlcv_data: List[Dict]) -> Tuple[bool, str]:
     2. Duplicate timestamps
     3. Outliers in price data
     4. Complete OHLCV logical constraints (High >= all, Low <= all)
-    5. Extreme single-day price jumps (>50%)
+    5. Large time gaps (>90 days)
+    6. Extreme single-day price jumps (>50%, or >100% after >1 year gap)
+    7. Suspicious patterns (3+ consecutive days with identical OHLC values)
     
     Args:
         ohlcv_data: List of OHLCV dicts with timestamp, open, high, low, close, volume
@@ -143,14 +145,53 @@ def validate_ohlcv_data(ohlcv_data: List[Dict]) -> Tuple[bool, str]:
         if outlier_checks:
             reasons.append(f"Outliers detected - {', '.join(outlier_checks)}")
         
-        # 4. Check for extreme single-day price jumps
-        # Price jumps >50% in a single day are not normal and indicate data quality issues
-        if len(df) > 1 and 'timestamp' in df.columns and 'close' in df.columns:
+        # 4. Check for large time gaps and suspicious price jumps after gaps
+        # Large gaps (>90 days) indicate missing data and should be flagged
+        large_gap_threshold_days = 90  # Define threshold for large gaps (>90 days = ~3 months)
+        if len(df) > 1 and 'timestamp' in df.columns:
             # Sort by timestamp to ensure chronological order
             df_sorted = df.sort_values('timestamp').reset_index(drop=True)
-            df_sorted['close'] = pd.to_numeric(df_sorted['close'], errors='coerce')
+            df_sorted['timestamp'] = pd.to_datetime(df_sorted['timestamp'], errors='coerce')
             
-            # Calculate day-to-day price changes
+            # Calculate time gaps between consecutive records
+            time_gaps = df_sorted['timestamp'].diff().dt.days
+            
+            # Check for large time gaps
+            large_gaps = time_gaps[time_gaps > large_gap_threshold_days]
+            
+            if len(large_gaps) > 0:
+                gap_details = []
+                for idx in large_gaps.index:
+                    if idx > 0 and pd.notna(time_gaps.iloc[idx]):
+                        gap_days = int(time_gaps.iloc[idx])
+                        gap_years = gap_days / 365.25
+                        prev_date = df_sorted.iloc[idx - 1]['timestamp']
+                        curr_date = df_sorted.iloc[idx]['timestamp']
+                        
+                        if pd.notna(prev_date) and pd.notna(curr_date):
+                            prev_date_str = pd.to_datetime(prev_date).strftime('%Y-%m-%d')
+                            curr_date_str = pd.to_datetime(curr_date).strftime('%Y-%m-%d')
+                            gap_details.append(
+                                f"{prev_date_str}->{curr_date_str} ({gap_days} days, {gap_years:.1f} years)"
+                            )
+                
+                if gap_details:
+                    reasons.append(
+                        f"Large time gaps detected ({len(large_gaps)}): " + 
+                        "; ".join(gap_details[:3])  # Limit to first 3
+                    )
+        
+        # 5. Check for extreme single-day price jumps (including after large gaps)
+        # Price jumps >50% are not normal and indicate data quality issues
+        if len(df) > 1 and 'timestamp' in df.columns and 'close' in df.columns:
+            # Sort by timestamp to ensure chronological order (reuse from previous check if available)
+            if 'df_sorted' not in locals():
+                df_sorted = df.sort_values('timestamp').reset_index(drop=True)
+            df_sorted['close'] = pd.to_numeric(df_sorted['close'], errors='coerce')
+            df_sorted['timestamp'] = pd.to_datetime(df_sorted['timestamp'], errors='coerce')
+            
+            # Calculate time gaps and price changes
+            time_gaps = df_sorted['timestamp'].diff().dt.days
             price_changes = df_sorted['close'].pct_change().abs()
             
             # Flag extreme jumps (>50% change)
@@ -166,16 +207,61 @@ def validate_ohlcv_data(ohlcv_data: List[Dict]) -> Tuple[bool, str]:
                         change_pct = price_changes.iloc[idx] * 100
                         jump_date = df_sorted.iloc[idx]['timestamp']
                         
+                        # Check if this jump occurs after a large gap
+                        gap_days = time_gaps.iloc[idx] if idx < len(time_gaps) else None
+                        is_after_large_gap = gap_days is not None and gap_days > large_gap_threshold_days
+                        
+                        # Special handling for jumps after large gaps: flag if >100% change after >1 year gap
+                        if is_after_large_gap and gap_days > 365 and change_pct > 100:
+                            gap_info = f" (after {int(gap_days)} day gap)"
+                        else:
+                            gap_info = ""
+                        
                         if pd.notna(prev_close) and pd.notna(curr_close):
                             date_str = pd.to_datetime(jump_date).strftime('%Y-%m-%d') if pd.notna(jump_date) else 'N/A'
                             jump_details.append(
-                                f"{date_str}: {prev_close:.4f}->{curr_close:.4f} ({change_pct:.2f}%)"
+                                f"{date_str}: {prev_close:.4f}->{curr_close:.4f} ({change_pct:.2f}%){gap_info}"
                             )
                 
                 if jump_details:
                     reasons.append(
                         f"Extreme price jumps detected ({len(extreme_jumps)}): " + 
                         "; ".join(jump_details[:5])  # Limit to first 5 to avoid very long messages
+                    )
+        
+        # 6. Check for suspicious patterns: consecutive days with identical OHLC values
+        # This can indicate data quality issues or stale data
+        if len(df) > 2 and all(col in df.columns for col in ['open', 'high', 'low', 'close']):
+            # Sort by timestamp if not already sorted
+            if 'df_sorted' not in locals():
+                df_sorted = df.sort_values('timestamp').reset_index(drop=True)
+            
+            # Check for identical OHLC values (all prices the same)
+            df_sorted['identical_ohlc'] = (
+                (df_sorted['open'] == df_sorted['high']) &
+                (df_sorted['high'] == df_sorted['low']) &
+                (df_sorted['low'] == df_sorted['close'])
+            )
+            
+            # Check for 3 or more consecutive days with identical OHLC
+            consecutive_identical = df_sorted['identical_ohlc'].rolling(window=3, min_periods=3).sum()
+            suspicious_patterns = consecutive_identical[consecutive_identical >= 3]
+            
+            if len(suspicious_patterns) > 0:
+                pattern_details = []
+                pattern_indices = suspicious_patterns.index
+                for idx in pattern_indices[:5]:  # Limit to first 5
+                    if idx >= 2:  # Need at least 3 consecutive records
+                        pattern_date = df_sorted.iloc[idx]['timestamp']
+                        if pd.notna(pattern_date):
+                            date_str = pd.to_datetime(pattern_date).strftime('%Y-%m-%d')
+                            price = df_sorted.iloc[idx]['close']
+                            pattern_details.append(f"{date_str} (price: {price:.4f})")
+                
+                if pattern_details:
+                    reasons.append(
+                        f"Suspicious patterns detected ({len(suspicious_patterns)} instances of 3+ consecutive identical OHLC): " +
+                        "; ".join(pattern_details)
                     )
         
         # Determine if data is valid
