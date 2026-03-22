@@ -75,7 +75,13 @@ class BacktestStatisticsAdmin(admin.ModelAdmin):
             'fields': ('total_pnl', 'total_pnl_percentage', 'average_pnl', 'average_winner', 'average_loser', 'profit_factor')
         }),
         ('Risk Metrics', {
-            'fields': ('max_drawdown', 'max_drawdown_duration', 'sharpe_ratio')
+            'fields': (
+                'max_drawdown',
+                'max_drawdown_duration',
+                'avg_intra_trade_drawdown',
+                'worst_intra_trade_drawdown',
+                'sharpe_ratio',
+            )
         }),
         ('Performance Metrics', {
             'fields': ('cagr', 'total_return')

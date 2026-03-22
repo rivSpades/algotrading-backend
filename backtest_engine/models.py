@@ -156,8 +156,28 @@ class BacktestStatistics(models.Model):
     profit_factor = models.DecimalField(max_digits=10, decimal_places=4, null=True, blank=True)
     
     # Risk metrics
-    max_drawdown = models.DecimalField(max_digits=10, decimal_places=4, null=True, blank=True, help_text="Maximum drawdown as percentage")
+    max_drawdown = models.DecimalField(
+        max_digits=10,
+        decimal_places=4,
+        null=True,
+        blank=True,
+        help_text="Peak-to-trough drawdown on the equity curve (percentage of capital)",
+    )
     max_drawdown_duration = models.IntegerField(null=True, blank=True, help_text="Duration of max drawdown in days")
+    avg_intra_trade_drawdown = models.DecimalField(
+        max_digits=10,
+        decimal_places=4,
+        null=True,
+        blank=True,
+        help_text="Average intra-trade adverse excursion (percentage), from OHLCV during each open position",
+    )
+    worst_intra_trade_drawdown = models.DecimalField(
+        max_digits=10,
+        decimal_places=4,
+        null=True,
+        blank=True,
+        help_text="Largest intra-trade adverse excursion (percentage) among closed trades",
+    )
     sharpe_ratio = models.DecimalField(max_digits=10, decimal_places=4, null=True, blank=True)
     
     # Performance metrics

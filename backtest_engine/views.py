@@ -266,10 +266,8 @@ class BacktestViewSet(viewsets.ModelViewSet):
         
         Query parameters:
         - symbol: Filter by symbol ticker
-        - mode: Filter by position mode ('all', 'long', 'short')
-          - 'long' filters for trade_type='buy'
-          - 'short' filters for trade_type='sell'
-          - 'all' returns all trades
+        - mode: Filter by backtest position mode ('all', 'long', 'short') — matches
+          ``metadata.position_mode`` stored when trades are saved (one run per mode).
         - no_pagination: Set to 'true' to disable pagination (not recommended for large datasets)
         """
         backtest = self.get_object()
@@ -280,14 +278,15 @@ class BacktestViewSet(viewsets.ModelViewSet):
         if symbol_ticker:
             trades = trades.filter(symbol__ticker=symbol_ticker)
         
-        # Get mode from query params (for independent_bet_amounts injection, not for filtering)
-        # We DON'T filter trades by mode here because the frontend needs to switch modes without reloading
-        # The frontend will filter by mode on the client side
         mode = request.query_params.get('mode', None)
         if mode:
             mode = mode.lower()
             if mode not in ['long', 'short', 'all']:
                 mode = None  # Invalid mode, ignore it
+        
+        # Filter by position mode (Celery task stores this on each Trade.metadata)
+        if mode in ('long', 'short', 'all'):
+            trades = trades.filter(metadata__position_mode=mode)
         
         # Order by entry timestamp
         trades = trades.order_by('entry_timestamp')

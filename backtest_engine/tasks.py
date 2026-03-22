@@ -12,8 +12,38 @@ import logging
 import threading
 import pandas as pd
 import os
+from decimal import Decimal
 
 logger = logging.getLogger(__name__)
+
+# Decimal places when persisting Trade fields (must match DecimalField definitions)
+_TRADE_FIELD_DECIMAL_PLACES = {
+    'entry_price': 8,
+    'exit_price': 8,
+    'quantity': 8,
+    'pnl': 8,
+    'pnl_percentage': 4,
+    'max_drawdown': 4,
+}
+
+
+def _trade_pnl_from_stored_prices(trade_type: str, entry_price, exit_price, quantity):
+    """
+    PnL and return % from the same rounded prices stored on Trade, so
+    pnl ≈ (exit - entry) * quantity (long) / (entry - exit) * quantity (short) within quantize error.
+    """
+    d_ep = Decimal(str(entry_price))
+    d_xp = Decimal(str(exit_price))
+    d_qty = Decimal(str(quantity))
+    if trade_type == 'buy':
+        pnl_d = (d_xp - d_ep) * d_qty
+        pct_d = ((d_xp - d_ep) / d_ep) * Decimal(100) if d_ep != 0 else Decimal(0)
+    else:
+        pnl_d = (d_ep - d_xp) * d_qty
+        pct_d = ((d_ep - d_xp) / d_ep) * Decimal(100) if d_ep != 0 else Decimal(0)
+    q8 = Decimal('0.00000001')
+    q4 = Decimal('0.0001')
+    return float(pnl_d.quantize(q8)), float(pct_d.quantize(q4))
 
 
 @shared_task(bind=True, name='backtest_engine.run_backtest', time_limit=48 * 60 * 60, soft_time_limit=48 * 60 * 60)
@@ -480,7 +510,7 @@ def run_backtest_task(self, backtest_id):
                 
                 # Convert numpy types to Python native types to avoid Django field validation errors
                 def convert_value(value, field_name=None):
-                    """Convert numpy/pandas types to Python native types, round to 2 decimal places, and validate database limits
+                    """Convert numpy/pandas types to Python float, round per field (8dp money, 4dp %), validate limits.
                     
                     For DecimalField(max_digits=20, decimal_places=8), values must be < 10^12.
                     If value exceeds limit, raises ValueError (indicates bad data/calculation error).
@@ -531,8 +561,8 @@ def run_backtest_task(self, backtest_id):
                             logger.warning(f"Could not convert value {type(value)} to Python native type, using None")
                             return None
                     
-                    # Round to 2 decimal places before validation
-                    rounded_value = round(float_value, 2)
+                    places = _TRADE_FIELD_DECIMAL_PLACES.get(field_name, 2)
+                    rounded_value = round(float_value, places)
                     
                     # Validate database limits for DecimalField(max_digits=20, decimal_places=8)
                     # The database requires values to be strictly less than 10^12 (absolute value)
@@ -562,18 +592,31 @@ def run_backtest_task(self, backtest_id):
                     
                     return rounded_value
                 
+                entry_price = convert_value(trade_data['entry_price'], 'entry_price')
+                exit_price = convert_value(trade_data.get('exit_price'), 'exit_price')
+                quantity = convert_value(trade_data['quantity'], 'quantity')
+                trade_type = trade_data['trade_type']
+                # Derive PnL from stored prices × qty so DB rows match (exit - entry) * qty (long) / (entry - exit) * qty (short)
+                if exit_price is not None and entry_price is not None and quantity is not None:
+                    pnl, pnl_percentage = _trade_pnl_from_stored_prices(trade_type, entry_price, exit_price, quantity)
+                    is_winner = pnl > 0
+                else:
+                    pnl = convert_value(trade_data.get('pnl'), 'pnl')
+                    pnl_percentage = convert_value(trade_data.get('pnl_percentage'), 'pnl_percentage')
+                    is_winner = trade_data.get('is_winner')
+                
                 Trade.objects.create(
                     backtest=backtest,
                     symbol=trade_data['symbol'],
-                    trade_type=trade_data['trade_type'],
-                    entry_price=convert_value(trade_data['entry_price'], 'entry_price'),
-                    exit_price=convert_value(trade_data.get('exit_price'), 'exit_price'),
+                    trade_type=trade_type,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
                     entry_timestamp=trade_data['entry_timestamp'],
                     exit_timestamp=trade_data.get('exit_timestamp'),
-                    quantity=convert_value(trade_data['quantity'], 'quantity'),
-                    pnl=convert_value(trade_data.get('pnl'), 'pnl'),
-                    pnl_percentage=convert_value(trade_data.get('pnl_percentage'), 'pnl_percentage'),
-                    is_winner=trade_data.get('is_winner'),
+                    quantity=quantity,
+                    pnl=pnl,
+                    pnl_percentage=pnl_percentage,
+                    is_winner=is_winner,
                     max_drawdown=convert_value(trade_data.get('max_drawdown'), 'max_drawdown'),
                     metadata=trade_metadata
                 )
@@ -601,7 +644,8 @@ def run_backtest_task(self, backtest_id):
             
             # Determine field type and validation limit based on field name
             # Percentage fields (max_digits=10, decimal_places=4): limit is 10^6
-            percentage_fields = ['win_rate', 'total_pnl_percentage', 'profit_factor', 'max_drawdown', 
+            percentage_fields = ['win_rate', 'total_pnl_percentage', 'profit_factor', 'max_drawdown',
+                               'avg_intra_trade_drawdown', 'worst_intra_trade_drawdown',
                                'sharpe_ratio', 'cagr', 'total_return']
             
             if field_name in percentage_fields:
@@ -649,6 +693,8 @@ def run_backtest_task(self, backtest_id):
                         'profit_factor': 0,
                         'max_drawdown': 0,
                         'max_drawdown_duration': 0,
+                        'avg_intra_trade_drawdown': 0,
+                        'worst_intra_trade_drawdown': 0,
                         'sharpe_ratio': 0,
                         'cagr': 0,
                         'total_return': 0,
@@ -656,16 +702,21 @@ def run_backtest_task(self, backtest_id):
                     }
                 
                 # Prepare statistics with rounded and validated values
-                stats_dict = {k: v for k, v in portfolio_all.items() if k != 'additional_stats' and k != 'equity_curve'}
+                # Exclude fields that should be stored in additional_stats or are not model fields
+                stats_dict = {k: v for k, v in portfolio_all.items() if k not in ['additional_stats', 'equity_curve', 'skipped_trades_count', 'independent_bet_amounts']}
                 
                 # Round and validate numeric fields
                 numeric_fields = ['total_pnl', 'total_pnl_percentage', 'average_pnl', 'average_winner', 
-                                'average_loser', 'profit_factor', 'max_drawdown', 'sharpe_ratio', 
+                                'average_loser', 'profit_factor', 'max_drawdown', 'avg_intra_trade_drawdown',
+                                'worst_intra_trade_drawdown', 'sharpe_ratio', 
                                 'cagr', 'total_return', 'win_rate']
                 
                 for field in numeric_fields:
                     if field in stats_dict:
                         stats_dict[field] = round_and_validate_stat(stats_dict[field], field, decimal_places=2, symbol=None)
+                
+                # Get skipped_trades_count from portfolio_all to include in additional_stats
+                skipped_trades_count = portfolio_all.get('skipped_trades_count', 0)
                 
                 BacktestStatistics.objects.create(
                     backtest=backtest,
@@ -673,6 +724,9 @@ def run_backtest_task(self, backtest_id):
                     **stats_dict,
                     equity_curve=portfolio_all.get('equity_curve', []),
                     additional_stats={
+                        'all': {
+                            'skipped_trades_count': skipped_trades_count,
+                        },
                         'long': stats.get('long', {}),
                         'short': stats.get('short', {}),
                     }
@@ -682,8 +736,8 @@ def run_backtest_task(self, backtest_id):
                 # Similar to portfolio stats structure
                 symbol_all = stats.get('all', {})
                 # Always save statistics even if empty (no trades) so frontend knows symbol was processed
-                # Exclude equity_curve, independent_bet_amounts, and additional_stats from main fields
-                stats_to_save = {k: v for k, v in symbol_all.items() if k not in ['equity_curve', 'independent_bet_amounts', 'additional_stats']} if symbol_all else {}
+                # Exclude equity_curve, independent_bet_amounts, skipped_trades_count, and additional_stats from main fields
+                stats_to_save = {k: v for k, v in symbol_all.items() if k not in ['equity_curve', 'independent_bet_amounts', 'skipped_trades_count', 'additional_stats']} if symbol_all else {}
                 equity_curve_all = symbol_all.get('equity_curve', []) if symbol_all else []
                 independent_bet_amounts_all = symbol_all.get('independent_bet_amounts', {}) if symbol_all else {}
                 
@@ -708,6 +762,8 @@ def run_backtest_task(self, backtest_id):
                         'profit_factor': 0,
                         'max_drawdown': 0,
                         'max_drawdown_duration': 0,
+                        'avg_intra_trade_drawdown': 0,
+                        'worst_intra_trade_drawdown': 0,
                         'sharpe_ratio': 0,
                         'cagr': 0,
                         'total_return': 0,
@@ -715,12 +771,16 @@ def run_backtest_task(self, backtest_id):
                 
                 # Round and validate numeric fields in stats_to_save
                 numeric_fields = ['total_pnl', 'total_pnl_percentage', 'average_pnl', 'average_winner', 
-                                'average_loser', 'profit_factor', 'max_drawdown', 'sharpe_ratio', 
+                                'average_loser', 'profit_factor', 'max_drawdown', 'avg_intra_trade_drawdown',
+                                'worst_intra_trade_drawdown', 'sharpe_ratio', 
                                 'cagr', 'total_return', 'win_rate']
                 
                 for field in numeric_fields:
                     if field in stats_to_save:
                         stats_to_save[field] = round_and_validate_stat(stats_to_save[field], field, decimal_places=2, symbol=symbol)
+                
+                # Get skipped_trades_count from symbol_all to include in additional_stats
+                skipped_trades_count = symbol_all.get('skipped_trades_count', 0) if symbol_all else 0
                 
                 BacktestStatistics.objects.create(
                     backtest=backtest,
@@ -729,14 +789,15 @@ def run_backtest_task(self, backtest_id):
                     additional_stats={
                         'all': {
                             'independent_bet_amounts': independent_bet_amounts_all,  # Store independent bet amounts for 'all' mode
+                            'skipped_trades_count': skipped_trades_count,  # Store skipped trades count for 'all' mode
                         },
                         'long': {
-                            **{k: v for k, v in stats.get('long', {}).items() if k not in ['equity_curve', 'independent_bet_amounts']},
+                            **{k: v for k, v in stats.get('long', {}).items() if k not in ['equity_curve', 'independent_bet_amounts', 'skipped_trades_count']},
                             'equity_curve': equity_curve_long,  # Include equity curve in additional_stats
                             'independent_bet_amounts': independent_bet_amounts_long,  # Store independent bet amounts for 'long' mode
                         },
                         'short': {
-                            **{k: v for k, v in stats.get('short', {}).items() if k not in ['equity_curve', 'independent_bet_amounts']},
+                            **{k: v for k, v in stats.get('short', {}).items() if k not in ['equity_curve', 'independent_bet_amounts', 'skipped_trades_count']},
                             'equity_curve': equity_curve_short,  # Include equity curve in additional_stats
                             'independent_bet_amounts': independent_bet_amounts_short,  # Store independent bet amounts for 'short' mode
                         },
