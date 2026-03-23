@@ -21,20 +21,24 @@ import logging
 import threading
 import bisect
 import heapq
+from itertools import groupby
 
 logger = logging.getLogger(__name__)
+
+# Float tolerance for "no free cash" (avoid edge-case comparisons)
+_CASH_EPS = 1e-9
 
 
 class BacktestExecutor:
     """Executes backtests for trading strategies"""
     
-    def __init__(self, backtest, position_mode='all', preprocessed_data=None):
+    def __init__(self, backtest, position_mode='long', preprocessed_data=None):
         """
         Initialize backtest executor
         
         Args:
             backtest: Backtest model instance
-            position_mode: 'all' (both long and short), 'long' (only long positions), 'short' (only short positions)
+            position_mode: 'long' (only long positions) or 'short' (only short positions)
             preprocessed_data: Optional dict of pre-processed symbol data from Phase 1 {symbol: {'df': DataFrame, 'indicators': dict, 'test_df': DataFrame, 'price_cache': dict}}
         """
         self.backtest = backtest
@@ -44,21 +48,12 @@ class BacktestExecutor:
         self.start_date = backtest.start_date
         self.end_date = backtest.end_date
         self.split_ratio = backtest.split_ratio
-        self.position_mode = position_mode  # 'all', 'long', or 'short'
+        self.position_mode = position_mode  # 'long' or 'short'
         self.preprocessed_data = preprocessed_data  # Pre-processed data from Phase 1
         
-        # Filter symbols based on broker associations if broker is set
+        # Filter symbols based on broker associations if broker is set (long vs short capability)
         all_symbols = list(backtest.symbols.all())
-        
-        # For initial data loading (position_mode='all'), filter to only active symbols with at least one trading capability
-        # This ensures we only load data for symbols that can actually be traded
-        # For other position modes, use position-specific filtering
-        if position_mode == 'all':
-            # For data loading, filter symbols that are active and have at least one trading capability
-            self.symbols = self._filter_symbols_for_data_loading(all_symbols)
-        else:
-            # For specific position modes, use position-specific filtering
-            self.symbols = self._filter_symbols_by_broker(all_symbols, position_mode)
+        self.symbols = self._filter_symbols_by_broker(all_symbols, position_mode)
         
         # If preprocessed_data is provided, filter symbols to only those that were pre-processed
         if self.preprocessed_data:
@@ -83,14 +78,12 @@ class BacktestExecutor:
         - Support the requested position mode (based on long_active/short_active flags)
         
         Filtering rules:
-        - 'all' mode: symbols with at least one trading capability (long_active=True OR short_active=True)
-          The signal generation will respect broker flags (no short trades if short_active=False, etc.)
         - 'long' mode: symbols with long_active=True
         - 'short' mode: symbols with short_active=True
         
         Args:
             symbols: List of Symbol instances
-            position_mode: 'all', 'long', or 'short'
+            position_mode: 'long' or 'short'
         
         Returns:
             Filtered list of Symbol instances
@@ -119,17 +112,7 @@ class BacktestExecutor:
                 )
                 
                 # Check if symbol supports the requested position mode
-                # Filtering rules:
-                # - 'all' mode: symbols with at least one trading capability (long_active=True OR short_active=True)
-                #   This allows 'all' mode to trade longs on symbols that only support long, shorts on symbols that only support short,
-                #   and both on symbols that support both
-                # - 'long' mode: symbols with long_active=True
-                # - 'short' mode: symbols with short_active=True
-                if position_mode == 'all':
-                    # Include if at least one trading capability is active
-                    if association.long_active or association.short_active:
-                        filtered_symbols.append(symbol)
-                elif position_mode == 'long':
+                if position_mode == 'long':
                     if association.long_active:
                         filtered_symbols.append(symbol)
                 elif position_mode == 'short':
@@ -150,58 +133,6 @@ class BacktestExecutor:
         
         return filtered_symbols
     
-    def _filter_symbols_for_data_loading(self, symbols):
-        """
-        Filter symbols for data loading: only active symbols with at least one trading capability
-        
-        This ensures we only load OHLCV data for symbols that are:
-        - Active (status='active')
-        - Have at least one trading capability (long_active=True OR short_active=True)
-        
-        Args:
-            symbols: List of Symbol instances
-        
-        Returns:
-            Filtered list of Symbol instances
-        """
-        if not self.broker:
-            # No broker set, filter by status only
-            filtered = [s for s in symbols if s.status == 'active']
-            logger.info(f"Filtered to {len(filtered)} active symbols (no broker filtering)")
-            return filtered
-        
-        # Import here to avoid circular imports
-        from live_trading.models import SymbolBrokerAssociation
-        from django.db.models import Q
-        
-        logger.info(f"Filtering {len(symbols)} symbols for data loading (active + at least one trading capability)")
-        
-        filtered_symbols = []
-        for symbol in symbols:
-            # First check if symbol is active
-            if symbol.status != 'active':
-                logger.debug(f"Symbol {symbol.ticker} is not active (status={symbol.status}), skipping")
-                continue
-            
-            try:
-                association = SymbolBrokerAssociation.objects.get(
-                    symbol=symbol,
-                    broker=self.broker
-                )
-                
-                # Include symbol if it has at least one trading capability
-                if association.long_active or association.short_active:
-                    filtered_symbols.append(symbol)
-                else:
-                    logger.debug(f"Symbol {symbol.ticker} has no active trading capabilities, skipping")
-            except SymbolBrokerAssociation.DoesNotExist:
-                # Symbol not associated with broker, skip it
-                logger.debug(f"Symbol {symbol.ticker} not associated with broker {self.broker.name}, skipping")
-                continue
-        
-        logger.info(f"Filtered to {len(filtered_symbols)} symbols for data loading (from {len(symbols)} total)")
-        return filtered_symbols
-        
     def _load_data_for_symbol(self, symbol):
         """Load OHLCV data for a single symbol (on-demand/lazy loading)"""
         try:
@@ -550,6 +481,24 @@ class BacktestExecutor:
         # Store equity curve
         self.equity_curves[symbol] = equity_curve
     
+    @staticmethod
+    def _same_timestamp_portfolio_priority(signal, position) -> int:
+        """Within one calendar bar across symbols, process exits before entries.
+        
+        heapq.merge only orders by time; ties use arbitrary symbol order, so an entry
+        could run before another symbol's exit at the same timestamp and see stale
+        cash_available (still 0). Lower priority value runs first.
+        """
+        if signal is None:
+            return 2
+        if position is None:
+            return 1 if signal in ('buy', 'sell') else 2
+        if position['type'] == 'buy' and signal == 'sell':
+            return 0
+        if position['type'] == 'sell' and signal == 'buy':
+            return 0
+        return 2
+    
     def _execute_strategy_multi_symbol(self):
         """Execute strategy for multiple symbols with shared portfolio capital
         
@@ -695,134 +644,75 @@ class BacktestExecutor:
         # for each symbol and use it instead of doing expensive lookups
         last_known_price = {}  # {symbol: last_price} - tracks price as we process chronologically
         
-        # Process events chronologically with shared capital (strategy execution happens here)
-        for timestamp, symbol, idx, row in all_events:
-            event_count += 1
-            
-            # Log when we switch to a new symbol (first time we see it chronologically)
-            if symbol != last_logged_symbol:
-                if symbol not in processed_symbols:
-                    logger.info(f"[{self.position_mode.upper()}] Processing events for symbol: {symbol.ticker}")
-                    processed_symbols.add(symbol)
-                last_logged_symbol = symbol
-            
-            # Periodic progress logging
-            if event_count % log_interval == 0:
-                logger.info(f"[{self.position_mode.upper()}] Processed {event_count}/{len(all_events)} events (currently: {symbol.ticker} @ {timestamp.date()})")
-            
-            # OPTIMIZATION: Update last known price for current symbol (we process chronologically)
-            price = float(row['close'])
-            last_known_price[symbol] = price
-            
-            position = positions[symbol]
-            indicators = symbol_data[symbol]['indicators']
-            prev_indicator_values = prev_indicators[symbol]
-            
-            # Get indicator values for current row
-            indicator_values = {}
-            for name, series in indicators.items():
-                if idx in series.index:
-                    try:
-                        value = series.loc[idx]
-                        if pd.notna(value):
-                            indicator_values[name] = float(value)
-                    except (KeyError, IndexError, TypeError):
-                        pass
-            
-            # Generate signal for this symbol - let the strategy-specific signal function handle indicator validation
-            # Different strategies may use different parameter names (fast_period/slow_period vs short_period/long_period)
-            signal = self._generate_signal(row, indicator_values, position, prev_indicator_values, symbol)
-            
-            if indicator_values:
-                prev_indicators[symbol] = indicator_values.copy()
-            
-            # Calculate CURRENT portfolio equity BEFORE processing trade
-            # Equity = cash_available + cash_invested (cash_invested already includes all open positions)
-            current_portfolio_equity = portfolio_cash_available + portfolio_cash_invested
-            
-            # Stop processing if portfolio equity is negative (account blowup)
-            # Individual symbol statistics will still be calculated independently starting with full initial capital
-            if current_portfolio_equity <= 0:
-                logger.info(f"[{self.position_mode.upper()}] Portfolio equity ({current_portfolio_equity:.2f}) <= 0. Stopping execution (account blown up). Individual symbol stats will still be calculated independently.")
-                # Close any open positions at current timestamp before stopping (to record final state)
-                for sym, pos in positions.items():
-                    if pos is not None:
-                        # Use current event's price for the symbol, or fallback to entry price
-                        if sym == symbol:
-                            close_price = price
-                        elif sym in last_known_price:
-                            close_price = last_known_price[sym]
-                        else:
-                            close_price = pos['entry_price']  # Fallback
-                        portfolio_cash_available, portfolio_cash_invested = self._close_position_at_end(
-                            sym, pos, close_price, timestamp, portfolio_cash_available, portfolio_cash_invested
-                        )
-                # Update final portfolio equity curve point
-                final_equity = portfolio_cash_available + portfolio_cash_invested
-                portfolio_equity_curve.append((timestamp, float(final_equity)))
-                break  # Stop processing remaining events
-            
-            # Process trade: bet_amount is calculated from equity (cash_available + cash_invested)
-            portfolio_cash_available, portfolio_cash_invested, new_position, _ = self._process_trade_signal(
-                symbol, timestamp, price, signal, position, portfolio_cash_available, portfolio_cash_invested, bet_size_pct,
-                [], indicators, idx
-            )
-            
-            # In "all" mode, if we closed a position and should flip, handle it here after recalculating portfolio equity
-            # (We disabled the flip logic inside _process_trade_signal for multi-symbol mode)
-            if self.position_mode == 'all' and new_position is None and position is not None:
-                # We closed a position - check if we should flip to opposite position
-                # But first check if broker allows the opposite position type
-                should_flip = False
-                flip_signal = None
-                
-                if position['type'] == 'buy':
-                    # Closed long, check if we can open short
-                    if self.broker and symbol:
-                        from live_trading.models import SymbolBrokerAssociation
+        # Process events chronologically with shared capital (strategy execution happens here).
+        # Same-timestamp batching: exits before entries so freed cash is visible before new entries
+        # (heapq.merge does not order ties; arbitrary symbol order could process an entry first).
+        execution_stopped = False
+        for timestamp, group_iter in groupby(all_events, key=lambda x: x[0]):
+            if execution_stopped:
+                break
+            batch = list(group_iter)
+            phase1 = []
+            for _ts, symbol, idx, row in batch:
+                event_count += 1
+                if symbol != last_logged_symbol:
+                    if symbol not in processed_symbols:
+                        logger.info(f"[{self.position_mode.upper()}] Processing events for symbol: {symbol.ticker}")
+                        processed_symbols.add(symbol)
+                    last_logged_symbol = symbol
+                if event_count % log_interval == 0:
+                    logger.info(f"[{self.position_mode.upper()}] Processed {event_count}/{len(all_events)} events (currently: {symbol.ticker} @ {_ts.date()})")
+                price = float(row['close'])
+                last_known_price[symbol] = price
+                position = positions[symbol]
+                indicators = symbol_data[symbol]['indicators']
+                prev_indicator_values = prev_indicators[symbol]
+                indicator_values = {}
+                for name, series in indicators.items():
+                    if idx in series.index:
                         try:
-                            association = SymbolBrokerAssociation.objects.get(symbol=symbol, broker=self.broker)
-                            should_flip = association.short_active
-                        except SymbolBrokerAssociation.DoesNotExist:
-                            should_flip = False
-                    else:
-                        should_flip = True  # No broker = allow flip
-                    
-                    if should_flip:
-                        flip_signal = 'sell'
-                else:
-                    # Closed short, check if we can open long
-                    if self.broker and symbol:
-                        from live_trading.models import SymbolBrokerAssociation
-                        try:
-                            association = SymbolBrokerAssociation.objects.get(symbol=symbol, broker=self.broker)
-                            should_flip = association.long_active
-                        except SymbolBrokerAssociation.DoesNotExist:
-                            should_flip = False
-                    else:
-                        should_flip = True  # No broker = allow flip
-                    
-                    if should_flip:
-                        flip_signal = 'buy'
-                
-                if should_flip and flip_signal:
-                    # Process the flip with current equity (cash_available + cash_invested)
-                    portfolio_cash_available, portfolio_cash_invested, new_position, _ = self._process_trade_signal(
-                        symbol, timestamp, price, flip_signal, None, portfolio_cash_available, portfolio_cash_invested, bet_size_pct,
-                        [], indicators, idx
-                    )
-                else:
-                    logger.debug(f"{symbol.ticker} Skipping flip: broker doesn't allow {'short' if position['type'] == 'buy' else 'long'}")
-            
-            # Update position for this symbol
-            positions[symbol] = new_position
-            
-            # Calculate portfolio equity AFTER trade (for equity curve)
-            # Equity = cash_available + cash_invested (cash_invested already includes all open positions)
-            portfolio_equity = portfolio_cash_available + portfolio_cash_invested
-            
-            # Update portfolio equity curve
-            portfolio_equity_curve.append((timestamp, float(portfolio_equity)))
+                            value = series.loc[idx]
+                            if pd.notna(value):
+                                indicator_values[name] = float(value)
+                        except (KeyError, IndexError, TypeError):
+                            pass
+                signal = self._generate_signal(row, indicator_values, position, prev_indicator_values, symbol)
+                priority = self._same_timestamp_portfolio_priority(signal, position)
+                phase1.append((priority, symbol.ticker, _ts, symbol, idx, row, signal, indicator_values))
+            phase1.sort(key=lambda x: (x[0], x[1]))
+            for _, _, _ts, symbol, idx, row, signal, indicator_values in phase1:
+                price = float(row['close'])
+                position = positions[symbol]
+                indicators = symbol_data[symbol]['indicators']
+                if indicator_values:
+                    prev_indicators[symbol] = indicator_values.copy()
+                current_portfolio_equity = portfolio_cash_available + portfolio_cash_invested
+                if current_portfolio_equity <= 0:
+                    logger.info(f"[{self.position_mode.upper()}] Portfolio equity ({current_portfolio_equity:.2f}) <= 0. Stopping execution (account blown up). Individual symbol stats will still be calculated independently.")
+                    for sym, pos in positions.items():
+                        if pos is not None:
+                            if sym == symbol:
+                                close_price = price
+                            elif sym in last_known_price:
+                                close_price = last_known_price[sym]
+                            else:
+                                close_price = pos['entry_price']
+                            portfolio_cash_available, portfolio_cash_invested = self._close_position_at_end(
+                                sym, pos, close_price, timestamp, portfolio_cash_available, portfolio_cash_invested
+                            )
+                    final_equity = portfolio_cash_available + portfolio_cash_invested
+                    portfolio_equity_curve.append((timestamp, float(final_equity)))
+                    execution_stopped = True
+                    break
+                portfolio_cash_available, portfolio_cash_invested, new_position, _ = self._process_trade_signal(
+                    symbol, timestamp, price, signal, position, portfolio_cash_available, portfolio_cash_invested, bet_size_pct,
+                    [], indicators, idx
+                )
+                positions[symbol] = new_position
+                portfolio_equity = portfolio_cash_available + portfolio_cash_invested
+                portfolio_equity_curve.append((timestamp, float(portfolio_equity)))
+            if execution_stopped:
+                break
         
         logger.info(f"[{self.position_mode.upper()}] Completed chronological event processing: {len(all_events)} events processed")
         
@@ -886,8 +776,15 @@ class BacktestExecutor:
                 logger.warning(f"{symbol.ticker} Skipping long entry: bet_amount={bet_amount:.2f}, quantity={quantity:.4f} (must be > 0)")
                 return cash_available, cash_invested, position, equity_curve
             
-            # Check if we have enough cash available
-            if bet_amount > cash_available:
+            # No deployable cash (all capital already in positions)
+            effective_cash = max(0.0, float(cash_available))
+            if effective_cash <= _CASH_EPS:
+                self.skipped_trades_count += 1
+                logger.debug(f"{symbol.ticker} Skipping long entry: no free cash (cash_available={cash_available:.2f})")
+                return cash_available, cash_invested, position, equity_curve
+            
+            # Check if we have enough cash available (use max(0,.) so tiny float negatives don't bypass)
+            if bet_amount > effective_cash:
                 self.skipped_trades_count += 1
                 logger.debug(f"{symbol.ticker} Skipping long entry: bet_amount ${bet_amount:.2f} > cash_available ${cash_available:.2f} (insufficient cash)")
                 return cash_available, cash_invested, position, equity_curve
@@ -916,9 +813,14 @@ class BacktestExecutor:
                 logger.warning(f"{symbol.ticker} Skipping short entry: bet_amount={bet_amount:.2f}, quantity={quantity:.4f} (must be > 0)")
                 return cash_available, cash_invested, position, equity_curve
             
-            # Check if we have enough cash available
+            effective_cash = max(0.0, float(cash_available))
+            if effective_cash <= _CASH_EPS:
+                self.skipped_trades_count += 1
+                logger.debug(f"{symbol.ticker} Skipping short entry: no free cash (cash_available={cash_available:.2f})")
+                return cash_available, cash_invested, position, equity_curve
+            
             # For shorts, we need cash to cover potential losses, so we still check cash_available
-            if bet_amount > cash_available:
+            if bet_amount > effective_cash:
                 self.skipped_trades_count += 1
                 logger.debug(f"{symbol.ticker} Skipping short entry: bet_amount ${bet_amount:.2f} > cash_available ${cash_available:.2f} (insufficient cash)")
                 return cash_available, cash_invested, position, equity_curve
@@ -990,43 +892,6 @@ class BacktestExecutor:
             
             position = None
             logger.debug(f"{symbol.ticker} LONG EXIT @ {exit_price} on {timestamp}, PnL: {pnl:.2f}, return: ${return_amount:.2f}, cash_available: ${cash_available:.2f}, cash_invested: ${cash_invested:.2f}")
-            
-            # In ALL mode, immediately open opposite position (short) since crossover already happened
-            # BUT: Only if broker allows short AND in single-symbol mode, don't flip here - caller will handle it after recalculating portfolio equity
-            # Check broker capabilities before flipping
-            short_allowed = True  # Default to True if no broker or no association
-            if self.broker and symbol:
-                from live_trading.models import SymbolBrokerAssociation
-                try:
-                    association = SymbolBrokerAssociation.objects.get(symbol=symbol, broker=self.broker)
-                    short_allowed = association.short_active
-                except SymbolBrokerAssociation.DoesNotExist:
-                    short_allowed = False
-            
-            if self.position_mode == 'all' and short_allowed:
-                # Single-symbol mode: can flip here using updated equity
-                equity_after_close = cash_available + cash_invested
-                bet_amount = float(equity_after_close * bet_size_pct)
-                quantity = float(bet_amount / price)
-                
-                # Check if we have enough cash available for the flip
-                if bet_amount <= cash_available:
-                    cash_available = float(cash_available - bet_amount)
-                    cash_invested = float(cash_invested + bet_amount)
-                    position = {
-                        'type': 'sell',
-                        'entry_price': float(price),
-                        'entry_timestamp': timestamp,
-                        'quantity': quantity,
-                        'bet_amount': bet_amount,
-                        'cash_invested': bet_amount
-                    }
-                    logger.debug(f"{symbol.ticker} SHORT ENTRY (after long exit) @ {price} on {timestamp}, quantity: {quantity:.4f}, bet_amount: ${bet_amount:.2f}, cash_available: ${cash_available:.2f}, cash_invested: ${cash_invested:.2f}")
-                else:
-                    self.skipped_trades_count += 1
-                    logger.debug(f"{symbol.ticker} Skipping flip to short: bet_amount ${bet_amount:.2f} > cash_available ${cash_available:.2f} (insufficient cash)")
-            elif self.position_mode == 'all' and not short_allowed:
-                logger.debug(f"{symbol.ticker} Skipping flip to short: broker doesn't allow short (short_active=False)")
         
         elif signal == 'buy' and position is not None and position['type'] == 'sell':
             # Close short position (EXIT)
@@ -1080,43 +945,6 @@ class BacktestExecutor:
             
             position = None
             logger.debug(f"{symbol.ticker} SHORT EXIT @ {exit_price} on {timestamp}, PnL: {pnl:.2f}, return: ${return_amount:.2f}, cash_available: ${cash_available:.2f}, cash_invested: ${cash_invested:.2f}")
-            
-            # In ALL mode, immediately open opposite position (long) since crossover already happened
-            # BUT: Only if broker allows long AND in single-symbol mode, don't flip here - caller will handle it after recalculating portfolio equity
-            # Check broker capabilities before flipping
-            long_allowed = True  # Default to True if no broker or no association
-            if self.broker and symbol:
-                from live_trading.models import SymbolBrokerAssociation
-                try:
-                    association = SymbolBrokerAssociation.objects.get(symbol=symbol, broker=self.broker)
-                    long_allowed = association.long_active
-                except SymbolBrokerAssociation.DoesNotExist:
-                    long_allowed = False
-            
-            if self.position_mode == 'all' and long_allowed:
-                # Single-symbol mode: can flip here using updated equity
-                equity_after_close = cash_available + cash_invested
-                bet_amount = float(equity_after_close * bet_size_pct)
-                quantity = float(bet_amount / price)
-                
-                # Check if we have enough cash available for the flip
-                if bet_amount <= cash_available:
-                    cash_available = float(cash_available - bet_amount)
-                    cash_invested = float(cash_invested + bet_amount)
-                    position = {
-                        'type': 'buy',
-                        'entry_price': float(price),
-                        'entry_timestamp': timestamp,
-                        'quantity': quantity,
-                        'bet_amount': bet_amount,
-                        'cash_invested': bet_amount
-                    }
-                    logger.debug(f"{symbol.ticker} LONG ENTRY (after short exit) @ {price} on {timestamp}, quantity: {quantity:.4f}, bet_amount: ${bet_amount:.2f}, cash_available: ${cash_available:.2f}, cash_invested: ${cash_invested:.2f}")
-                else:
-                    self.skipped_trades_count += 1
-                    logger.debug(f"{symbol.ticker} Skipping flip to long: bet_amount ${bet_amount:.2f} > cash_available ${cash_available:.2f} (insufficient cash)")
-            elif self.position_mode == 'all' and not long_allowed:
-                logger.debug(f"{symbol.ticker} Skipping flip to long: broker doesn't allow long (long_active=False)")
         
         # Update equity curve: equity = cash_available + cash_invested
         # Note: cash_invested already includes all open positions, so we don't need to mark-to-market
@@ -1220,7 +1048,7 @@ class BacktestExecutor:
             indicators: Dictionary of indicator values
             position: Current position (if any)
             prev_indicators: Previous indicator values (for crossover detection)
-            symbol: Symbol instance (needed to check broker flags in 'all' mode)
+            symbol: Symbol instance (for broker capability checks when applicable)
         
         Returns:
             'buy', 'sell', or None
@@ -1251,7 +1079,7 @@ class BacktestExecutor:
         - Short entry: fast SMA crosses below slow SMA
         - Short exit: fast SMA crosses above slow SMA
         
-        Respects position_mode: 'all' (both), 'long' (only longs), 'short' (only shorts)
+        Respects position_mode: 'long' (only longs) or 'short' (only shorts)
         """
         fast_period = self.parameters.get('fast_period', 20)
         slow_period = self.parameters.get('slow_period', 50)
@@ -1278,10 +1106,10 @@ class BacktestExecutor:
             logger.debug(f"SMA crossover: Missing previous indicators. prev_fast={prev_fast_sma}, prev_slow={prev_slow_sma}, prev_keys={list(prev_indicators.keys())}")
             return None
         
-        # Check broker flags for 'all' mode - respect what the broker actually allows
+        # Broker flags when a broker is configured
         long_allowed = True
         short_allowed = True
-        if self.position_mode == 'all' and self.broker and symbol:
+        if self.broker and symbol:
             from live_trading.models import SymbolBrokerAssociation
             try:
                 association = SymbolBrokerAssociation.objects.get(symbol=symbol, broker=self.broker)
@@ -1298,8 +1126,8 @@ class BacktestExecutor:
         # Detect crossover: fast crosses above slow (golden cross)
         if prev_fast_sma <= prev_slow_sma and fast_sma > slow_sma:
             if not has_position:
-                # No position: Enter LONG (only if position_mode allows longs AND broker allows it)
-                if self.position_mode in ('all', 'long') and long_allowed:
+                # No position: Enter LONG (only in long mode AND broker allows)
+                if self.position_mode == 'long' and long_allowed:
                     logger.info(f"[{self.position_mode.upper()}] LONG ENTRY signal: Fast SMA ({fast_sma:.2f}) crossed above Slow SMA ({slow_sma:.2f})")
                     return 'buy'
                 else:
@@ -1312,8 +1140,8 @@ class BacktestExecutor:
         # Detect crossover: fast crosses below slow (death cross)
         elif prev_fast_sma >= prev_slow_sma and fast_sma < slow_sma:
             if not has_position:
-                # No position: Enter SHORT (only if position_mode allows shorts AND broker allows it)
-                if self.position_mode in ('all', 'short') and short_allowed:
+                # No position: Enter SHORT (only in short mode AND broker allows)
+                if self.position_mode == 'short' and short_allowed:
                     logger.info(f"[{self.position_mode.upper()}] SHORT ENTRY signal: Fast SMA ({fast_sma:.2f}) crossed below Slow SMA ({slow_sma:.2f})")
                     return 'sell'
                 else:
@@ -1327,14 +1155,13 @@ class BacktestExecutor:
     
     def _moving_average_crossover_signal(self, row: pd.Series, indicators: Dict, position: Optional[Dict], prev_indicators: Optional[Dict] = None, symbol: Symbol = None) -> Optional[str]:
         """
-        Moving Average Crossover strategy signal - supports LONG and SHORT modes only (ALL disabled)
+        Moving Average Crossover strategy signal — long-only or short-only runs
         - Long entry: Short SMA crosses above Long SMA
         - Long exit: Short SMA crosses below Long SMA
         - Short entry: Short SMA crosses below Long SMA
         - Short exit: Short SMA crosses above Long SMA
         
-        Only supports position_mode: 'long' (only longs), 'short' (only shorts)
-        ALL mode is intentionally disabled for this strategy
+        Only position_mode: 'long' or 'short'
         """
         short_period = self.parameters.get('short_period', 20)
         long_period = self.parameters.get('long_period', 50)
@@ -1373,7 +1200,7 @@ class BacktestExecutor:
                     logger.info(f"[{self.position_mode.upper()}] LONG ENTRY signal: Short SMA ({short_sma:.2f}) crossed above Long SMA ({long_sma:.2f})")
                     return 'buy'
                 else:
-                    logger.debug(f"[{self.position_mode.upper()}] LONG ENTRY signal ignored (position_mode={self.position_mode}, ALL mode disabled)")
+                    logger.debug(f"[{self.position_mode.upper()}] LONG ENTRY signal ignored (position_mode={self.position_mode})")
             elif position_type == 'sell':
                 # Short position open: Exit SHORT (close short = buy) - always allowed
                 logger.info(f"[{self.position_mode.upper()}] SHORT EXIT signal: Short SMA ({short_sma:.2f}) crossed above Long SMA ({long_sma:.2f})")
@@ -1387,7 +1214,7 @@ class BacktestExecutor:
                     logger.info(f"[{self.position_mode.upper()}] SHORT ENTRY signal: Short SMA ({short_sma:.2f}) crossed below Long SMA ({long_sma:.2f})")
                     return 'sell'
                 else:
-                    logger.debug(f"[{self.position_mode.upper()}] SHORT ENTRY signal ignored (position_mode={self.position_mode}, ALL mode disabled)")
+                    logger.debug(f"[{self.position_mode.upper()}] SHORT ENTRY signal ignored (position_mode={self.position_mode})")
             elif position_type == 'buy':
                 # Long position open: Exit LONG (close long = sell) - always allowed
                 logger.info(f"[{self.position_mode.upper()}] LONG EXIT signal: Short SMA ({short_sma:.2f}) crossed below Long SMA ({long_sma:.2f})")
@@ -1402,7 +1229,7 @@ class BacktestExecutor:
         - Short entry: returns < -(threshold × std) (gap-down)
         - Exit: Opposite signal or position not allowed in mode
         
-        Supports position_mode: 'long', 'short', 'all' (with flipping in ALL mode)
+        Supports position_mode: 'long' or 'short' only (no same-bar flip between directions).
         
         IMPORTANT: Returns and STD are calculated using only data up to today's open
         to avoid lookahead bias.
@@ -1423,10 +1250,9 @@ class BacktestExecutor:
             logger.debug(f"Gap-Up and Gap-Down: Missing indicators. returns={returns}, std={std}, keys={list(indicators.keys())}")
             return None
         
-        # Check broker flags for 'all' mode - respect what the broker actually allows
         long_allowed = True
         short_allowed = True
-        if self.position_mode == 'all' and self.broker and symbol:
+        if self.broker and symbol:
             from live_trading.models import SymbolBrokerAssociation
             try:
                 association = SymbolBrokerAssociation.objects.get(symbol=symbol, broker=self.broker)
@@ -1447,71 +1273,31 @@ class BacktestExecutor:
         long_signal = returns > long_threshold
         short_signal = returns < short_threshold
         
-        # EXIT CONDITIONS (check exits first, before entries/flips)
-        # Exit LONG if opposite signal (gap-down) or mode doesn't allow long
+        # EXIT CONDITIONS (check exits first, before entries)
         if has_position and position_type == 'buy':
             if self.position_mode == 'short':
-                # Mode doesn't allow long, must exit
                 logger.info(f"[{self.position_mode.upper()}] LONG EXIT signal: mode doesn't allow long")
                 return 'sell'
-            elif self.position_mode == 'long' and short_signal:
-                # LONG mode: exit long when we get opposite (short) signal
+            if self.position_mode == 'long' and short_signal:
                 logger.info(f"[{self.position_mode.upper()}] LONG EXIT signal: returns ({returns:.4f})")
                 return 'sell'
-            elif self.position_mode == 'all' and short_signal:
-                if short_allowed:
-                    # Short signal AND broker allows short - flip to short (handled by flip logic below)
-                    # Don't return here, let the flip logic handle it
-                    pass
-                else:
-                    # Short signal but broker doesn't allow short - exit long but don't enter short
-                    logger.info(f"[{self.position_mode.upper()}] LONG EXIT signal (short not allowed): returns ({returns:.4f})")
-                    return 'sell'
         
-        # Exit SHORT if opposite signal (gap-up) or mode doesn't allow short
         if has_position and position_type == 'sell':
             if self.position_mode == 'long':
-                # Mode doesn't allow short, must exit
                 logger.info(f"[{self.position_mode.upper()}] SHORT EXIT signal: mode doesn't allow short")
                 return 'buy'
-            elif self.position_mode == 'short' and long_signal:
-                # SHORT mode: exit short when we get opposite (long) signal
+            if self.position_mode == 'short' and long_signal:
                 logger.info(f"[{self.position_mode.upper()}] SHORT EXIT signal: returns ({returns:.4f})")
                 return 'buy'
-            elif self.position_mode == 'all' and long_signal:
-                if long_allowed:
-                    # Long signal AND broker allows long - flip to long (handled by flip logic below)
-                    # Don't return here, let the flip logic handle it
-                    pass
-                else:
-                    # Long signal but broker doesn't allow long - exit short but don't enter long
-                    logger.info(f"[{self.position_mode.upper()}] SHORT EXIT signal (long not allowed): returns ({returns:.4f})")
-                    return 'buy'
         
-        # ENTRY/FLIP CONDITIONS (check after exits)
-        # LONG ENTRY/FLIP
-        if long_signal and long_allowed:
-            if self.position_mode in ('long', 'all'):
-                if not has_position:
-                    # No position: Enter LONG
-                    logger.info(f"[{self.position_mode.upper()}] LONG ENTRY signal: returns ({returns:.4f}) > threshold×std ({long_threshold:.4f})")
-                    return 'buy'
-                elif self.position_mode == 'all' and position_type == 'sell':
-                    # Short position open in ALL mode: Flip to LONG
-                    logger.info(f"[{self.position_mode.upper()}] FLIP SHORT→LONG: returns ({returns:.4f}) > threshold×std ({long_threshold:.4f})")
-                    return 'buy'
+        # ENTRY (no flip: opposite direction closes first on a later bar)
+        if long_signal and long_allowed and self.position_mode == 'long' and not has_position:
+            logger.info(f"[{self.position_mode.upper()}] LONG ENTRY signal: returns ({returns:.4f}) > threshold×std ({long_threshold:.4f})")
+            return 'buy'
         
-        # SHORT ENTRY/FLIP
-        if short_signal and short_allowed:
-            if self.position_mode in ('short', 'all'):
-                if not has_position:
-                    # No position: Enter SHORT
-                    logger.info(f"[{self.position_mode.upper()}] SHORT ENTRY signal: returns ({returns:.4f}) < -threshold×std ({short_threshold:.4f})")
-                    return 'sell'
-                elif self.position_mode == 'all' and position_type == 'buy':
-                    # Long position open in ALL mode: Flip to SHORT (only if short_allowed)
-                    logger.info(f"[{self.position_mode.upper()}] FLIP LONG→SHORT: returns ({returns:.4f}) < -threshold×std ({short_threshold:.4f})")
-                    return 'sell'
+        if short_signal and short_allowed and self.position_mode == 'short' and not has_position:
+            logger.info(f"[{self.position_mode.upper()}] SHORT ENTRY signal: returns ({returns:.4f}) < -threshold×std ({short_threshold:.4f})")
+            return 'sell'
         
         return None
     

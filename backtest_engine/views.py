@@ -119,12 +119,8 @@ class BacktestViewSet(viewsets.ModelViewSet):
                 )
             
             # Get broker associations - filter by status='active' and broker association flags
-            # Since backtest runs all three modes ('all', 'long', 'short'), we include symbols compatible with any mode
-            # The executor will further filter symbols per mode:
-            #   - 'all' mode: symbols with both long_active=True AND short_active=True
-            #   - 'long' mode: symbols with long_active=True
-            #   - 'short' mode: symbols with short_active=True
-            # For initial filtering, include symbols with status='active' and at least one active flag
+            # Backtest runs long and short modes; include symbols usable in at least one mode.
+            # The executor filters per mode: long → long_active, short → short_active.
             associations = SymbolBrokerAssociation.objects.filter(
                 broker=broker,
                 symbol__status='active'  # Only active symbols
@@ -266,7 +262,7 @@ class BacktestViewSet(viewsets.ModelViewSet):
         
         Query parameters:
         - symbol: Filter by symbol ticker
-        - mode: Filter by backtest position mode ('all', 'long', 'short') — matches
+        - mode: Filter by backtest position mode ('long', 'short') — matches
           ``metadata.position_mode`` stored when trades are saved (one run per mode).
         - no_pagination: Set to 'true' to disable pagination (not recommended for large datasets)
         """
@@ -281,11 +277,11 @@ class BacktestViewSet(viewsets.ModelViewSet):
         mode = request.query_params.get('mode', None)
         if mode:
             mode = mode.lower()
-            if mode not in ['long', 'short', 'all']:
+            if mode not in ['long', 'short']:
                 mode = None  # Invalid mode, ignore it
         
         # Filter by position mode (Celery task stores this on each Trade.metadata)
-        if mode in ('long', 'short', 'all'):
+        if mode in ('long', 'short'):
             trades = trades.filter(metadata__position_mode=mode)
         
         # Order by entry timestamp
@@ -300,8 +296,8 @@ class BacktestViewSet(viewsets.ModelViewSet):
                 symbol = Symbol.objects.get(ticker=symbol_ticker)
                 symbol_stats = backtest.statistics.filter(symbol=symbol).first()
                 if symbol_stats and symbol_stats.additional_stats:
-                    # Get the mode from query params (default to 'all') for independent_bet_amounts lookup
-                    stats_mode = mode if mode else 'all'
+                    # Default to long (main stats row) for independent_bet_amounts lookup
+                    stats_mode = mode if mode else 'long'
                     mode_stats = symbol_stats.additional_stats.get(stats_mode, {})
                     independent_bet_amounts = mode_stats.get('independent_bet_amounts', {})
             except Symbol.DoesNotExist:
@@ -317,7 +313,7 @@ class BacktestViewSet(viewsets.ModelViewSet):
             from django.utils import timezone as tz
             for trade in trades_list:
                 # If mode is specified, only inject for trades matching that mode
-                # Otherwise, inject for all trades (when mode is not specified, default to 'all' mode's stats)
+                # Otherwise, inject for all trades (when mode is not specified, default to long-mode stats)
                 trade_metadata = trade.metadata if isinstance(trade.metadata, dict) else {}
                 trade_mode = trade_metadata.get('position_mode')
                 
@@ -370,7 +366,7 @@ class BacktestViewSet(viewsets.ModelViewSet):
     
     @action(detail=True, methods=['get'], url_path='statistics/optimized')
     def statistics_optimized(self, request, pk=None):
-        """Get optimized statistics for a backtest - organized by mode (ALL/LONG/SHORT)"""
+        """Get optimized statistics for a backtest - organized by mode (LONG/SHORT)"""
         backtest = self.get_object()
         
         # Get portfolio stats (symbol=None)

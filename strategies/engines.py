@@ -18,7 +18,7 @@ class BaseBacktestEngine(ABC):
     in a backtest environment (using historical data).
     """
     
-    def __init__(self, strategy, parameters: Dict, symbols: List, position_mode: str = 'all'):
+    def __init__(self, strategy, parameters: Dict, symbols: List, position_mode: str = 'long'):
         """
         Initialize the backtest engine
         
@@ -26,7 +26,7 @@ class BaseBacktestEngine(ABC):
             strategy: StrategyDefinition instance
             parameters: Strategy parameters dict
             symbols: List of Symbol instances
-            position_mode: 'all', 'long', or 'short'
+            position_mode: 'long' or 'short'
         """
         self.strategy = strategy
         self.parameters = parameters

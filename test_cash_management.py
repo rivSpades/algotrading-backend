@@ -104,14 +104,14 @@ print("="*80)
 
 try:
     # Run for 'all' mode directly
-    executor = BacktestExecutor(backtest, position_mode='all')
+    executor = BacktestExecutor(backtest, position_mode='long')
     
     if not executor.symbols:
         print(f"WARNING: Executor has no symbols after filtering. Original count: {len(symbols)}")
         print("This might be due to broker filtering. Trying without broker...")
         backtest.broker = None
         backtest.save()
-        executor = BacktestExecutor(backtest, position_mode='all')
+        executor = BacktestExecutor(backtest, position_mode='long')
     
     if not executor.symbols:
         print("ERROR: No symbols available after filtering. Cannot run backtest.")
