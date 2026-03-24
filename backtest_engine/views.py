@@ -383,6 +383,10 @@ class BacktestViewSet(viewsets.ModelViewSet):
                 'stats_by_mode': serializer.data.get('stats_by_mode', {}),
                 'equity_curve_x': serializer.data.get('equity_curve_x', []),
                 'equity_curve_y': serializer.data.get('equity_curve_y', []),
+                'benchmark_equity_curve_x': serializer.data.get('benchmark_equity_curve_x', []),
+                'benchmark_equity_curve_y': serializer.data.get('benchmark_equity_curve_y', []),
+                'benchmark_ticker': serializer.data.get('benchmark_ticker'),
+                'benchmark_error': serializer.data.get('benchmark_error'),
             }
         
         # Get symbol-level stats

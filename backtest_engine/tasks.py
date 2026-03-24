@@ -7,6 +7,7 @@ from django.utils import timezone
 from django.db import connections
 from .models import Backtest, Trade, BacktestStatistics
 from .services.backtest_executor import BacktestExecutor
+from .services.sp500_benchmark import compute_sp500_buy_hold_curve
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import threading
@@ -770,6 +771,39 @@ def run_backtest_task(self, backtest_id):
                 
                 skipped_trades_count = portfolio_long.get('skipped_trades_count', 0)
                 
+                benchmark_block = {}
+                eq_curve = portfolio_long.get('equity_curve') or []
+                if eq_curve and isinstance(eq_curve, list):
+                    try:
+                        first_pt = eq_curve[0]
+                        last_pt = eq_curve[-1]
+                        first_ts = first_pt.get('timestamp')
+                        last_ts = last_pt.get('timestamp')
+                        start_cap = float(
+                            first_pt.get('equity', backtest.initial_capital) or backtest.initial_capital
+                        )
+                        b_curve, b_meta = compute_sp500_buy_hold_curve(first_ts, last_ts, start_cap)
+                        benchmark_block = {
+                            'ticker': b_meta.get('ticker', '^GSPC'),
+                            'equity_curve': b_curve,
+                            'source': b_meta.get('source', 'none'),
+                        }
+                        if b_meta.get('error'):
+                            benchmark_block['error'] = b_meta['error']
+                    except Exception as bench_ex:
+                        logger.warning(
+                            'S&P 500 benchmark curve failed for backtest %s: %s',
+                            backtest_id,
+                            bench_ex,
+                            exc_info=True,
+                        )
+                        benchmark_block = {
+                            'ticker': '^GSPC',
+                            'equity_curve': [],
+                            'error': str(bench_ex),
+                            'source': 'none',
+                        }
+                
                 BacktestStatistics.objects.create(
                     backtest=backtest,
                     symbol=None,
@@ -780,6 +814,7 @@ def run_backtest_task(self, backtest_id):
                             'skipped_trades_count': skipped_trades_count,
                         },
                         'short': stats.get('short', {}),
+                        **({'benchmark': benchmark_block} if benchmark_block else {}),
                     }
                 )
             else:

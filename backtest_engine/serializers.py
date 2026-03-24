@@ -30,6 +30,10 @@ class BacktestStatisticsSerializer(serializers.ModelSerializer):
     symbol_ticker = serializers.SerializerMethodField()
     equity_curve_x = serializers.SerializerMethodField()
     equity_curve_y = serializers.SerializerMethodField()
+    benchmark_equity_curve_x = serializers.SerializerMethodField()
+    benchmark_equity_curve_y = serializers.SerializerMethodField()
+    benchmark_ticker = serializers.SerializerMethodField()
+    benchmark_error = serializers.SerializerMethodField()
     stats_by_mode = serializers.SerializerMethodField()
     
     class Meta:
@@ -43,6 +47,7 @@ class BacktestStatisticsSerializer(serializers.ModelSerializer):
             'avg_intra_trade_drawdown', 'worst_intra_trade_drawdown',
             'sharpe_ratio',
             'cagr', 'total_return', 'equity_curve', 'equity_curve_x', 'equity_curve_y',
+            'benchmark_equity_curve_x', 'benchmark_equity_curve_y', 'benchmark_ticker', 'benchmark_error',
             'additional_stats', 'stats_by_mode',
             'created_at', 'updated_at'
         ]
@@ -64,6 +69,43 @@ class BacktestStatisticsSerializer(serializers.ModelSerializer):
             return []
         return [float(point.get('equity', 0)) for point in obj.equity_curve if isinstance(point, dict)]
     
+    def _portfolio_benchmark_curve(self, obj) -> list:
+        """Buy-hold ^GSPC curve; portfolio rows only (symbol is null)."""
+        if obj.symbol is not None:
+            return []
+        extra = obj.additional_stats if isinstance(obj.additional_stats, dict) else {}
+        block = extra.get('benchmark') or {}
+        if not isinstance(block, dict):
+            return []
+        curve = block.get('equity_curve') or []
+        return curve if isinstance(curve, list) else []
+    
+    def get_benchmark_equity_curve_x(self, obj):
+        curve = self._portfolio_benchmark_curve(obj)
+        return [p.get('timestamp') for p in curve if isinstance(p, dict)]
+    
+    def get_benchmark_equity_curve_y(self, obj):
+        curve = self._portfolio_benchmark_curve(obj)
+        return [float(p.get('equity', 0)) for p in curve if isinstance(p, dict)]
+    
+    def get_benchmark_ticker(self, obj):
+        if obj.symbol is not None:
+            return None
+        extra = obj.additional_stats if isinstance(obj.additional_stats, dict) else {}
+        block = extra.get('benchmark') or {}
+        if isinstance(block, dict) and block.get('ticker'):
+            return block['ticker']
+        return '^GSPC'
+    
+    def get_benchmark_error(self, obj):
+        if obj.symbol is not None:
+            return None
+        extra = obj.additional_stats if isinstance(obj.additional_stats, dict) else {}
+        block = extra.get('benchmark') or {}
+        if isinstance(block, dict) and block.get('error'):
+            return str(block['error'])
+        return None
+    
     def get_stats_by_mode(self, obj):
         """Return statistics organized by mode (LONG, SHORT). Main model row stores long-mode metrics."""
         # Helper function to extract equity curve arrays
@@ -76,6 +118,8 @@ class BacktestStatisticsSerializer(serializers.ModelSerializer):
             return {'x': x, 'y': y}
         
         long_equity_curve = extract_equity_curve_arrays(obj.equity_curve)
+        bench_x = self.get_benchmark_equity_curve_x(obj)
+        bench_y = self.get_benchmark_equity_curve_y(obj)
         
         result = {
             'long': {
@@ -99,6 +143,8 @@ class BacktestStatisticsSerializer(serializers.ModelSerializer):
                 'equity_curve': obj.equity_curve or [],
                 'equity_curve_x': long_equity_curve['x'],
                 'equity_curve_y': long_equity_curve['y'],
+                'benchmark_equity_curve_x': bench_x,
+                'benchmark_equity_curve_y': bench_y,
             }
         }
         
@@ -129,6 +175,8 @@ class BacktestStatisticsSerializer(serializers.ModelSerializer):
             'equity_curve': short_stats.get('equity_curve', []),
             'equity_curve_x': short_equity_curve['x'],
             'equity_curve_y': short_equity_curve['y'],
+            'benchmark_equity_curve_x': bench_x,
+            'benchmark_equity_curve_y': bench_y,
         }
         
         return result
