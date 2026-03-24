@@ -21,7 +21,7 @@ import logging
 import threading
 import bisect
 import heapq
-from itertools import groupby
+from itertools import chain, groupby
 
 logger = logging.getLogger(__name__)
 
@@ -522,9 +522,9 @@ class BacktestExecutor:
         # Store processed symbol data for later chronological processing
         symbol_data = {}  # {symbol: {'df': DataFrame, 'test_df': DataFrame, 'indicators': dict, 'price_cache': dict, 'sorted_timestamps': list}}
         
-        # OPTIMIZATION: Collect events per symbol (will merge later using heapq for efficiency)
-        # This avoids sorting 20M+ events at once
-        symbol_events = {}  # {symbol: list of (timestamp, symbol, idx, row)}
+        # Collect events per symbol as (timestamp, symbol, idx) — no row/Series in heap
+        # (avoids millions of Series copies and a giant merged list in memory)
+        symbol_events = {}  # {symbol: list of (timestamp, symbol, idx)}
         
         # Single loop: for each symbol, use pre-processed data or load on-demand, then collect events
         for symbol in self.symbols:
@@ -561,12 +561,11 @@ class BacktestExecutor:
                     logger.warning(f"[{self.position_mode.upper()}] No test data available for symbol {symbol.ticker} after split, skipping")
                     continue
                 
-                # Build price cache
+                # Build price cache (vectorized; avoid iterrows)
                 price_cache = {}
-                for idx, row in test_df.iterrows():
-                    timestamp = row['timestamp']
-                    if pd.notna(row['close']):
-                        price_cache[timestamp] = float(row['close'])
+                _sub = test_df[test_df['close'].notna()]
+                for ts, cl in zip(_sub['timestamp'], _sub['close']):
+                    price_cache[ts] = float(cl)
             
             # OPTIMIZATION: Create sorted timestamp list for binary search price lookups
             # This enables O(log n) lookups instead of O(n) list comprehension
@@ -583,33 +582,37 @@ class BacktestExecutor:
             positions[symbol] = None
             prev_indicators[symbol] = None
             
-            # OPTIMIZATION: Collect events per symbol (already sorted by timestamp in test_df)
-            # This allows us to use heapq.merge() instead of sorting all events at once
-            symbol_event_list = []
-            for idx, row in test_df.iterrows():
-                timestamp = row['timestamp']
-                if pd.notna(row['close']):
-                    symbol_event_list.append((timestamp, symbol, idx, row))
-            
+            # Events per symbol: same order as test_df (sorted by time) for heapq.merge
+            _valid = test_df['close'].notna()
+            _sub = test_df.loc[_valid]
+            symbol_event_list = [
+                (ts, symbol, idx) for idx, ts in zip(_sub.index, _sub['timestamp'])
+            ]
             if symbol_event_list:
                 symbol_events[symbol] = symbol_event_list
-                logger.info(f"[{self.position_mode.upper()}] Collected {len(symbol_event_list)} events for {symbol.ticker}")
+                logger.debug(
+                    f"[{self.position_mode.upper()}] Collected {len(symbol_event_list)} events for {symbol.ticker}"
+                )
         
         if not symbol_data:
             logger.warning("No valid symbol data for multi-symbol execution")
             return
         
-        # OPTIMIZATION: Merge sorted event lists using heapq.merge (more efficient than sorting all at once)
-        # heapq.merge efficiently merges multiple sorted iterators in O(n) time with O(k) space
-        # where k = number of symbols, vs O(n log n) time with O(n) space for full sort
+        total_events = sum(len(v) for v in symbol_events.values())
         if symbol_events:
-            all_events = list(heapq.merge(*symbol_events.values(), key=lambda x: x[0]))
-            logger.info(f"[{self.position_mode.upper()}] Merged {len(all_events)} events from {len(symbol_events)} symbols using heapq.merge")
+            logger.info(
+                f"[{self.position_mode.upper()}] Merged stream: {total_events} events from "
+                f"{len(symbol_events)} symbols (lazy heapq.merge, no full materialized list)"
+            )
+            merged_event_stream = heapq.merge(*symbol_events.values(), key=lambda x: x[0])
         else:
-            all_events = []
+            merged_event_stream = iter(())
             logger.warning(f"[{self.position_mode.upper()}] No events collected from any symbol")
         
-        logger.info(f"[{self.position_mode.upper()}] Starting strategy execution: processing {len(all_events)} events chronologically across {len(symbol_data)} symbols with shared capital")
+        logger.info(
+            f"[{self.position_mode.upper()}] Starting strategy execution: processing {total_events} events "
+            f"chronologically across {len(symbol_data)} symbols with shared capital"
+        )
         
         # OPTIMIZATION: Binary search for price lookup (O(log n) instead of O(n))
         def get_price_at_timestamp(symbol, timestamp):
@@ -627,11 +630,17 @@ class BacktestExecutor:
                 return price_cache[closest_ts]
             return None
         
-        # Initialize portfolio equity curve
+        # Stream merge output (peek first row for initial equity point — no materialized all_events list)
+        _merged_iter = iter(merged_event_stream)
+        _first_ev = next(_merged_iter, None)
         portfolio_equity_curve = []
-        first_event_timestamp = all_events[0][0] if all_events else None
-        if first_event_timestamp:
-            portfolio_equity_curve.append((first_event_timestamp, initial_capital))
+        if _first_ev is not None:
+            portfolio_equity_curve.append((_first_ev[0], initial_capital))
+            event_stream = chain([_first_ev], _merged_iter)
+        else:
+            event_stream = iter(())
+        
+        last_stream_timestamp = _first_ev[0] if _first_ev is not None else None
         
         # Track logging state for progress updates
         last_logged_symbol = None
@@ -648,20 +657,23 @@ class BacktestExecutor:
         # Same-timestamp batching: exits before entries so freed cash is visible before new entries
         # (heapq.merge does not order ties; arbitrary symbol order could process an entry first).
         execution_stopped = False
-        for timestamp, group_iter in groupby(all_events, key=lambda x: x[0]):
+        for timestamp, group_iter in groupby(event_stream, key=lambda x: x[0]):
             if execution_stopped:
                 break
+            last_stream_timestamp = timestamp
             batch = list(group_iter)
             phase1 = []
-            for _ts, symbol, idx, row in batch:
+            for _ts, symbol, idx in batch:
                 event_count += 1
+                test_df = symbol_data[symbol]['test_df']
+                row = test_df.loc[idx]
                 if symbol != last_logged_symbol:
                     if symbol not in processed_symbols:
                         logger.info(f"[{self.position_mode.upper()}] Processing events for symbol: {symbol.ticker}")
                         processed_symbols.add(symbol)
                     last_logged_symbol = symbol
                 if event_count % log_interval == 0:
-                    logger.info(f"[{self.position_mode.upper()}] Processed {event_count}/{len(all_events)} events (currently: {symbol.ticker} @ {_ts.date()})")
+                    logger.info(f"[{self.position_mode.upper()}] Processed {event_count}/{total_events} events (currently: {symbol.ticker} @ {_ts.date()})")
                 price = float(row['close'])
                 last_known_price[symbol] = price
                 position = positions[symbol]
@@ -678,10 +690,9 @@ class BacktestExecutor:
                             pass
                 signal = self._generate_signal(row, indicator_values, position, prev_indicator_values, symbol)
                 priority = self._same_timestamp_portfolio_priority(signal, position)
-                phase1.append((priority, symbol.ticker, _ts, symbol, idx, row, signal, indicator_values))
+                phase1.append((priority, symbol.ticker, _ts, symbol, idx, price, signal, indicator_values))
             phase1.sort(key=lambda x: (x[0], x[1]))
-            for _, _, _ts, symbol, idx, row, signal, indicator_values in phase1:
-                price = float(row['close'])
+            for _, _, _ts, symbol, idx, price, signal, indicator_values in phase1:
                 position = positions[symbol]
                 indicators = symbol_data[symbol]['indicators']
                 if indicator_values:
@@ -714,10 +725,10 @@ class BacktestExecutor:
             if execution_stopped:
                 break
         
-        logger.info(f"[{self.position_mode.upper()}] Completed chronological event processing: {len(all_events)} events processed")
+        logger.info(f"[{self.position_mode.upper()}] Completed chronological event processing: {total_events} events processed")
         
         # Close any open positions at the end
-        final_timestamp = all_events[-1][0] if all_events else None
+        final_timestamp = last_stream_timestamp
         for symbol, position in positions.items():
             if position is not None:
                 test_df = symbol_data[symbol]['test_df']

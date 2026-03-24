@@ -12,6 +12,7 @@ import logging
 import threading
 import pandas as pd
 import os
+from datetime import timedelta
 from decimal import Decimal
 
 logger = logging.getLogger(__name__)
@@ -111,64 +112,47 @@ def run_backtest_task(self, backtest_id):
             symbols_to_preprocess = [s for s in all_symbols if s.status == 'active']
         
         logger.info(f"Phase 1: Pre-processing {len(symbols_to_preprocess)} symbols in parallel")
-        
-        # OPTIMIZATION: Bulk load all OHLCV data in a single query instead of N queries
-        # This dramatically reduces database round-trips (10-50x faster for large symbol sets)
-        logger.info(f"Bulk loading OHLCV data for {len(symbols_to_preprocess)} symbols...")
-        from market_data.models import OHLCV
-        
-        symbol_tickers = [s.ticker for s in symbols_to_preprocess]
-        ticker_to_symbol = {s.ticker: s for s in symbols_to_preprocess}
-        
-        # Single bulk query for all OHLCV data
-        bulk_ohlcv_queryset = OHLCV.objects.filter(
-            symbol__ticker__in=symbol_tickers,
-            timeframe='daily'
-        ).select_related('symbol').order_by('symbol__ticker', 'timestamp')
-        
-        # Group OHLCV data by symbol ticker in memory (much faster than N queries)
-        bulk_ohlcv_data = {}
-        for ohlcv in bulk_ohlcv_queryset.values('symbol__ticker', 'timestamp', 'open', 'high', 'low', 'close', 'volume'):
-            ticker = ohlcv['symbol__ticker']
-            if ticker not in bulk_ohlcv_data:
-                bulk_ohlcv_data[ticker] = []
-            
-            timestamp = ohlcv['timestamp']
-            if hasattr(timestamp, 'isoformat'):
-                timestamp = timestamp.isoformat()
-            
-            bulk_ohlcv_data[ticker].append({
-                'timestamp': timestamp,
-                'open': float(ohlcv['open']),
-                'high': float(ohlcv['high']),
-                'low': float(ohlcv['low']),
-                'close': float(ohlcv['close']),
-                'volume': float(ohlcv['volume'])
-            })
-        
-        # Create symbol->data mapping
-        bulk_ohlcv_by_symbol = {}
-        for ticker, data in bulk_ohlcv_data.items():
-            if ticker in ticker_to_symbol:
-                bulk_ohlcv_by_symbol[ticker_to_symbol[ticker]] = data
-        
-        logger.info(f"Bulk loaded OHLCV data for {len(bulk_ohlcv_by_symbol)} symbols")
+
+        # Date-bounded OHLCV loading to prevent timeouts on large symbol sets.
+        # We still load a small warmup window so indicators have enough lookback.
+        merged_strategy_params = {}
+        if getattr(backtest.strategy, "default_parameters", None):
+            merged_strategy_params.update(backtest.strategy.default_parameters or {})
+        merged_strategy_params.update(backtest.strategy_parameters or {})
+
+        warmup_days = 0
+        required_tool_configs = backtest.strategy.required_tool_configs or []
+        for tool_config in required_tool_configs:
+            parameters = (tool_config.get('parameters') or {}).copy()
+            parameter_mapping = tool_config.get('parameter_mapping') or {}
+            for tool_param, strategy_param in parameter_mapping.items():
+                if merged_strategy_params.get(strategy_param) is not None:
+                    parameters[tool_param] = merged_strategy_params[strategy_param]
+
+            for k, v in parameters.items():
+                if isinstance(v, (int, float)) and ('period' in str(k).lower() or str(k).lower() == 'period'):
+                    warmup_days = max(warmup_days, int(v))
+
+        # Add a small buffer for rolling indicators and ensure warmup_days >= 1 when warmup exists
+        warmup_days = max(0, warmup_days) + (5 if warmup_days > 0 else 0)
+        date_window_start = backtest.start_date - timedelta(days=warmup_days)
+        date_window_end = backtest.end_date
         
         # Pre-process in parallel
         preprocessed_data = {}  # {symbol: {'df': DataFrame, 'indicators': dict, 'test_df': DataFrame, 'price_cache': dict}}
         preprocessed_lock = threading.Lock()
         
-        def preprocess_symbol(symbol):
+        def preprocess_symbol(symbol, bulk_ohlcv_by_symbol_local):
             """Load data and compute indicators for a single symbol (Phase 1)"""
             try:
                 logger.info(f"Pre-processing symbol: {symbol.ticker}")
                 
                 # OPTIMIZATION: Use bulk-loaded OHLCV data instead of individual query
-                if symbol not in bulk_ohlcv_by_symbol:
+                if symbol not in bulk_ohlcv_by_symbol_local:
                     logger.warning(f"No OHLCV data found for symbol {symbol.ticker} in bulk load")
                     return symbol, None
                 
-                ohlcv_list = bulk_ohlcv_by_symbol[symbol]
+                ohlcv_list = bulk_ohlcv_by_symbol_local[symbol]
                 
                 if not ohlcv_list:
                     return symbol, None
@@ -278,10 +262,51 @@ def run_backtest_task(self, backtest_id):
                     total_batches = (len(symbols_to_preprocess) + BATCH_SIZE - 1) // BATCH_SIZE
                     
                     logger.info(f"Processing batch {batch_num}/{total_batches}: symbols {batch_start} to {batch_end-1}")
+
+                    # Load OHLCV only for this batch, bounded by the backtest window (+ warmup)
+                    from market_data.models import OHLCV
+                    batch_tickers = [s.ticker for s in batch_symbols]
+                    ticker_to_symbol = {s.ticker: s for s in batch_symbols}
+                    bulk_ohlcv_queryset = OHLCV.objects.filter(
+                        symbol__ticker__in=batch_tickers,
+                        timeframe='daily',
+                        timestamp__gte=date_window_start,
+                        timestamp__lte=date_window_end,
+                    ).select_related('symbol').order_by('symbol__ticker', 'timestamp')
+
+                    bulk_ohlcv_data = {}
+                    values_qs = bulk_ohlcv_queryset.values(
+                        'symbol__ticker', 'timestamp', 'open', 'high', 'low', 'close', 'volume'
+                    ).iterator(chunk_size=50000)
+                    for ohlcv in values_qs:
+                        ticker = ohlcv['symbol__ticker']
+                        if ticker not in bulk_ohlcv_data:
+                            bulk_ohlcv_data[ticker] = []
+
+                        timestamp = ohlcv['timestamp']
+                        if hasattr(timestamp, 'isoformat'):
+                            timestamp = timestamp.isoformat()
+
+                        bulk_ohlcv_data[ticker].append({
+                            'timestamp': timestamp,
+                            'open': float(ohlcv['open']),
+                            'high': float(ohlcv['high']),
+                            'low': float(ohlcv['low']),
+                            'close': float(ohlcv['close']),
+                            'volume': float(ohlcv['volume'])
+                        })
+
+                    bulk_ohlcv_by_symbol_local = {}
+                    for ticker, data in bulk_ohlcv_data.items():
+                        if ticker in ticker_to_symbol:
+                            bulk_ohlcv_by_symbol_local[ticker_to_symbol[ticker]] = data
                     
                     # Process batch in parallel
                     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                        futures = {executor.submit(preprocess_symbol, symbol): symbol for symbol in batch_symbols}
+                        futures = {
+                            executor.submit(preprocess_symbol, symbol, bulk_ohlcv_by_symbol_local): symbol
+                            for symbol in batch_symbols
+                        }
                         for future in as_completed(futures):
                             future.result()  # Raise exception if any occurred
                     
@@ -300,8 +325,49 @@ def run_backtest_task(self, backtest_id):
                 preprocessed_data = all_preprocessed_data
             else:
                 # Process all symbols at once for smaller sets
+                from market_data.models import OHLCV
+                symbol_tickers = [s.ticker for s in symbols_to_preprocess]
+                ticker_to_symbol = {s.ticker: s for s in symbols_to_preprocess}
+
+                bulk_ohlcv_queryset = OHLCV.objects.filter(
+                    symbol__ticker__in=symbol_tickers,
+                    timeframe='daily',
+                    timestamp__gte=date_window_start,
+                    timestamp__lte=date_window_end,
+                ).select_related('symbol').order_by('symbol__ticker', 'timestamp')
+
+                bulk_ohlcv_data = {}
+                values_qs = bulk_ohlcv_queryset.values(
+                    'symbol__ticker', 'timestamp', 'open', 'high', 'low', 'close', 'volume'
+                ).iterator(chunk_size=50000)
+                for ohlcv in values_qs:
+                    ticker = ohlcv['symbol__ticker']
+                    if ticker not in bulk_ohlcv_data:
+                        bulk_ohlcv_data[ticker] = []
+
+                    timestamp = ohlcv['timestamp']
+                    if hasattr(timestamp, 'isoformat'):
+                        timestamp = timestamp.isoformat()
+
+                    bulk_ohlcv_data[ticker].append({
+                        'timestamp': timestamp,
+                        'open': float(ohlcv['open']),
+                        'high': float(ohlcv['high']),
+                        'low': float(ohlcv['low']),
+                        'close': float(ohlcv['close']),
+                        'volume': float(ohlcv['volume'])
+                    })
+
+                bulk_ohlcv_by_symbol_local = {}
+                for ticker, data in bulk_ohlcv_data.items():
+                    if ticker in ticker_to_symbol:
+                        bulk_ohlcv_by_symbol_local[ticker_to_symbol[ticker]] = data
+
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = {executor.submit(preprocess_symbol, symbol): symbol for symbol in symbols_to_preprocess}
+                    futures = {
+                        executor.submit(preprocess_symbol, symbol, bulk_ohlcv_by_symbol_local): symbol
+                        for symbol in symbols_to_preprocess
+                    }
                     for future in as_completed(futures):
                         future.result()  # Raise exception if any occurred
         
