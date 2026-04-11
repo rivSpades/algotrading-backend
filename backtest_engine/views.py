@@ -12,7 +12,14 @@ from django.db.models import Q
 from .models import Backtest, Trade, BacktestStatistics
 from .serializers import (
     BacktestSerializer, BacktestListSerializer, BacktestDetailSerializer, BacktestCreateSerializer,
-    TradeSerializer, BacktestStatisticsSerializer
+    TradeSerializer, BacktestStatisticsSerializer, HedgePreviewSerializer, HedgeLabSettingsWriteSerializer,
+)
+from .services.hybrid_vix_hedge import (
+    simulate_hybrid_vix_hedge,
+    merge_lab_overrides_with_request,
+    resolved_hedge_config_for_backtest,
+    merge_defaults_into_hedge_config,
+    get_hedge_lab_saved_overrides,
 )
 from strategies.models import StrategyDefinition, StrategyAssignment
 from market_data.models import Symbol
@@ -232,6 +239,12 @@ class BacktestViewSet(viewsets.ModelViewSet):
             initial_capital=data.get('initial_capital', 10000.0),
             bet_size_percentage=data.get('bet_size_percentage', 100.0),
             strategy_parameters=strategy_parameters,
+            hedge_enabled=bool(data.get('hedge_enabled', False)),
+            hedge_config=(
+                resolved_hedge_config_for_backtest(data.get('hedge_config'))
+                if bool(data.get('hedge_enabled', False))
+                else {}
+            ),
             status='pending'
         )
         backtest.symbols.set(symbols)
@@ -356,6 +369,50 @@ class BacktestViewSet(viewsets.ModelViewSet):
         serializer = TradeSerializer(trades_list, many=True)
         return Response(serializer.data)
     
+    @action(detail=False, methods=['post'], url_path='preview-hedge')
+    def preview_hedge(self, request):
+        """Run hybrid VIX hedge + SPY buy-and-hold simulation for a date range (fast preview)."""
+        ser = HedgePreviewSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        vd = ser.validated_data
+        merged_cfg = merge_lab_overrides_with_request(vd.get('hedge_config'))
+        result = simulate_hybrid_vix_hedge(
+            vd['start_date'],
+            vd['end_date'],
+            float(vd['initial_capital']),
+            merged_cfg,
+            yahoo_only=bool(vd.get('use_yahoo_only', True)),
+        )
+        return Response(result)
+
+    @action(detail=False, methods=['get', 'put'], url_path='hedge-lab-settings')
+    def hedge_lab_settings(self, request):
+        """GET: saved overrides + full effective defaults. PUT: save lab overrides."""
+        if request.method == 'GET':
+            saved = get_hedge_lab_saved_overrides()
+            effective = merge_defaults_into_hedge_config(saved)
+            return Response(
+                {
+                    'hedge_config': saved,
+                    'effective_config': effective,
+                }
+            )
+        ser = HedgeLabSettingsWriteSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        from .models import HedgeLabSettings
+
+        row = HedgeLabSettings.get_solo()
+        row.hedge_config = ser.validated_data['hedge_config']
+        row.save(update_fields=['hedge_config', 'updated_at'])
+        saved = get_hedge_lab_saved_overrides()
+        effective = merge_defaults_into_hedge_config(saved)
+        return Response(
+            {
+                'hedge_config': saved,
+                'effective_config': effective,
+            }
+        )
+    
     @action(detail=True, methods=['get'])
     def statistics(self, request, pk=None):
         """Get all statistics for a backtest"""
@@ -387,6 +444,11 @@ class BacktestViewSet(viewsets.ModelViewSet):
                 'benchmark_equity_curve_y': serializer.data.get('benchmark_equity_curve_y', []),
                 'benchmark_ticker': serializer.data.get('benchmark_ticker'),
                 'benchmark_error': serializer.data.get('benchmark_error'),
+                'hedge_equity_curve_x': serializer.data.get('hedge_equity_curve_x', []),
+                'hedge_equity_curve_y': serializer.data.get('hedge_equity_curve_y', []),
+                'hedge_metrics': serializer.data.get('hedge_metrics', {}),
+                'hedge_error': serializer.data.get('hedge_error'),
+                'hedge_enabled': backtest.hedge_enabled,
             }
         
         # Get symbol-level stats

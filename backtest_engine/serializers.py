@@ -34,6 +34,10 @@ class BacktestStatisticsSerializer(serializers.ModelSerializer):
     benchmark_equity_curve_y = serializers.SerializerMethodField()
     benchmark_ticker = serializers.SerializerMethodField()
     benchmark_error = serializers.SerializerMethodField()
+    hedge_equity_curve_x = serializers.SerializerMethodField()
+    hedge_equity_curve_y = serializers.SerializerMethodField()
+    hedge_metrics = serializers.SerializerMethodField()
+    hedge_error = serializers.SerializerMethodField()
     stats_by_mode = serializers.SerializerMethodField()
     
     class Meta:
@@ -48,6 +52,7 @@ class BacktestStatisticsSerializer(serializers.ModelSerializer):
             'sharpe_ratio',
             'cagr', 'total_return', 'equity_curve', 'equity_curve_x', 'equity_curve_y',
             'benchmark_equity_curve_x', 'benchmark_equity_curve_y', 'benchmark_ticker', 'benchmark_error',
+            'hedge_equity_curve_x', 'hedge_equity_curve_y', 'hedge_metrics', 'hedge_error',
             'additional_stats', 'stats_by_mode',
             'created_at', 'updated_at'
         ]
@@ -106,6 +111,88 @@ class BacktestStatisticsSerializer(serializers.ModelSerializer):
             return str(block['error'])
         return None
     
+    def _portfolio_hedge_block(self, obj) -> dict:
+        if obj.symbol is not None:
+            return {}
+        extra = obj.additional_stats if isinstance(obj.additional_stats, dict) else {}
+        block = extra.get('hedge') or {}
+        return block if isinstance(block, dict) else {}
+    
+    def get_hedge_equity_curve_x(self, obj):
+        curve = self._portfolio_hedge_block(obj).get('equity_curve') or []
+        if not isinstance(curve, list):
+            return []
+        return [p.get('timestamp') for p in curve if isinstance(p, dict)]
+    
+    def get_hedge_equity_curve_y(self, obj):
+        curve = self._portfolio_hedge_block(obj).get('equity_curve') or []
+        if not isinstance(curve, list):
+            return []
+        return [float(p.get('equity', 0)) for p in curve if isinstance(p, dict)]
+    
+    def get_hedge_metrics(self, obj):
+        block = self._portfolio_hedge_block(obj)
+        m = block.get('metrics')
+        return m if isinstance(m, dict) else {}
+    
+    def get_hedge_error(self, obj):
+        block = self._portfolio_hedge_block(obj)
+        if block.get('error'):
+            return str(block['error'])
+        return None
+
+    def _strategy_only_bundle(self, obj, mode_key: str) -> dict:
+        """Baseline portfolio (no hedge split) for comparison when hedge_enabled backtest ran dual execution."""
+        if obj.symbol is not None:
+            return {'x': [], 'y': [], 'metrics': {}}
+        extra = obj.additional_stats if isinstance(obj.additional_stats, dict) else {}
+        so_root = extra.get('strategy_only') or {}
+        if not isinstance(so_root, dict):
+            return {'x': [], 'y': [], 'metrics': {}}
+        block = so_root.get(mode_key) or {}
+        if not isinstance(block, dict):
+            return {'x': [], 'y': [], 'metrics': {}}
+        curve = block.get('equity_curve') or []
+        if not isinstance(curve, list):
+            curve = []
+        x = [p.get('timestamp') for p in curve if isinstance(p, dict)]
+        y = [float(p.get('equity', 0)) for p in curve if isinstance(p, dict)]
+        metric_keys = (
+            'total_trades',
+            'winning_trades',
+            'losing_trades',
+            'win_rate',
+            'total_pnl',
+            'total_pnl_percentage',
+            'average_pnl',
+            'average_winner',
+            'average_loser',
+            'profit_factor',
+            'max_drawdown',
+            'max_drawdown_duration',
+            'sharpe_ratio',
+            'cagr',
+            'total_return',
+            'skipped_trades_count',
+        )
+        metrics = {}
+        for k in metric_keys:
+            v = block.get(k)
+            if v is not None:
+                if k in ('win_rate', 'total_pnl_percentage', 'max_drawdown', 'sharpe_ratio', 'cagr', 'total_return'):
+                    try:
+                        metrics[k] = round(float(v), 2)
+                    except (TypeError, ValueError):
+                        metrics[k] = v
+                elif k in ('total_trades', 'winning_trades', 'losing_trades', 'skipped_trades_count', 'max_drawdown_duration'):
+                    metrics[k] = int(v) if v is not None else 0
+                else:
+                    try:
+                        metrics[k] = round(float(v), 2)
+                    except (TypeError, ValueError):
+                        metrics[k] = v
+        return {'x': x, 'y': y, 'metrics': metrics}
+    
     def get_stats_by_mode(self, obj):
         """Return statistics organized by mode (LONG, SHORT). Main model row stores long-mode metrics."""
         # Helper function to extract equity curve arrays
@@ -120,6 +207,11 @@ class BacktestStatisticsSerializer(serializers.ModelSerializer):
         long_equity_curve = extract_equity_curve_arrays(obj.equity_curve)
         bench_x = self.get_benchmark_equity_curve_x(obj)
         bench_y = self.get_benchmark_equity_curve_y(obj)
+        hedge_x = self.get_hedge_equity_curve_x(obj)
+        hedge_y = self.get_hedge_equity_curve_y(obj)
+        hedge_m = self.get_hedge_metrics(obj)
+        hedge_err = self.get_hedge_error(obj)
+        so_long = self._strategy_only_bundle(obj, 'long')
         
         result = {
             'long': {
@@ -145,6 +237,13 @@ class BacktestStatisticsSerializer(serializers.ModelSerializer):
                 'equity_curve_y': long_equity_curve['y'],
                 'benchmark_equity_curve_x': bench_x,
                 'benchmark_equity_curve_y': bench_y,
+                'hedge_equity_curve_x': hedge_x,
+                'hedge_equity_curve_y': hedge_y,
+                'hedge_metrics': hedge_m,
+                'hedge_error': hedge_err,
+                'strategy_only_equity_curve_x': so_long['x'],
+                'strategy_only_equity_curve_y': so_long['y'],
+                'strategy_only_metrics': so_long['metrics'],
             }
         }
         
@@ -154,6 +253,7 @@ class BacktestStatisticsSerializer(serializers.ModelSerializer):
         if not isinstance(short_stats, dict):
             short_stats = {}
         short_equity_curve = extract_equity_curve_arrays(short_stats.get('equity_curve'))
+        so_short = self._strategy_only_bundle(obj, 'short')
         result['short'] = {
             'total_trades': short_stats.get('total_trades', 0),
             'winning_trades': short_stats.get('winning_trades', 0),
@@ -177,6 +277,13 @@ class BacktestStatisticsSerializer(serializers.ModelSerializer):
             'equity_curve_y': short_equity_curve['y'],
             'benchmark_equity_curve_x': bench_x,
             'benchmark_equity_curve_y': bench_y,
+            'hedge_equity_curve_x': hedge_x,
+            'hedge_equity_curve_y': hedge_y,
+            'hedge_metrics': hedge_m,
+            'hedge_error': hedge_err,
+            'strategy_only_equity_curve_x': so_short['x'],
+            'strategy_only_equity_curve_y': so_short['y'],
+            'strategy_only_metrics': so_short['metrics'],
         }
         
         return result
@@ -192,7 +299,9 @@ class BacktestListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'strategy', 'strategy_name', 'strategy_assignment',
             'start_date', 'end_date', 'split_ratio',
-            'initial_capital', 'bet_size_percentage', 'strategy_parameters', 'status', 'error_message',
+            'initial_capital', 'bet_size_percentage', 'strategy_parameters',
+            'hedge_enabled', 'hedge_config',
+            'status', 'error_message',
             'created_at', 'updated_at', 'completed_at',
             'symbols_count'
         ]
@@ -222,7 +331,9 @@ class BacktestDetailSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'strategy', 'strategy_name', 'strategy_assignment',
             'start_date', 'end_date', 'split_ratio',
-            'initial_capital', 'bet_size_percentage', 'strategy_parameters', 'status', 'error_message',
+            'initial_capital', 'bet_size_percentage', 'strategy_parameters',
+            'hedge_enabled', 'hedge_config',
+            'status', 'error_message',
             'created_at', 'updated_at', 'completed_at',
         ]
         read_only_fields = ['created_at', 'updated_at', 'completed_at', 'status', 'error_message']
@@ -243,7 +354,9 @@ class BacktestSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'strategy', 'strategy_info', 'strategy_assignment',
             'start_date', 'end_date', 'split_ratio',
-            'initial_capital', 'bet_size_percentage', 'strategy_parameters', 'status', 'error_message',
+            'initial_capital', 'bet_size_percentage', 'strategy_parameters',
+            'hedge_enabled', 'hedge_config',
+            'status', 'error_message',
             'created_at', 'updated_at', 'completed_at',
             'trades', 'statistics'
         ]
@@ -269,6 +382,8 @@ class BacktestCreateSerializer(serializers.Serializer):
     strategy_parameters = serializers.JSONField(required=False, default=dict)
     initial_capital = serializers.DecimalField(required=False, default=10000.0, max_digits=20, decimal_places=2, min_value=Decimal('0.01'))
     bet_size_percentage = serializers.FloatField(required=False, default=100.0, min_value=0.1, max_value=100.0, help_text="Percentage of available capital to bet per trade")
+    hedge_enabled = serializers.BooleanField(required=False, default=False)
+    hedge_config = serializers.JSONField(required=False, default=dict)
     
     def validate(self, data):
         """Validate that either symbol_tickers is provided or broker_id is provided"""
@@ -281,4 +396,36 @@ class BacktestCreateSerializer(serializers.Serializer):
             )
         
         return data
+
+
+class HedgePreviewSerializer(serializers.Serializer):
+    """Request body for hybrid VIX hedge preview (no backtest required)."""
+    start_date = serializers.DateTimeField(required=True)
+    end_date = serializers.DateTimeField(required=True)
+    initial_capital = serializers.DecimalField(
+        required=False,
+        default=10000.0,
+        max_digits=20,
+        decimal_places=2,
+        min_value=Decimal('0.01'),
+    )
+    hedge_config = serializers.JSONField(required=False, default=dict)
+    use_yahoo_only = serializers.BooleanField(
+        required=False,
+        default=True,
+        help_text="If true (default), fetch SPY/VIXM/VIXY/^VIX from Yahoo only; do not read DB.",
+    )
+
+
+class HedgeLabSettingsWriteSerializer(serializers.Serializer):
+    """Persist hedge lab overrides (known keys only)."""
+
+    hedge_config = serializers.JSONField(required=True)
+
+    def validate_hedge_config(self, value):
+        from .services.hybrid_vix_hedge import filter_hedge_config_user_keys
+
+        if not isinstance(value, dict):
+            raise serializers.ValidationError("hedge_config must be an object")
+        return filter_hedge_config_user_keys(value)
 

@@ -32,7 +32,7 @@ _CASH_EPS = 1e-9
 class BacktestExecutor:
     """Executes backtests for trading strategies"""
     
-    def __init__(self, backtest, position_mode='long', preprocessed_data=None):
+    def __init__(self, backtest, position_mode='long', preprocessed_data=None, hedge_overlay=None):
         """
         Initialize backtest executor
         
@@ -40,6 +40,7 @@ class BacktestExecutor:
             backtest: Backtest model instance
             position_mode: 'long' (only long positions) or 'short' (only short positions)
             preprocessed_data: Optional dict of pre-processed symbol data from Phase 1 {symbol: {'df': DataFrame, 'indicators': dict, 'test_df': DataFrame, 'price_cache': dict}}
+            hedge_overlay: Optional dict from compute_trade_hedge_overlay — splits each entry bet between strategy and VIX sleeve
         """
         self.backtest = backtest
         self.strategy = backtest.strategy
@@ -68,7 +69,57 @@ class BacktestExecutor:
         self.trades = []  # List of trade dicts
         self.equity_curves = {}  # {symbol: [(timestamp, equity), ...]}
         self.skipped_trades_count = 0  # Count of trades skipped due to insufficient cash
-    
+        self.hedge_overlay = hedge_overlay
+
+    def _hedge_overlay_active(self) -> bool:
+        h = self.hedge_overlay
+        return bool(
+            h
+            and not h.get("error")
+            and h.get("index_ns")
+            and len(h["index_ns"]) > 0
+            and getattr(self.backtest, "hedge_enabled", False)
+        )
+
+    def _event_ns_utc_midnight(self, ts) -> int:
+        t = pd.Timestamp(ts)
+        if t.tzinfo is None:
+            t = t.tz_localize("UTC")
+        else:
+            t = t.tz_convert("UTC")
+        t = t.normalize()
+        return int(t.value)
+
+    def _hedge_weights_at(self, timestamp) -> Tuple[float, float]:
+        if not self._hedge_overlay_active():
+            return 1.0, 0.0
+        arr = self.hedge_overlay["index_ns"]
+        ws = self.hedge_overlay["w_strategy"]
+        wh = self.hedge_overlay["w_hedge"]
+        ns = self._event_ns_utc_midnight(timestamp)
+        i = bisect.bisect_right(arr, ns) - 1
+        i = max(0, min(i, len(ws) - 1))
+        return float(ws[i]), float(wh[i])
+
+    def _hedge_overlay_compound_factor(self, entry_timestamp, exit_timestamp) -> float:
+        if not self._hedge_overlay_active():
+            return 1.0
+        arr = self.hedge_overlay["index_ns"]
+        rh = self.hedge_overlay["r_hedge"]
+        ns_e = self._event_ns_utc_midnight(entry_timestamp)
+        ns_x = self._event_ns_utc_midnight(exit_timestamp)
+        ie = bisect.bisect_right(arr, ns_e) - 1
+        ix = bisect.bisect_right(arr, ns_x) - 1
+        ie = max(0, min(ie, len(arr) - 1))
+        ix = max(0, min(ix, len(arr) - 1))
+        if ix <= ie:
+            return 1.0
+        f = 1.0
+        for j in range(ie + 1, ix + 1):
+            if j < len(rh):
+                f *= 1.0 + float(rh[j])
+        return f
+
     def _filter_symbols_by_broker(self, symbols, position_mode):
         """
         Filter symbols based on broker associations and position mode
@@ -780,7 +831,10 @@ class BacktestExecutor:
         if signal == 'buy' and position is None:
             # Open long position
             bet_amount = float(equity * bet_size_pct)
-            quantity = float(bet_amount / price)
+            w_s, w_h = self._hedge_weights_at(timestamp)
+            bet_strategy = float(bet_amount * w_s)
+            bet_hedge = float(bet_amount * w_h)
+            quantity = float(bet_strategy / price) if price > 0 else 0.0
             
             # Ensure bet_amount and quantity are positive (safety check)
             if bet_amount <= 0 or quantity <= 0:
@@ -810,14 +864,23 @@ class BacktestExecutor:
                 'entry_timestamp': timestamp,
                 'quantity': quantity,
                 'bet_amount': bet_amount,
+                'bet_strategy': bet_strategy,
+                'bet_hedge': bet_hedge,
                 'cash_invested': bet_amount  # Track cash invested in this position
             }
-            logger.debug(f"{symbol.ticker} LONG ENTRY @ {price} on {timestamp}, quantity: {quantity:.4f}, bet_amount: ${bet_amount:.2f}, cash_available: ${cash_available:.2f}, cash_invested: ${cash_invested:.2f}")
+            logger.debug(
+                f"{symbol.ticker} LONG ENTRY @ {price} on {timestamp}, quantity: {quantity:.4f}, "
+                f"bet_total: ${bet_amount:.2f} (strategy ${bet_strategy:.2f}, hedge ${bet_hedge:.2f}), "
+                f"cash_available: ${cash_available:.2f}, cash_invested: ${cash_invested:.2f}"
+            )
         
         elif signal == 'sell' and position is None:
             # Open short position
             bet_amount = float(equity * bet_size_pct)
-            quantity = float(bet_amount / price)
+            w_s, w_h = self._hedge_weights_at(timestamp)
+            bet_strategy = float(bet_amount * w_s)
+            bet_hedge = float(bet_amount * w_h)
+            quantity = float(bet_strategy / price) if price > 0 else 0.0
             
             # Ensure bet_amount and quantity are positive (safety check)
             if bet_amount <= 0 or quantity <= 0:
@@ -847,17 +910,29 @@ class BacktestExecutor:
                 'entry_timestamp': timestamp,
                 'quantity': quantity,
                 'bet_amount': bet_amount,
+                'bet_strategy': bet_strategy,
+                'bet_hedge': bet_hedge,
                 'cash_invested': bet_amount  # Track cash invested in this position
             }
-            logger.debug(f"{symbol.ticker} SHORT ENTRY @ {price} on {timestamp}, quantity: {quantity:.4f}, bet_amount: ${bet_amount:.2f}, cash_available: ${cash_available:.2f}, cash_invested: ${cash_invested:.2f}")
+            logger.debug(
+                f"{symbol.ticker} SHORT ENTRY @ {price} on {timestamp}, quantity: {quantity:.4f}, "
+                f"bet_total: ${bet_amount:.2f} (strategy ${bet_strategy:.2f}, hedge ${bet_hedge:.2f}), "
+                f"cash_available: ${cash_available:.2f}, cash_invested: ${cash_invested:.2f}"
+            )
         
         elif signal == 'sell' and position is not None and position['type'] == 'buy':
             # Close long position (EXIT)
             exit_price = float(price)
             bet_amount = float(position.get('bet_amount', position['entry_price'] * position['quantity']))
             cash_invested_in_position = float(position.get('cash_invested', bet_amount))
-            pnl = float((exit_price - position['entry_price']) * position['quantity'])
-            pnl_percentage = float(((exit_price - position['entry_price']) / position['entry_price']) * 100)
+            bet_strategy = float(position.get('bet_strategy', bet_amount))
+            bet_hedge = float(position.get('bet_hedge', 0.0))
+            strategy_pnl = float((exit_price - position['entry_price']) * position['quantity'])
+            h_factor = self._hedge_overlay_compound_factor(position['entry_timestamp'], timestamp)
+            hedge_proceeds = float(bet_hedge * h_factor)
+            hedge_pnl = float(hedge_proceeds - bet_hedge)
+            pnl = float(strategy_pnl + hedge_pnl)
+            pnl_percentage = float((pnl / bet_amount * 100) if bet_amount > 1e-12 else 0.0)
             
             # Calculate maximum drawdown for this trade
             max_drawdown = self._calculate_trade_drawdown(
@@ -883,6 +958,11 @@ class BacktestExecutor:
                 'max_drawdown': float(max_drawdown) if max_drawdown is not None else None,
                 'metadata': {
                     'bet_amount': float(bet_amount),
+                    'bet_strategy': bet_strategy,
+                    'bet_hedge': bet_hedge,
+                    'strategy_pnl': strategy_pnl,
+                    'hedge_pnl': hedge_pnl,
+                    'hedge_proceeds': hedge_proceeds,
                     'action_type': 'long_exit',  # This trade represents closing a long position
                     'position_type': 'long',  # The position type that was closed
                     'entry_action': 'long_entry',  # When this position was opened (entry)
@@ -891,9 +971,8 @@ class BacktestExecutor:
             }
             self.trades.append(trade)
             
-            # Calculate return: cash_invested_in_position + pnl
-            # If return < 0, set to 0 (position blew up - all money lost)
-            return_amount = float(cash_invested_in_position + pnl)
+            # Return strategy leg + hedge sleeve (hedge compounding applied through exit day)
+            return_amount = float(bet_strategy + strategy_pnl + hedge_proceeds)
             if return_amount < 0:
                 return_amount = 0.0
             
@@ -902,15 +981,25 @@ class BacktestExecutor:
             cash_invested = float(cash_invested - cash_invested_in_position)
             
             position = None
-            logger.debug(f"{symbol.ticker} LONG EXIT @ {exit_price} on {timestamp}, PnL: {pnl:.2f}, return: ${return_amount:.2f}, cash_available: ${cash_available:.2f}, cash_invested: ${cash_invested:.2f}")
+            logger.debug(
+                f"{symbol.ticker} LONG EXIT @ {exit_price} on {timestamp}, total PnL: {pnl:.2f} "
+                f"(strat {strategy_pnl:.2f}, hedge {hedge_pnl:.2f}), return: ${return_amount:.2f}, "
+                f"cash_available: ${cash_available:.2f}, cash_invested: ${cash_invested:.2f}"
+            )
         
         elif signal == 'buy' and position is not None and position['type'] == 'sell':
             # Close short position (EXIT)
             exit_price = float(price)
             bet_amount = float(position.get('bet_amount', position['entry_price'] * position['quantity']))
             cash_invested_in_position = float(position.get('cash_invested', bet_amount))
-            pnl = float((position['entry_price'] - exit_price) * position['quantity'])
-            pnl_percentage = float(((position['entry_price'] - exit_price) / position['entry_price']) * 100)
+            bet_strategy = float(position.get('bet_strategy', bet_amount))
+            bet_hedge = float(position.get('bet_hedge', 0.0))
+            strategy_pnl = float((position['entry_price'] - exit_price) * position['quantity'])
+            h_factor = self._hedge_overlay_compound_factor(position['entry_timestamp'], timestamp)
+            hedge_proceeds = float(bet_hedge * h_factor)
+            hedge_pnl = float(hedge_proceeds - bet_hedge)
+            pnl = float(strategy_pnl + hedge_pnl)
+            pnl_percentage = float((pnl / bet_amount * 100) if bet_amount > 1e-12 else 0.0)
             
             # Calculate maximum drawdown for this trade
             max_drawdown = self._calculate_trade_drawdown(
@@ -936,6 +1025,11 @@ class BacktestExecutor:
                 'max_drawdown': float(max_drawdown) if max_drawdown is not None else None,
                 'metadata': {
                     'bet_amount': float(bet_amount),
+                    'bet_strategy': bet_strategy,
+                    'bet_hedge': bet_hedge,
+                    'strategy_pnl': strategy_pnl,
+                    'hedge_pnl': hedge_pnl,
+                    'hedge_proceeds': hedge_proceeds,
                     'action_type': 'short_exit',  # This trade represents closing a short position
                     'position_type': 'short',  # The position type that was closed
                     'entry_action': 'short_entry',  # When this position was opened (entry)
@@ -944,9 +1038,7 @@ class BacktestExecutor:
             }
             self.trades.append(trade)
             
-            # Calculate return: cash_invested_in_position + pnl
-            # If return < 0, set to 0 (position blew up - all money lost)
-            return_amount = float(cash_invested_in_position + pnl)
+            return_amount = float(bet_strategy + strategy_pnl + hedge_proceeds)
             if return_amount < 0:
                 return_amount = 0.0
             
@@ -955,7 +1047,11 @@ class BacktestExecutor:
             cash_invested = float(cash_invested - cash_invested_in_position)
             
             position = None
-            logger.debug(f"{symbol.ticker} SHORT EXIT @ {exit_price} on {timestamp}, PnL: {pnl:.2f}, return: ${return_amount:.2f}, cash_available: ${cash_available:.2f}, cash_invested: ${cash_invested:.2f}")
+            logger.debug(
+                f"{symbol.ticker} SHORT EXIT @ {exit_price} on {timestamp}, total PnL: {pnl:.2f} "
+                f"(strat {strategy_pnl:.2f}, hedge {hedge_pnl:.2f}), return: ${return_amount:.2f}, "
+                f"cash_available: ${cash_available:.2f}, cash_invested: ${cash_invested:.2f}"
+            )
         
         # Update equity curve: equity = cash_available + cash_invested
         # Note: cash_invested already includes all open positions, so we don't need to mark-to-market
@@ -972,7 +1068,14 @@ class BacktestExecutor:
             exit_price = final_price
             bet_amount = float(position.get('bet_amount', position['entry_price'] * position['quantity']))
             cash_invested_in_position = float(position.get('cash_invested', bet_amount))
-            pnl = float((exit_price - position['entry_price']) * position['quantity'])
+            bet_strategy = float(position.get('bet_strategy', bet_amount))
+            bet_hedge = float(position.get('bet_hedge', 0.0))
+            strategy_pnl = float((exit_price - position['entry_price']) * position['quantity'])
+            h_factor = self._hedge_overlay_compound_factor(position['entry_timestamp'], final_timestamp)
+            hedge_proceeds = float(bet_hedge * h_factor)
+            hedge_pnl = float(hedge_proceeds - bet_hedge)
+            pnl = float(strategy_pnl + hedge_pnl)
+            pnl_pct = float((pnl / bet_amount * 100) if bet_amount > 1e-12 else 0.0)
             
             # Record trade (completed long position closed at end of backtest)
             trade = {
@@ -984,21 +1087,24 @@ class BacktestExecutor:
                 'exit_timestamp': final_timestamp,
                 'quantity': float(position['quantity']),
                 'pnl': pnl,
-                'pnl_percentage': float(((exit_price - position['entry_price']) / position['entry_price']) * 100),
+                'pnl_percentage': pnl_pct,
                 'is_winner': pnl > 0,
                 'max_drawdown': None,
                 'metadata': {
                     'closed_at_end': True,
                     'bet_amount': float(bet_amount),
+                    'bet_strategy': bet_strategy,
+                    'bet_hedge': bet_hedge,
+                    'strategy_pnl': strategy_pnl,
+                    'hedge_pnl': hedge_pnl,
+                    'hedge_proceeds': hedge_proceeds,
                     'action_type': 'long_exit',  # Clear: this is exiting a long position
                     'position_type': 'long'  # The position type that was closed
                 }
             }
             self.trades.append(trade)
             
-            # Calculate return: cash_invested_in_position + pnl
-            # If return < 0, set to 0 (position blew up - all money lost)
-            return_amount = float(cash_invested_in_position + pnl)
+            return_amount = float(bet_strategy + strategy_pnl + hedge_proceeds)
             if return_amount < 0:
                 return_amount = 0.0
             
@@ -1006,13 +1112,23 @@ class BacktestExecutor:
             cash_available = float(cash_available + return_amount)
             cash_invested = float(cash_invested - cash_invested_in_position)
             
-            logger.debug(f"{symbol.ticker} LONG POSITION CLOSED AT END @ {exit_price}, PnL: {pnl:.2f}, return: ${return_amount:.2f}, cash_available: ${cash_available:.2f}, cash_invested: ${cash_invested:.2f}")
+            logger.debug(
+                f"{symbol.ticker} LONG POSITION CLOSED AT END @ {exit_price}, total PnL: {pnl:.2f}, "
+                f"return: ${return_amount:.2f}, cash_available: ${cash_available:.2f}, cash_invested: ${cash_invested:.2f}"
+            )
         else:
             # Close short position (EXIT)
             exit_price = final_price
             bet_amount = float(position.get('bet_amount', position['entry_price'] * position['quantity']))
             cash_invested_in_position = float(position.get('cash_invested', bet_amount))
-            pnl = float((position['entry_price'] - exit_price) * position['quantity'])
+            bet_strategy = float(position.get('bet_strategy', bet_amount))
+            bet_hedge = float(position.get('bet_hedge', 0.0))
+            strategy_pnl = float((position['entry_price'] - exit_price) * position['quantity'])
+            h_factor = self._hedge_overlay_compound_factor(position['entry_timestamp'], final_timestamp)
+            hedge_proceeds = float(bet_hedge * h_factor)
+            hedge_pnl = float(hedge_proceeds - bet_hedge)
+            pnl = float(strategy_pnl + hedge_pnl)
+            pnl_pct = float((pnl / bet_amount * 100) if bet_amount > 1e-12 else 0.0)
             
             # Record trade (completed short position closed at end of backtest)
             trade = {
@@ -1024,21 +1140,24 @@ class BacktestExecutor:
                 'exit_timestamp': final_timestamp,
                 'quantity': float(position['quantity']),
                 'pnl': pnl,
-                'pnl_percentage': float(((position['entry_price'] - exit_price) / position['entry_price']) * 100),
+                'pnl_percentage': pnl_pct,
                 'is_winner': pnl > 0,
                 'max_drawdown': None,
                 'metadata': {
                     'closed_at_end': True,
                     'bet_amount': float(bet_amount),
+                    'bet_strategy': bet_strategy,
+                    'bet_hedge': bet_hedge,
+                    'strategy_pnl': strategy_pnl,
+                    'hedge_pnl': hedge_pnl,
+                    'hedge_proceeds': hedge_proceeds,
                     'action_type': 'short_exit',  # Clear: this is exiting a short position
                     'position_type': 'short'  # The position type that was closed
                 }
             }
             self.trades.append(trade)
             
-            # Calculate return: cash_invested_in_position + pnl
-            # If return < 0, set to 0 (position blew up - all money lost)
-            return_amount = float(cash_invested_in_position + pnl)
+            return_amount = float(bet_strategy + strategy_pnl + hedge_proceeds)
             if return_amount < 0:
                 return_amount = 0.0
             
@@ -1046,7 +1165,10 @@ class BacktestExecutor:
             cash_available = float(cash_available + return_amount)
             cash_invested = float(cash_invested - cash_invested_in_position)
             
-            logger.debug(f"{symbol.ticker} SHORT POSITION CLOSED AT END @ {exit_price}, PnL: {pnl:.2f}, return: ${return_amount:.2f}, cash_available: ${cash_available:.2f}, cash_invested: ${cash_invested:.2f}")
+            logger.debug(
+                f"{symbol.ticker} SHORT POSITION CLOSED AT END @ {exit_price}, total PnL: {pnl:.2f}, "
+                f"return: ${return_amount:.2f}, cash_available: ${cash_available:.2f}, cash_invested: ${cash_invested:.2f}"
+            )
         
         return cash_available, cash_invested
     

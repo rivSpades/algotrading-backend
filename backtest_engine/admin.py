@@ -3,7 +3,7 @@ Admin configuration for backtest_engine app
 """
 
 from django.contrib import admin
-from .models import Backtest, Trade, BacktestStatistics
+from .models import Backtest, Trade, BacktestStatistics, HedgeLabSettings
 
 
 @admin.register(Backtest)
@@ -18,7 +18,16 @@ class BacktestAdmin(admin.ModelAdmin):
             'fields': ('name', 'strategy', 'strategy_assignment', 'symbols')
         }),
         ('Backtest Configuration', {
-            'fields': ('start_date', 'end_date', 'split_ratio', 'initial_capital', 'bet_size_percentage', 'strategy_parameters')
+            'fields': (
+                'start_date',
+                'end_date',
+                'split_ratio',
+                'initial_capital',
+                'bet_size_percentage',
+                'strategy_parameters',
+                'hedge_enabled',
+                'hedge_config',
+            )
         }),
         ('Status', {
             'fields': ('status', 'error_message')
@@ -29,6 +38,12 @@ class BacktestAdmin(admin.ModelAdmin):
         }),
     )
     date_hierarchy = 'created_at'
+
+
+@admin.register(HedgeLabSettings)
+class HedgeLabSettingsAdmin(admin.ModelAdmin):
+    list_display = ['singleton_key', 'updated_at']
+    readonly_fields = ['singleton_key', 'updated_at']
 
 
 @admin.register(Trade)

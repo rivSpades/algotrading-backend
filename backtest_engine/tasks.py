@@ -8,6 +8,7 @@ from django.db import connections
 from .models import Backtest, Trade, BacktestStatistics
 from .services.backtest_executor import BacktestExecutor
 from .services.sp500_benchmark import compute_sp500_buy_hold_curve
+from .services.hybrid_vix_hedge import compute_trade_hedge_overlay
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import threading
@@ -46,6 +47,22 @@ def _trade_pnl_from_stored_prices(trade_type: str, entry_price, exit_price, quan
     q8 = Decimal('0.00000001')
     q4 = Decimal('0.0001')
     return float(pnl_d.quantize(q8)), float(pct_d.quantize(q4))
+
+
+def _preprocessed_test_window_bounds(preprocessed_data):
+    """Min/max timestamps across all symbols' test_df (for hedge overlay range)."""
+    mn_dt, mx_dt = None, None
+    for _sym, pack in (preprocessed_data or {}).items():
+        td = pack.get('test_df')
+        if td is None or len(td) == 0:
+            continue
+        t0 = td.iloc[0]['timestamp']
+        t1 = td.iloc[-1]['timestamp']
+        if mn_dt is None or pd.Timestamp(t0) < pd.Timestamp(mn_dt):
+            mn_dt = t0
+        if mx_dt is None or pd.Timestamp(t1) > pd.Timestamp(mx_dt):
+            mx_dt = t1
+    return mn_dt, mx_dt
 
 
 @shared_task(bind=True, name='backtest_engine.run_backtest', time_limit=48 * 60 * 60, soft_time_limit=48 * 60 * 60)
@@ -377,6 +394,30 @@ def run_backtest_task(self, backtest_id):
             state='PROGRESS',
             meta={'progress': 18, 'message': f'Pre-processed {len(preprocessed_data)} symbols'}
         )
+
+        hedge_overlay = None
+        if getattr(backtest, 'hedge_enabled', False) and preprocessed_data:
+            mn_ts, mx_ts = _preprocessed_test_window_bounds(preprocessed_data)
+            if mn_ts is not None and mx_ts is not None:
+                raw_overlay = compute_trade_hedge_overlay(
+                    mn_ts,
+                    mx_ts,
+                    backtest.hedge_config or {},
+                    yahoo_only=False,
+                )
+                if raw_overlay and not raw_overlay.get('error') and raw_overlay.get('index_ns'):
+                    hedge_overlay = raw_overlay
+                    logger.info(
+                        'Built integrated hedge overlay: %s trading days (data_source=%s)',
+                        len(hedge_overlay['index_ns']),
+                        hedge_overlay.get('data_source', 'unknown'),
+                    )
+                else:
+                    logger.warning(
+                        'Backtest %s: hedge_enabled but overlay unavailable (%s); running without hedge split',
+                        backtest_id,
+                        raw_overlay.get('error') if raw_overlay else 'no overlay',
+                    )
         
         # Phase 2: Execute strategy twice: LONG and SHORT in parallel
         # Each mode uses the pre-processed data from Phase 1
@@ -387,9 +428,13 @@ def run_backtest_task(self, backtest_id):
         
         all_trades_by_mode = {}
         all_statistics = {}
+        all_baseline_portfolio_by_mode = {}
         
         def execute_position_mode(position_mode):
             """Execute strategy for a single position mode (thread-safe helper)
+            
+            When hedge_overlay is set, runs twice: baseline (no hedge split) then hedged.
+            Trades persisted are from the hedged run only.
             
             Note: Cannot call self.update_state() from within threads.
             State updates must be done from the main task thread.
@@ -397,14 +442,35 @@ def run_backtest_task(self, backtest_id):
             try:
                 logger.info(f"[{position_mode.upper()}] Starting strategy execution (Phase 2)")
                 
-                # Create a new executor instance for this mode with pre-processed data
-                mode_executor = BacktestExecutor(backtest, position_mode=position_mode, preprocessed_data=preprocessed_data)
+                baseline_portfolio = None
+                if hedge_overlay:
+                    logger.info(f"[{position_mode.upper()}] Baseline run (strategy only, no hedge split)...")
+                    ex_base = BacktestExecutor(
+                        backtest,
+                        position_mode=position_mode,
+                        preprocessed_data=preprocessed_data,
+                        hedge_overlay=None,
+                    )
+                    ex_base.execute_strategy()
+                    stats_base = ex_base.calculate_statistics()
+                    baseline_portfolio = stats_base.get(None) or {}
+                    logger.info(
+                        f"[{position_mode.upper()}] Baseline: {len(ex_base.trades)} trades, "
+                        f"portfolio trades={baseline_portfolio.get('total_trades', 0)}"
+                    )
                 
-                # Execute strategy for this mode (data/indicators loaded on-demand)
-                logger.info(f"[{position_mode.upper()}] Executing strategy logic...")
+                mode_executor = BacktestExecutor(
+                    backtest,
+                    position_mode=position_mode,
+                    preprocessed_data=preprocessed_data,
+                    hedge_overlay=hedge_overlay,
+                )
+                
+                logger.info(
+                    f"[{position_mode.upper()}] Executing strategy logic ({'with hedge split' if hedge_overlay else 'no hedge'})..."
+                )
                 mode_executor.execute_strategy()
                 
-                # Log trade counts for debugging
                 buy_trades = [t for t in mode_executor.trades if t.get('trade_type') == 'buy']
                 sell_trades = [t for t in mode_executor.trades if t.get('trade_type') == 'sell']
                 logger.info(f"[{position_mode.upper()}] Generated {len(mode_executor.trades)} trades: {len(buy_trades)} buy, {len(sell_trades)} sell")
@@ -412,13 +478,12 @@ def run_backtest_task(self, backtest_id):
                 if not mode_executor.trades:
                     logger.warning(f"[{position_mode.upper()}] No trades generated for backtest {backtest_id}")
                 
-                # Calculate statistics for this mode
                 logger.info(f"[{position_mode.upper()}] Calculating statistics...")
                 mode_stats = mode_executor.calculate_statistics()
                 
                 logger.info(f"[{position_mode.upper()}] Completed strategy execution")
                 
-                return position_mode, mode_executor.trades, mode_stats
+                return position_mode, mode_executor.trades, mode_stats, baseline_portfolio
             except Exception as e:
                 logger.error(f"[{position_mode.upper()}] Error executing strategy: {str(e)}")
                 # Close database connection in this thread
@@ -447,10 +512,12 @@ def run_backtest_task(self, backtest_id):
             for future in as_completed(future_to_mode):
                 position_mode = future_to_mode[future]
                 try:
-                    mode_result, trades, stats = future.result()
+                    mode_result, trades, stats, baseline_pf = future.result()
                     with results_lock:
                         all_trades_by_mode[mode_result] = trades
                         mode_stats_results[mode_result] = stats
+                        if baseline_pf:
+                            all_baseline_portfolio_by_mode[mode_result] = baseline_pf
                     completed_count += 1
                     
                     # Update progress from main thread (20% to 70% for execution)
@@ -655,14 +722,19 @@ def run_backtest_task(self, backtest_id):
                 exit_price = convert_value(trade_data.get('exit_price'), 'exit_price')
                 quantity = convert_value(trade_data['quantity'], 'quantity')
                 trade_type = trade_data['trade_type']
-                # Derive PnL from stored prices × qty so DB rows match (exit - entry) * qty (long) / (entry - exit) * qty (short)
-                if exit_price is not None and entry_price is not None and quantity is not None:
+                # Integrated hedge: executor sets strategy_pnl + hedge_pnl on exit metadata; keep stored pnl consistent
+                if (
+                    exit_price is not None
+                    and entry_price is not None
+                    and quantity is not None
+                    and trade_metadata.get('strategy_pnl') is None
+                ):
                     pnl, pnl_percentage = _trade_pnl_from_stored_prices(trade_type, entry_price, exit_price, quantity)
                     is_winner = pnl > 0
                 else:
                     pnl = convert_value(trade_data.get('pnl'), 'pnl')
                     pnl_percentage = convert_value(trade_data.get('pnl_percentage'), 'pnl_percentage')
-                    is_winner = trade_data.get('is_winner')
+                    is_winner = (pnl > 0) if pnl is not None else trade_data.get('is_winner')
                 
                 Trade.objects.create(
                     backtest=backtest,
@@ -804,18 +876,48 @@ def run_backtest_task(self, backtest_id):
                             'source': 'none',
                         }
                 
+                extra_stats = {
+                    'long': {
+                        'skipped_trades_count': skipped_trades_count,
+                    },
+                    'short': stats.get('short', {}),
+                }
+                if benchmark_block:
+                    extra_stats['benchmark'] = benchmark_block
+
+                strategy_only_payload = {}
+                for pm in ('long', 'short'):
+                    b = all_baseline_portfolio_by_mode.get(pm) or {}
+                    if not b:
+                        continue
+                    strategy_only_payload[pm] = {
+                        'equity_curve': b.get('equity_curve') or [],
+                        'total_trades': b.get('total_trades', 0),
+                        'winning_trades': b.get('winning_trades', 0),
+                        'losing_trades': b.get('losing_trades', 0),
+                        'win_rate': b.get('win_rate', 0),
+                        'total_pnl': b.get('total_pnl', 0),
+                        'total_pnl_percentage': b.get('total_pnl_percentage', 0),
+                        'average_pnl': b.get('average_pnl', 0),
+                        'average_winner': b.get('average_winner', 0),
+                        'average_loser': b.get('average_loser', 0),
+                        'profit_factor': b.get('profit_factor', 0),
+                        'max_drawdown': b.get('max_drawdown', 0),
+                        'max_drawdown_duration': b.get('max_drawdown_duration', 0),
+                        'sharpe_ratio': b.get('sharpe_ratio', 0),
+                        'cagr': b.get('cagr', 0),
+                        'total_return': b.get('total_return', 0),
+                        'skipped_trades_count': b.get('skipped_trades_count', 0),
+                    }
+                if strategy_only_payload:
+                    extra_stats['strategy_only'] = strategy_only_payload
+                
                 BacktestStatistics.objects.create(
                     backtest=backtest,
                     symbol=None,
                     **stats_dict,
                     equity_curve=portfolio_long.get('equity_curve', []),
-                    additional_stats={
-                        'long': {
-                            'skipped_trades_count': skipped_trades_count,
-                        },
-                        'short': stats.get('short', {}),
-                        **({'benchmark': benchmark_block} if benchmark_block else {}),
-                    }
+                    additional_stats=extra_stats,
                 )
             else:
                 # Symbol-specific stats: main row = long mode; short in additional_stats

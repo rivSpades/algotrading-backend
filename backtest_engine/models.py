@@ -61,6 +61,15 @@ class Backtest(models.Model):
         blank=True,
         help_text="Strategy parameters used for this backtest"
     )
+    hedge_enabled = models.BooleanField(
+        default=False,
+        help_text="If true, split each trade's bet between the strategy and hybrid VIX sleeve (VIXM/VIXY)",
+    )
+    hedge_config = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Hybrid VIX hedge parameters (z_threshold, vix_floor, weights, windows); defaults apply when empty",
+    )
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
     error_message = models.TextField(blank=True, help_text="Error message if backtest failed")
     created_at = models.DateTimeField(auto_now_add=True)
@@ -82,6 +91,44 @@ class Backtest(models.Model):
         if self.symbols.count() > 3:
             symbols_str += f" (+{self.symbols.count() - 3} more)"
         return f"{self.strategy.name} - {symbols_str} ({self.status})"
+
+
+class HedgeLabSettings(models.Model):
+    """
+    Singleton row: saved hybrid VIX hedge parameters from the Hedge lab UI.
+    Merged under per-backtest hedge_config when creating a backtest with hedge enabled.
+    """
+
+    SINGLETON_KEY = "default"
+
+    singleton_key = models.CharField(
+        max_length=32,
+        primary_key=True,
+        default=SINGLETON_KEY,
+        editable=False,
+        help_text="Single row key; always use HedgeLabSettings.SINGLETON_KEY",
+    )
+    hedge_config = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Partial or full hedge parameter overrides (z_threshold, vix_floor, weights, windows)",
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Hedge lab settings"
+        verbose_name_plural = "Hedge lab settings"
+
+    def __str__(self):
+        return "Hedge lab settings"
+
+    @classmethod
+    def get_solo(cls):
+        row, _ = cls.objects.get_or_create(
+            singleton_key=cls.SINGLETON_KEY,
+            defaults={"hedge_config": {}},
+        )
+        return row
 
 
 class Trade(models.Model):
