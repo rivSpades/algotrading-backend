@@ -65,6 +65,31 @@ def _preprocessed_test_window_bounds(preprocessed_data):
     return mn_dt, mx_dt
 
 
+def _strategy_only_snapshot_from_stats(b):
+    """Build additional_stats.strategy_only[mode] payload from portfolio or symbol stats dict (baseline run)."""
+    if not b:
+        return None
+    return {
+        'equity_curve': b.get('equity_curve') or [],
+        'total_trades': b.get('total_trades', 0),
+        'winning_trades': b.get('winning_trades', 0),
+        'losing_trades': b.get('losing_trades', 0),
+        'win_rate': b.get('win_rate', 0),
+        'total_pnl': b.get('total_pnl', 0),
+        'total_pnl_percentage': b.get('total_pnl_percentage', 0),
+        'average_pnl': b.get('average_pnl', 0),
+        'average_winner': b.get('average_winner', 0),
+        'average_loser': b.get('average_loser', 0),
+        'profit_factor': b.get('profit_factor', 0),
+        'max_drawdown': b.get('max_drawdown', 0),
+        'max_drawdown_duration': b.get('max_drawdown_duration', 0),
+        'sharpe_ratio': b.get('sharpe_ratio', 0),
+        'cagr': b.get('cagr', 0),
+        'total_return': b.get('total_return', 0),
+        'skipped_trades_count': b.get('skipped_trades_count', 0),
+    }
+
+
 @shared_task(bind=True, name='backtest_engine.run_backtest', time_limit=48 * 60 * 60, soft_time_limit=48 * 60 * 60)
 def run_backtest_task(self, backtest_id):
     """
@@ -428,7 +453,7 @@ def run_backtest_task(self, backtest_id):
         
         all_trades_by_mode = {}
         all_statistics = {}
-        all_baseline_portfolio_by_mode = {}
+        all_baseline_stats_by_mode = {}
         
         def execute_position_mode(position_mode):
             """Execute strategy for a single position mode (thread-safe helper)
@@ -442,7 +467,7 @@ def run_backtest_task(self, backtest_id):
             try:
                 logger.info(f"[{position_mode.upper()}] Starting strategy execution (Phase 2)")
                 
-                baseline_portfolio = None
+                baseline_full_stats = None
                 if hedge_overlay:
                     logger.info(f"[{position_mode.upper()}] Baseline run (strategy only, no hedge split)...")
                     ex_base = BacktestExecutor(
@@ -453,10 +478,11 @@ def run_backtest_task(self, backtest_id):
                     )
                     ex_base.execute_strategy()
                     stats_base = ex_base.calculate_statistics()
-                    baseline_portfolio = stats_base.get(None) or {}
+                    baseline_full_stats = stats_base
+                    bp = stats_base.get(None) or {}
                     logger.info(
                         f"[{position_mode.upper()}] Baseline: {len(ex_base.trades)} trades, "
-                        f"portfolio trades={baseline_portfolio.get('total_trades', 0)}"
+                        f"portfolio trades={bp.get('total_trades', 0)}"
                     )
                 
                 mode_executor = BacktestExecutor(
@@ -483,7 +509,7 @@ def run_backtest_task(self, backtest_id):
                 
                 logger.info(f"[{position_mode.upper()}] Completed strategy execution")
                 
-                return position_mode, mode_executor.trades, mode_stats, baseline_portfolio
+                return position_mode, mode_executor.trades, mode_stats, baseline_full_stats
             except Exception as e:
                 logger.error(f"[{position_mode.upper()}] Error executing strategy: {str(e)}")
                 # Close database connection in this thread
@@ -512,12 +538,12 @@ def run_backtest_task(self, backtest_id):
             for future in as_completed(future_to_mode):
                 position_mode = future_to_mode[future]
                 try:
-                    mode_result, trades, stats, baseline_pf = future.result()
+                    mode_result, trades, stats, baseline_full = future.result()
                     with results_lock:
                         all_trades_by_mode[mode_result] = trades
                         mode_stats_results[mode_result] = stats
-                        if baseline_pf:
-                            all_baseline_portfolio_by_mode[mode_result] = baseline_pf
+                        if baseline_full:
+                            all_baseline_stats_by_mode[mode_result] = baseline_full
                     completed_count += 1
                     
                     # Update progress from main thread (20% to 70% for execution)
@@ -887,28 +913,13 @@ def run_backtest_task(self, backtest_id):
 
                 strategy_only_payload = {}
                 for pm in ('long', 'short'):
-                    b = all_baseline_portfolio_by_mode.get(pm) or {}
+                    bfull = all_baseline_stats_by_mode.get(pm) or {}
+                    b = bfull.get(None) or {}
                     if not b:
                         continue
-                    strategy_only_payload[pm] = {
-                        'equity_curve': b.get('equity_curve') or [],
-                        'total_trades': b.get('total_trades', 0),
-                        'winning_trades': b.get('winning_trades', 0),
-                        'losing_trades': b.get('losing_trades', 0),
-                        'win_rate': b.get('win_rate', 0),
-                        'total_pnl': b.get('total_pnl', 0),
-                        'total_pnl_percentage': b.get('total_pnl_percentage', 0),
-                        'average_pnl': b.get('average_pnl', 0),
-                        'average_winner': b.get('average_winner', 0),
-                        'average_loser': b.get('average_loser', 0),
-                        'profit_factor': b.get('profit_factor', 0),
-                        'max_drawdown': b.get('max_drawdown', 0),
-                        'max_drawdown_duration': b.get('max_drawdown_duration', 0),
-                        'sharpe_ratio': b.get('sharpe_ratio', 0),
-                        'cagr': b.get('cagr', 0),
-                        'total_return': b.get('total_return', 0),
-                        'skipped_trades_count': b.get('skipped_trades_count', 0),
-                    }
+                    snap = _strategy_only_snapshot_from_stats(b)
+                    if snap:
+                        strategy_only_payload[pm] = snap
                 if strategy_only_payload:
                     extra_stats['strategy_only'] = strategy_only_payload
                 
@@ -961,21 +972,33 @@ def run_backtest_task(self, backtest_id):
                 
                 skipped_trades_count = symbol_long.get('skipped_trades_count', 0) if symbol_long else 0
                 
+                sym_additional = {
+                    'long': {
+                        'independent_bet_amounts': independent_bet_amounts_long,
+                        'skipped_trades_count': skipped_trades_count,
+                    },
+                    'short': {
+                        **{k: v for k, v in stats.get('short', {}).items() if k not in ['equity_curve', 'independent_bet_amounts', 'skipped_trades_count']},
+                        'equity_curve': equity_curve_short,
+                        'independent_bet_amounts': independent_bet_amounts_short,
+                    },
+                }
+                strategy_only_sym = {}
+                for pm in ('long', 'short'):
+                    bfull = all_baseline_stats_by_mode.get(pm) or {}
+                    sym_b = bfull.get(symbol)
+                    if sym_b:
+                        snap = _strategy_only_snapshot_from_stats(sym_b)
+                        if snap:
+                            strategy_only_sym[pm] = snap
+                if strategy_only_sym:
+                    sym_additional['strategy_only'] = strategy_only_sym
+                
                 BacktestStatistics.objects.create(
                     backtest=backtest,
                     symbol=symbol,
                     equity_curve=equity_curve_long_main,
-                    additional_stats={
-                        'long': {
-                            'independent_bet_amounts': independent_bet_amounts_long,
-                            'skipped_trades_count': skipped_trades_count,
-                        },
-                        'short': {
-                            **{k: v for k, v in stats.get('short', {}).items() if k not in ['equity_curve', 'independent_bet_amounts', 'skipped_trades_count']},
-                            'equity_curve': equity_curve_short,
-                            'independent_bet_amounts': independent_bet_amounts_short,
-                        },
-                    },
+                    additional_stats=sym_additional,
                     **stats_to_save
                 )
         

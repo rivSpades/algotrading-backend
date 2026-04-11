@@ -142,9 +142,7 @@ class BacktestStatisticsSerializer(serializers.ModelSerializer):
         return None
 
     def _strategy_only_bundle(self, obj, mode_key: str) -> dict:
-        """Baseline portfolio (no hedge split) for comparison when hedge_enabled backtest ran dual execution."""
-        if obj.symbol is not None:
-            return {'x': [], 'y': [], 'metrics': {}}
+        """Baseline (no hedge split) for portfolio or per-symbol rows when dual execution ran."""
         extra = obj.additional_stats if isinstance(obj.additional_stats, dict) else {}
         so_root = extra.get('strategy_only') or {}
         if not isinstance(so_root, dict):
