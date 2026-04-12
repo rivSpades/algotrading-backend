@@ -5,6 +5,7 @@ Serializers for Backtest Engine models
 from decimal import Decimal
 from rest_framework import serializers
 from .models import Backtest, Trade, BacktestStatistics
+from .position_modes import normalize_position_modes
 from strategies.serializers import StrategyDefinitionSerializer
 from market_data.serializers import SymbolListSerializer
 
@@ -192,7 +193,7 @@ class BacktestStatisticsSerializer(serializers.ModelSerializer):
         return {'x': x, 'y': y, 'metrics': metrics}
     
     def get_stats_by_mode(self, obj):
-        """Return statistics organized by mode (LONG, SHORT). Main model row stores long-mode metrics."""
+        """Return statistics by long/short. Main DB row holds primary mode (long when both ran; short when short-only)."""
         # Helper function to extract equity curve arrays
         def extract_equity_curve_arrays(equity_curve_data):
             """Extract X and Y arrays from equity curve data"""
@@ -201,18 +202,12 @@ class BacktestStatisticsSerializer(serializers.ModelSerializer):
             x = [point.get('timestamp') for point in equity_curve_data if isinstance(point, dict)]
             y = [float(point.get('equity', 0)) for point in equity_curve_data if isinstance(point, dict)]
             return {'x': x, 'y': y}
-        
-        long_equity_curve = extract_equity_curve_arrays(obj.equity_curve)
-        bench_x = self.get_benchmark_equity_curve_x(obj)
-        bench_y = self.get_benchmark_equity_curve_y(obj)
-        hedge_x = self.get_hedge_equity_curve_x(obj)
-        hedge_y = self.get_hedge_equity_curve_y(obj)
-        hedge_m = self.get_hedge_metrics(obj)
-        hedge_err = self.get_hedge_error(obj)
-        so_long = self._strategy_only_bundle(obj, 'long')
-        
-        result = {
-            'long': {
+
+        def block_from_model(so_bundle_key):
+            """Build one mode block from top-level BacktestStatistics fields (primary row)."""
+            eq = extract_equity_curve_arrays(obj.equity_curve)
+            so = self._strategy_only_bundle(obj, so_bundle_key)
+            return {
                 'total_trades': obj.total_trades,
                 'winning_trades': obj.winning_trades,
                 'losing_trades': obj.losing_trades,
@@ -231,60 +226,84 @@ class BacktestStatisticsSerializer(serializers.ModelSerializer):
                 'cagr': round(float(obj.cagr), 2) if obj.cagr else None,
                 'total_return': round(float(obj.total_return), 2) if obj.total_return else None,
                 'equity_curve': obj.equity_curve or [],
-                'equity_curve_x': long_equity_curve['x'],
-                'equity_curve_y': long_equity_curve['y'],
+                'equity_curve_x': eq['x'],
+                'equity_curve_y': eq['y'],
                 'benchmark_equity_curve_x': bench_x,
                 'benchmark_equity_curve_y': bench_y,
                 'hedge_equity_curve_x': hedge_x,
                 'hedge_equity_curve_y': hedge_y,
                 'hedge_metrics': hedge_m,
                 'hedge_error': hedge_err,
-                'strategy_only_equity_curve_x': so_long['x'],
-                'strategy_only_equity_curve_y': so_long['y'],
-                'strategy_only_metrics': so_long['metrics'],
+                'strategy_only_equity_curve_x': so['x'],
+                'strategy_only_equity_curve_y': so['y'],
+                'strategy_only_metrics': so['metrics'],
             }
+
+        def block_from_nested(nested: dict, so_bundle_key: str):
+            """Build one mode block from additional_stats[nested_key] payload."""
+            if not isinstance(nested, dict):
+                nested = {}
+            eq = extract_equity_curve_arrays(nested.get('equity_curve'))
+            so = self._strategy_only_bundle(obj, so_bundle_key)
+            return {
+                'total_trades': nested.get('total_trades', 0),
+                'winning_trades': nested.get('winning_trades', 0),
+                'losing_trades': nested.get('losing_trades', 0),
+                'win_rate': round(float(nested.get('win_rate', 0)), 2) if nested.get('win_rate') else None,
+                'total_pnl': round(float(nested.get('total_pnl', 0)), 2) if nested.get('total_pnl') is not None else None,
+                'total_pnl_percentage': round(float(nested.get('total_pnl_percentage', 0)), 2) if nested.get('total_pnl_percentage') is not None else None,
+                'average_pnl': round(float(nested.get('average_pnl', 0)), 2) if nested.get('average_pnl') is not None else None,
+                'average_winner': round(float(nested.get('average_winner', 0)), 2) if nested.get('average_winner') is not None else None,
+                'average_loser': round(float(nested.get('average_loser', 0)), 2) if nested.get('average_loser') is not None else None,
+                'profit_factor': round(float(nested.get('profit_factor', 0)), 2) if nested.get('profit_factor') is not None else None,
+                'max_drawdown': round(float(nested.get('max_drawdown', 0)), 2) if nested.get('max_drawdown') is not None else None,
+                'max_drawdown_duration': nested.get('max_drawdown_duration'),
+                'avg_intra_trade_drawdown': round(float(nested.get('avg_intra_trade_drawdown', 0)), 2) if nested.get('avg_intra_trade_drawdown') is not None else None,
+                'worst_intra_trade_drawdown': round(float(nested.get('worst_intra_trade_drawdown', 0)), 2) if nested.get('worst_intra_trade_drawdown') is not None else None,
+                'sharpe_ratio': round(float(nested.get('sharpe_ratio', 0)), 2) if nested.get('sharpe_ratio') is not None else None,
+                'cagr': round(float(nested.get('cagr', 0)), 2) if nested.get('cagr') is not None else None,
+                'total_return': round(float(nested.get('total_return', 0)), 2) if nested.get('total_return') is not None else None,
+                'equity_curve': nested.get('equity_curve', []),
+                'equity_curve_x': eq['x'],
+                'equity_curve_y': eq['y'],
+                'benchmark_equity_curve_x': bench_x,
+                'benchmark_equity_curve_y': bench_y,
+                'hedge_equity_curve_x': hedge_x,
+                'hedge_equity_curve_y': hedge_y,
+                'hedge_metrics': hedge_m,
+                'hedge_error': hedge_err,
+                'strategy_only_equity_curve_x': so['x'],
+                'strategy_only_equity_curve_y': so['y'],
+                'strategy_only_metrics': so['metrics'],
+            }
+
+        bench_x = self.get_benchmark_equity_curve_x(obj)
+        bench_y = self.get_benchmark_equity_curve_y(obj)
+        hedge_x = self.get_hedge_equity_curve_x(obj)
+        hedge_y = self.get_hedge_equity_curve_y(obj)
+        hedge_m = self.get_hedge_metrics(obj)
+        hedge_err = self.get_hedge_error(obj)
+
+        modes = normalize_position_modes(getattr(obj.backtest, 'position_modes', None))
+        has_long = 'long' in modes
+        has_short = 'short' in modes
+
+        extra = obj.additional_stats if isinstance(obj.additional_stats, dict) else {}
+
+        if has_short and not has_long:
+            # Primary row is short only
+            long_nested = extra.get('long') or {}
+            return {
+                'short': block_from_model('short'),
+                'long': block_from_nested(long_nested, 'long'),
+            }
+
+        # Long ran (alone or with short): primary row is long
+        short_nested = extra.get('short') or {}
+        return {
+            'long': block_from_model('long'),
+            'short': block_from_nested(short_nested, 'short'),
         }
-        
-        short_stats = {}
-        if obj.additional_stats and isinstance(obj.additional_stats, dict):
-            short_stats = obj.additional_stats.get('short') or {}
-        if not isinstance(short_stats, dict):
-            short_stats = {}
-        short_equity_curve = extract_equity_curve_arrays(short_stats.get('equity_curve'))
-        so_short = self._strategy_only_bundle(obj, 'short')
-        result['short'] = {
-            'total_trades': short_stats.get('total_trades', 0),
-            'winning_trades': short_stats.get('winning_trades', 0),
-            'losing_trades': short_stats.get('losing_trades', 0),
-            'win_rate': round(float(short_stats.get('win_rate', 0)), 2) if short_stats.get('win_rate') else None,
-            'total_pnl': round(float(short_stats.get('total_pnl', 0)), 2) if short_stats.get('total_pnl') is not None else None,
-            'total_pnl_percentage': round(float(short_stats.get('total_pnl_percentage', 0)), 2) if short_stats.get('total_pnl_percentage') is not None else None,
-            'average_pnl': round(float(short_stats.get('average_pnl', 0)), 2) if short_stats.get('average_pnl') is not None else None,
-            'average_winner': round(float(short_stats.get('average_winner', 0)), 2) if short_stats.get('average_winner') is not None else None,
-            'average_loser': round(float(short_stats.get('average_loser', 0)), 2) if short_stats.get('average_loser') is not None else None,
-            'profit_factor': round(float(short_stats.get('profit_factor', 0)), 2) if short_stats.get('profit_factor') is not None else None,
-            'max_drawdown': round(float(short_stats.get('max_drawdown', 0)), 2) if short_stats.get('max_drawdown') is not None else None,
-            'max_drawdown_duration': short_stats.get('max_drawdown_duration'),
-            'avg_intra_trade_drawdown': round(float(short_stats.get('avg_intra_trade_drawdown', 0)), 2) if short_stats.get('avg_intra_trade_drawdown') is not None else None,
-            'worst_intra_trade_drawdown': round(float(short_stats.get('worst_intra_trade_drawdown', 0)), 2) if short_stats.get('worst_intra_trade_drawdown') is not None else None,
-            'sharpe_ratio': round(float(short_stats.get('sharpe_ratio', 0)), 2) if short_stats.get('sharpe_ratio') is not None else None,
-            'cagr': round(float(short_stats.get('cagr', 0)), 2) if short_stats.get('cagr') is not None else None,
-            'total_return': round(float(short_stats.get('total_return', 0)), 2) if short_stats.get('total_return') is not None else None,
-            'equity_curve': short_stats.get('equity_curve', []),
-            'equity_curve_x': short_equity_curve['x'],
-            'equity_curve_y': short_equity_curve['y'],
-            'benchmark_equity_curve_x': bench_x,
-            'benchmark_equity_curve_y': bench_y,
-            'hedge_equity_curve_x': hedge_x,
-            'hedge_equity_curve_y': hedge_y,
-            'hedge_metrics': hedge_m,
-            'hedge_error': hedge_err,
-            'strategy_only_equity_curve_x': so_short['x'],
-            'strategy_only_equity_curve_y': so_short['y'],
-            'strategy_only_metrics': so_short['metrics'],
-        }
-        
-        return result
 
 
 class BacktestListSerializer(serializers.ModelSerializer):
@@ -298,7 +317,7 @@ class BacktestListSerializer(serializers.ModelSerializer):
             'id', 'name', 'strategy', 'strategy_name', 'strategy_assignment',
             'start_date', 'end_date', 'split_ratio',
             'initial_capital', 'bet_size_percentage', 'strategy_parameters',
-            'hedge_enabled', 'hedge_config',
+            'hedge_enabled', 'hedge_config', 'position_modes',
             'status', 'error_message',
             'created_at', 'updated_at', 'completed_at',
             'symbols_count'
@@ -330,7 +349,7 @@ class BacktestDetailSerializer(serializers.ModelSerializer):
             'id', 'name', 'strategy', 'strategy_name', 'strategy_assignment',
             'start_date', 'end_date', 'split_ratio',
             'initial_capital', 'bet_size_percentage', 'strategy_parameters',
-            'hedge_enabled', 'hedge_config',
+            'hedge_enabled', 'hedge_config', 'position_modes',
             'status', 'error_message',
             'created_at', 'updated_at', 'completed_at',
         ]
@@ -353,7 +372,7 @@ class BacktestSerializer(serializers.ModelSerializer):
             'id', 'name', 'strategy', 'strategy_info', 'strategy_assignment',
             'start_date', 'end_date', 'split_ratio',
             'initial_capital', 'bet_size_percentage', 'strategy_parameters',
-            'hedge_enabled', 'hedge_config',
+            'hedge_enabled', 'hedge_config', 'position_modes',
             'status', 'error_message',
             'created_at', 'updated_at', 'completed_at',
             'trades', 'statistics'
@@ -382,7 +401,13 @@ class BacktestCreateSerializer(serializers.Serializer):
     bet_size_percentage = serializers.FloatField(required=False, default=100.0, min_value=0.1, max_value=100.0, help_text="Percentage of available capital to bet per trade")
     hedge_enabled = serializers.BooleanField(required=False, default=False)
     hedge_config = serializers.JSONField(required=False, default=dict)
-    
+    position_modes = serializers.ListField(
+        child=serializers.ChoiceField(choices=['long', 'short']),
+        required=False,
+        allow_empty=False,
+        help_text="Subset of ['long','short']; omit to run both. At least one when provided.",
+    )
+
     def validate(self, data):
         """Validate that either symbol_tickers is provided or broker_id is provided"""
         symbol_tickers = data.get('symbol_tickers', [])
@@ -392,7 +417,9 @@ class BacktestCreateSerializer(serializers.Serializer):
             raise serializers.ValidationError(
                 "Either 'symbol_tickers' must be provided, or 'broker_id' must be provided for broker-based filtering."
             )
-        
+
+        data['position_modes'] = normalize_position_modes(data.get('position_modes'))
+
         return data
 
 

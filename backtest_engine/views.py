@@ -134,7 +134,15 @@ class BacktestViewSet(viewsets.ModelViewSet):
             ).filter(
                 Q(long_active=True) | Q(short_active=True)  # At least one active flag (covers all three modes)
             )
-            
+
+            pmodes_create = data.get('position_modes') or ['long', 'short']
+            has_long = 'long' in pmodes_create
+            has_short = 'short' in pmodes_create
+            if has_long and not has_short:
+                associations = associations.filter(long_active=True)
+            elif has_short and not has_long:
+                associations = associations.filter(short_active=True)
+
             # Filter by exchange if provided
             if exchange_code:
                 try:
@@ -227,7 +235,9 @@ class BacktestViewSet(viewsets.ModelViewSet):
             except Broker.DoesNotExist:
                 pass  # Already handled in symbol filtering section above
         
-        # Create backtest
+        # Create backtest (position_modes normalized in BacktestCreateSerializer.validate)
+        pmodes = data.get('position_modes') or ['long', 'short']
+
         backtest = Backtest.objects.create(
             name=data.get('name', ''),
             strategy=strategy,
@@ -245,6 +255,7 @@ class BacktestViewSet(viewsets.ModelViewSet):
                 if bool(data.get('hedge_enabled', False))
                 else {}
             ),
+            position_modes=pmodes,
             status='pending'
         )
         backtest.symbols.set(symbols)

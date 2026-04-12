@@ -6,6 +6,7 @@ from celery import shared_task
 from django.utils import timezone
 from django.db import connections
 from .models import Backtest, Trade, BacktestStatistics
+from .position_modes import normalize_position_modes
 from .services.backtest_executor import BacktestExecutor
 from .services.sp500_benchmark import compute_sp500_buy_hold_curve
 from .services.hybrid_vix_hedge import compute_trade_hedge_overlay
@@ -88,6 +89,19 @@ def _strategy_only_snapshot_from_stats(b):
         'total_return': b.get('total_return', 0),
         'skipped_trades_count': b.get('skipped_trades_count', 0),
     }
+
+
+def _position_modes_to_run(backtest) -> list:
+    """Ordered list of modes to execute from Backtest.position_modes."""
+    return normalize_position_modes(getattr(backtest, 'position_modes', None))
+
+
+def _primary_secondary_modes(modes_list: list) -> tuple:
+    """Primary DB row is long when long ran, else short. Secondary is the other side."""
+    s = set(modes_list)
+    primary = 'long' if 'long' in s else 'short'
+    secondary = 'short' if primary == 'long' else 'long'
+    return primary, secondary
 
 
 @shared_task(bind=True, name='backtest_engine.run_backtest', time_limit=48 * 60 * 60, soft_time_limit=48 * 60 * 60)
@@ -444,11 +458,15 @@ def run_backtest_task(self, backtest_id):
                         raw_overlay.get('error') if raw_overlay else 'no overlay',
                     )
         
-        # Phase 2: Execute strategy twice: LONG and SHORT in parallel
-        # Each mode uses the pre-processed data from Phase 1
+        position_modes_to_run = _position_modes_to_run(backtest)
+        primary_mode, secondary_mode = _primary_secondary_modes(position_modes_to_run)
+        num_modes = len(position_modes_to_run)
+
+        # Phase 2: Execute strategy for each selected position mode (pre-processed data from Phase 1)
+        mode_label = ' and '.join(m.upper() for m in position_modes_to_run)
         self.update_state(
             state='PROGRESS',
-            meta={'progress': 20, 'message': 'Executing strategy for long and short position modes...'}
+            meta={'progress': 20, 'message': f'Executing strategy ({mode_label})...'}
         )
         
         all_trades_by_mode = {}
@@ -519,20 +537,22 @@ def run_backtest_task(self, backtest_id):
                 # Always close connections in thread to prevent connection leaks
                 connections.close_all()
         
-        # Execute long and short position modes in parallel
-        logger.info("Starting parallel execution of strategy for position modes (long, short)")
+        logger.info(
+            "Starting execution for position mode(s): %s",
+            ", ".join(position_modes_to_run),
+        )
         mode_stats_results = {}
         results_lock = threading.Lock()
         
-        with ThreadPoolExecutor(max_workers=2) as executor_pool:
+        with ThreadPoolExecutor(max_workers=max(1, num_modes)) as executor_pool:
             future_to_mode = {
                 executor_pool.submit(execute_position_mode, mode): mode 
-                for mode in ['long', 'short']
+                for mode in position_modes_to_run
             }
             
             # Update progress as each mode completes (from main thread)
             completed_count = 0
-            total_modes = 2
+            total_modes = num_modes
             
             # Collect results as they complete
             for future in as_completed(future_to_mode):
@@ -566,11 +586,11 @@ def run_backtest_task(self, backtest_id):
         # Update progress: 70% - All execution modes completed
         self.update_state(
             state='PROGRESS',
-            meta={'progress': 70, 'message': 'Strategy execution completed for long and short modes'}
+            meta={'progress': 70, 'message': 'Strategy execution completed'}
         )
         
-        # Process statistics from both modes
-        for position_mode in ['long', 'short']:
+        # Process statistics from each executed mode
+        for position_mode in position_modes_to_run:
             mode_stats = mode_stats_results.get(position_mode, {})
             
             # Store portfolio-level statistics
@@ -612,9 +632,8 @@ def run_backtest_task(self, backtest_id):
             meta={'progress': 80, 'message': 'Saving trades and statistics...'}
         )
         
-        # Save trades from each mode (LONG, SHORT)
-        # Store the mode in metadata so we can filter by mode later
-        for position_mode in ['long', 'short']:
+        # Save trades from each executed mode; metadata.position_mode for filtering
+        for position_mode in position_modes_to_run:
             mode_trades = all_trades_by_mode.get(position_mode, [])
             logger.info(f"Saving {len(mode_trades)} trades for position_mode={position_mode}")
             
@@ -827,13 +846,12 @@ def run_backtest_task(self, backtest_id):
             
             return rounded_value
         
-        # Save statistics
+        # Save statistics (primary mode on main row; secondary mode nested in additional_stats)
         for symbol, stats in statistics.items():
             if symbol is None:
-                # Portfolio-level stats: main row = long mode; short nested in additional_stats
-                portfolio_long = stats.get('long', {})
-                if not portfolio_long or not portfolio_long.get('total_trades', 0):
-                    portfolio_long = {
+                portfolio_primary = stats.get(primary_mode, {}) or {}
+                if not portfolio_primary or not portfolio_primary.get('total_trades', 0):
+                    portfolio_primary = {
                         'total_trades': 0,
                         'winning_trades': 0,
                         'losing_trades': 0,
@@ -855,7 +873,7 @@ def run_backtest_task(self, backtest_id):
                     }
                 
                 # Prepare statistics with rounded and validated values
-                stats_dict = {k: v for k, v in portfolio_long.items() if k not in ['additional_stats', 'equity_curve', 'skipped_trades_count', 'independent_bet_amounts']}
+                stats_dict = {k: v for k, v in portfolio_primary.items() if k not in ['additional_stats', 'equity_curve', 'skipped_trades_count', 'independent_bet_amounts']}
                 
                 # Round and validate numeric fields
                 numeric_fields = ['total_pnl', 'total_pnl_percentage', 'average_pnl', 'average_winner', 
@@ -867,10 +885,10 @@ def run_backtest_task(self, backtest_id):
                     if field in stats_dict:
                         stats_dict[field] = round_and_validate_stat(stats_dict[field], field, decimal_places=2, symbol=None)
                 
-                skipped_trades_count = portfolio_long.get('skipped_trades_count', 0)
+                skipped_trades_count = portfolio_primary.get('skipped_trades_count', 0)
                 
                 benchmark_block = {}
-                eq_curve = portfolio_long.get('equity_curve') or []
+                eq_curve = portfolio_primary.get('equity_curve') or []
                 if eq_curve and isinstance(eq_curve, list):
                     try:
                         first_pt = eq_curve[0]
@@ -902,11 +920,12 @@ def run_backtest_task(self, backtest_id):
                             'source': 'none',
                         }
                 
+                portfolio_secondary = stats.get(secondary_mode, {}) or {}
                 extra_stats = {
-                    'long': {
+                    primary_mode: {
                         'skipped_trades_count': skipped_trades_count,
                     },
-                    'short': stats.get('short', {}),
+                    secondary_mode: portfolio_secondary if portfolio_secondary else {},
                 }
                 if benchmark_block:
                     extra_stats['benchmark'] = benchmark_block
@@ -927,19 +946,19 @@ def run_backtest_task(self, backtest_id):
                     backtest=backtest,
                     symbol=None,
                     **stats_dict,
-                    equity_curve=portfolio_long.get('equity_curve', []),
+                    equity_curve=portfolio_primary.get('equity_curve', []),
                     additional_stats=extra_stats,
                 )
             else:
-                # Symbol-specific stats: main row = long mode; short in additional_stats
-                symbol_long = stats.get('long', {})
-                stats_to_save = {k: v for k, v in symbol_long.items() if k not in ['equity_curve', 'independent_bet_amounts', 'skipped_trades_count', 'additional_stats']} if symbol_long else {}
-                equity_curve_long_main = symbol_long.get('equity_curve', []) if symbol_long else []
-                independent_bet_amounts_long = stats.get('long', {}).get('independent_bet_amounts', {})
-                equity_curve_short = stats.get('short', {}).get('equity_curve', [])
-                independent_bet_amounts_short = stats.get('short', {}).get('independent_bet_amounts', {})
+                primary_stats = stats.get(primary_mode, {}) or {}
+                secondary_stats = stats.get(secondary_mode, {}) or {}
+                stats_to_save = {k: v for k, v in primary_stats.items() if k not in ['equity_curve', 'independent_bet_amounts', 'skipped_trades_count', 'additional_stats']} if primary_stats else {}
+                equity_curve_primary_main = primary_stats.get('equity_curve', []) if primary_stats else []
+                independent_bet_amounts_primary = primary_stats.get('independent_bet_amounts', {})
+                equity_curve_secondary = secondary_stats.get('equity_curve', [])
+                independent_bet_amounts_secondary = secondary_stats.get('independent_bet_amounts', {})
                 
-                if not symbol_long:
+                if not primary_stats:
                     stats_to_save = {
                         'total_trades': 0,
                         'winning_trades': 0,
@@ -970,17 +989,17 @@ def run_backtest_task(self, backtest_id):
                     if field in stats_to_save:
                         stats_to_save[field] = round_and_validate_stat(stats_to_save[field], field, decimal_places=2, symbol=symbol)
                 
-                skipped_trades_count = symbol_long.get('skipped_trades_count', 0) if symbol_long else 0
+                skipped_trades_count = primary_stats.get('skipped_trades_count', 0) if primary_stats else 0
                 
                 sym_additional = {
-                    'long': {
-                        'independent_bet_amounts': independent_bet_amounts_long,
+                    primary_mode: {
+                        'independent_bet_amounts': independent_bet_amounts_primary,
                         'skipped_trades_count': skipped_trades_count,
                     },
-                    'short': {
-                        **{k: v for k, v in stats.get('short', {}).items() if k not in ['equity_curve', 'independent_bet_amounts', 'skipped_trades_count']},
-                        'equity_curve': equity_curve_short,
-                        'independent_bet_amounts': independent_bet_amounts_short,
+                    secondary_mode: {
+                        **{k: v for k, v in secondary_stats.items() if k not in ['equity_curve', 'independent_bet_amounts', 'skipped_trades_count']},
+                        'equity_curve': equity_curve_secondary,
+                        'independent_bet_amounts': independent_bet_amounts_secondary,
                     },
                 }
                 strategy_only_sym = {}
@@ -997,7 +1016,7 @@ def run_backtest_task(self, backtest_id):
                 BacktestStatistics.objects.create(
                     backtest=backtest,
                     symbol=symbol,
-                    equity_curve=equity_curve_long_main,
+                    equity_curve=equity_curve_primary_main,
                     additional_stats=sym_additional,
                     **stats_to_save
                 )

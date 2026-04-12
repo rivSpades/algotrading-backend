@@ -27,6 +27,7 @@ class BacktestAdmin(admin.ModelAdmin):
                 'strategy_parameters',
                 'hedge_enabled',
                 'hedge_config',
+                'position_modes',
             )
         }),
         ('Status', {

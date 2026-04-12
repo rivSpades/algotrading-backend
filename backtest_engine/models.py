@@ -8,6 +8,8 @@ from django.core.validators import MinValueValidator, MaxValueValidator
 from market_data.models import Symbol
 from strategies.models import StrategyDefinition, StrategyAssignment
 
+from .position_modes import default_position_modes_list
+
 
 class Backtest(models.Model):
     """Backtest execution record"""
@@ -69,6 +71,10 @@ class Backtest(models.Model):
         default=dict,
         blank=True,
         help_text="Hybrid VIX hedge parameters (z_threshold, vix_floor, weights, windows); defaults apply when empty",
+    )
+    position_modes = models.JSONField(
+        default=default_position_modes_list,
+        help_text="Which directions to simulate: include 'long' and/or 'short' (at least one)",
     )
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
     error_message = models.TextField(blank=True, help_text="Error message if backtest failed")
