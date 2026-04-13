@@ -67,6 +67,10 @@ class Backtest(models.Model):
         default=False,
         help_text="If true, split each trade's bet between the strategy and hybrid VIX sleeve (VIXM/VIXY)",
     )
+    run_strategy_only_baseline = models.BooleanField(
+        default=True,
+        help_text="When hedge is enabled, also run a baseline (no-hedge) backtest to populate strategy_only comparison metrics",
+    )
     hedge_config = models.JSONField(
         default=dict,
         blank=True,

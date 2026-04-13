@@ -486,7 +486,7 @@ def run_backtest_task(self, backtest_id):
                 logger.info(f"[{position_mode.upper()}] Starting strategy execution (Phase 2)")
                 
                 baseline_full_stats = None
-                if hedge_overlay:
+                if hedge_overlay and getattr(backtest, 'run_strategy_only_baseline', True):
                     logger.info(f"[{position_mode.upper()}] Baseline run (strategy only, no hedge split)...")
                     ex_base = BacktestExecutor(
                         backtest,

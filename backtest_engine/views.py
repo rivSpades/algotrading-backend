@@ -250,6 +250,7 @@ class BacktestViewSet(viewsets.ModelViewSet):
             bet_size_percentage=data.get('bet_size_percentage', 100.0),
             strategy_parameters=strategy_parameters,
             hedge_enabled=bool(data.get('hedge_enabled', False)),
+            run_strategy_only_baseline=bool(data.get('run_strategy_only_baseline', True)),
             hedge_config=(
                 resolved_hedge_config_for_backtest(data.get('hedge_config'))
                 if bool(data.get('hedge_enabled', False))

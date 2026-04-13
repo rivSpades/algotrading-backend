@@ -317,7 +317,7 @@ class BacktestListSerializer(serializers.ModelSerializer):
             'id', 'name', 'strategy', 'strategy_name', 'strategy_assignment',
             'start_date', 'end_date', 'split_ratio',
             'initial_capital', 'bet_size_percentage', 'strategy_parameters',
-            'hedge_enabled', 'hedge_config', 'position_modes',
+            'hedge_enabled', 'run_strategy_only_baseline', 'hedge_config', 'position_modes',
             'status', 'error_message',
             'created_at', 'updated_at', 'completed_at',
             'symbols_count'
@@ -349,7 +349,7 @@ class BacktestDetailSerializer(serializers.ModelSerializer):
             'id', 'name', 'strategy', 'strategy_name', 'strategy_assignment',
             'start_date', 'end_date', 'split_ratio',
             'initial_capital', 'bet_size_percentage', 'strategy_parameters',
-            'hedge_enabled', 'hedge_config', 'position_modes',
+            'hedge_enabled', 'run_strategy_only_baseline', 'hedge_config', 'position_modes',
             'status', 'error_message',
             'created_at', 'updated_at', 'completed_at',
         ]
@@ -372,7 +372,7 @@ class BacktestSerializer(serializers.ModelSerializer):
             'id', 'name', 'strategy', 'strategy_info', 'strategy_assignment',
             'start_date', 'end_date', 'split_ratio',
             'initial_capital', 'bet_size_percentage', 'strategy_parameters',
-            'hedge_enabled', 'hedge_config', 'position_modes',
+            'hedge_enabled', 'run_strategy_only_baseline', 'hedge_config', 'position_modes',
             'status', 'error_message',
             'created_at', 'updated_at', 'completed_at',
             'trades', 'statistics'
@@ -400,6 +400,11 @@ class BacktestCreateSerializer(serializers.Serializer):
     initial_capital = serializers.DecimalField(required=False, default=10000.0, max_digits=20, decimal_places=2, min_value=Decimal('0.01'))
     bet_size_percentage = serializers.FloatField(required=False, default=100.0, min_value=0.1, max_value=100.0, help_text="Percentage of available capital to bet per trade")
     hedge_enabled = serializers.BooleanField(required=False, default=False)
+    run_strategy_only_baseline = serializers.BooleanField(
+        required=False,
+        default=True,
+        help_text="When hedge_enabled, whether to also run the strategy-only baseline for comparison",
+    )
     hedge_config = serializers.JSONField(required=False, default=dict)
     position_modes = serializers.ListField(
         child=serializers.ChoiceField(choices=['long', 'short']),
