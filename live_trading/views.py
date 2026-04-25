@@ -87,7 +87,7 @@ class BrokerViewSet(viewsets.ModelViewSet):
         # Fallback if pagination is not applied (shouldn't happen with paginator)
         serializer = SymbolBrokerAssociationSerializer(associations, many=True)
         return Response(serializer.data)
-    
+
     @action(detail=True, methods=['post'], url_path='link-symbols')
     def link_symbols(self, request, pk=None):
         """Link symbols to this broker asynchronously (individual, by exchange, or all available)"""
@@ -126,7 +126,35 @@ class BrokerViewSet(viewsets.ModelViewSet):
                 {'error': f'Error starting symbol linking task: {str(e)}'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
-    
+
+    @action(detail=True, methods=['post'], url_path='reverify-symbols')
+    def reverify_symbols(self, request, pk=None):
+        """
+        Re-run broker capability checks for all symbols already linked to this broker
+        and update long_active, short_active, verified_at (async Celery task).
+        """
+        broker = self.get_object()
+        from .tasks import reverify_broker_symbol_associations_task
+
+        try:
+            task = reverify_broker_symbol_associations_task.delay(broker_id=broker.id)
+            logger.info('Started reverify symbols task for broker %s, task_id: %s', broker.id, task.id)
+            return Response(
+                {
+                    'message': 'Symbol re-verification task started',
+                    'task_id': task.id,
+                    'broker_id': broker.id,
+                    'broker_name': broker.name,
+                },
+                status=status.HTTP_202_ACCEPTED,
+            )
+        except Exception as e:
+            logger.error('Error starting reverify symbols task: %s', e)
+            return Response(
+                {'error': f'Error starting reverify task: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
     @action(detail=True, methods=['post'], url_path='test-connection')
     def test_connection(self, request, pk=None):
         """Test broker API connection and verify credentials for paper or real money"""

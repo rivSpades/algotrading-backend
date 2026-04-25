@@ -9,10 +9,11 @@ from rest_framework.filters import SearchFilter, OrderingFilter
 from rest_framework.pagination import PageNumberPagination
 from django.shortcuts import get_object_or_404
 from django.db.models import Q
-from .models import Backtest, Trade, BacktestStatistics
+from .models import Backtest, Trade, BacktestStatistics, SymbolBacktestRun, SymbolBacktestTrade, SymbolBacktestStatistics
 from .serializers import (
     BacktestSerializer, BacktestListSerializer, BacktestDetailSerializer, BacktestCreateSerializer,
     TradeSerializer, BacktestStatisticsSerializer, HedgePreviewSerializer, HedgeLabSettingsWriteSerializer,
+    SymbolBacktestTradeSerializer, SymbolBacktestStatisticsSerializer, SymbolBacktestRunSerializer,
 )
 from .services.hybrid_vix_hedge import (
     simulate_hybrid_vix_hedge,
@@ -21,9 +22,8 @@ from .services.hybrid_vix_hedge import (
     merge_defaults_into_hedge_config,
     get_hedge_lab_saved_overrides,
 )
-from strategies.models import StrategyDefinition, StrategyAssignment
 from market_data.models import Symbol
-from .tasks import run_backtest_task
+from .services.create_backtest import create_backtest_from_validated_data
 import logging
 
 logger = logging.getLogger(__name__)
@@ -93,193 +93,7 @@ class BacktestViewSet(viewsets.ModelViewSet):
         """Create and start a new backtest"""
         serializer = BacktestCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        
-        data = serializer.validated_data
-        
-        # Get strategy
-        try:
-            strategy = StrategyDefinition.objects.get(id=data['strategy_id'])
-        except StrategyDefinition.DoesNotExist:
-            return Response(
-                {'error': f'Strategy with id {data["strategy_id"]} not found'},
-                status=status.HTTP_404_NOT_FOUND
-            )
-        
-        # Get symbols - either from provided tickers or broker-based filtering
-        symbols = []
-        symbol_tickers = data.get('symbol_tickers', [])
-        broker_id = data.get('broker_id')
-        exchange_code = data.get('exchange_code', '')
-        
-        if broker_id:
-            # Broker-based filtering - get all symbols with at least one active flag
-            # The backtest executor will filter by position mode automatically
-            from live_trading.models import Broker, SymbolBrokerAssociation
-            from market_data.models import Exchange
-            
-            try:
-                broker = Broker.objects.get(id=broker_id)
-            except Broker.DoesNotExist:
-                return Response(
-                    {'error': f'Broker with id {broker_id} not found'},
-                    status=status.HTTP_404_NOT_FOUND
-                )
-            
-            # Get broker associations - filter by status='active' and broker association flags
-            # Backtest runs long and short modes; include symbols usable in at least one mode.
-            # The executor filters per mode: long → long_active, short → short_active.
-            associations = SymbolBrokerAssociation.objects.filter(
-                broker=broker,
-                symbol__status='active'  # Only active symbols
-            ).filter(
-                Q(long_active=True) | Q(short_active=True)  # At least one active flag (covers all three modes)
-            )
-
-            pmodes_create = data.get('position_modes') or ['long', 'short']
-            has_long = 'long' in pmodes_create
-            has_short = 'short' in pmodes_create
-            if has_long and not has_short:
-                associations = associations.filter(long_active=True)
-            elif has_short and not has_long:
-                associations = associations.filter(short_active=True)
-
-            # Filter by exchange if provided
-            if exchange_code:
-                try:
-                    exchange = Exchange.objects.get(code=exchange_code)
-                    associations = associations.filter(symbol__exchange=exchange)
-                except Exchange.DoesNotExist:
-                    return Response(
-                        {'error': f'Exchange with code {exchange_code} not found'},
-                        status=status.HTTP_404_NOT_FOUND
-                    )
-            
-            # Get symbols from associations (already filtered for active status)
-            symbols = [assoc.symbol for assoc in associations.select_related('symbol')]
-            
-            # If specific symbol_tickers provided, further filter to only those
-            # If symbol_tickers is empty, use all broker symbols (select all)
-            if symbol_tickers and len(symbol_tickers) > 0:
-                symbols = [s for s in symbols if s.ticker in symbol_tickers]
-            
-            if not symbols:
-                exchange_text = f" on exchange {exchange_code}" if exchange_code else ""
-                return Response(
-                    {'error': f'No symbols found for broker {broker.name}{exchange_text}'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-        else:
-            # Normal symbol selection from tickers (no broker filtering)
-            if not symbol_tickers or len(symbol_tickers) == 0:
-                # If no broker_id and no symbol_tickers, fetch all active symbols
-                symbols = list(Symbol.objects.filter(status='active'))
-                if not symbols:
-                    return Response(
-                        {'error': 'No active symbols found. Please provide symbol_tickers or use broker-based filtering.'},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-            else:
-                # Filter to only requested tickers - only active symbols
-                for ticker in symbol_tickers:
-                    try:
-                        symbol = Symbol.objects.get(ticker=ticker, status='active')
-                        symbols.append(symbol)
-                    except Symbol.DoesNotExist:
-                        return Response(
-                            {'error': f'Symbol {ticker} not found or is not active'},
-                            status=status.HTTP_404_NOT_FOUND
-                        )
-        
-        # Get or create strategy assignment (for parameter merging)
-        strategy_assignment = None
-        if len(symbols) == 1:
-            # Try to find symbol-specific assignment
-            strategy_assignment = StrategyAssignment.objects.filter(
-                strategy=strategy,
-                symbol=symbols[0]
-            ).first()
-        
-        if not strategy_assignment:
-            # Try global assignment
-            strategy_assignment = StrategyAssignment.objects.filter(
-                strategy=strategy,
-                symbol__isnull=True
-            ).first()
-        
-        # Merge parameters
-        strategy_parameters = strategy.default_parameters.copy()
-        if strategy_assignment:
-            strategy_parameters.update(strategy_assignment.parameters)
-        strategy_parameters.update(data.get('strategy_parameters', {}))
-        
-        # Handle date range - backtests now use ALL available data for each symbol
-        # start_date and end_date are kept for backward compatibility but are not used for filtering
-        start_date = data.get('start_date')
-        end_date = data.get('end_date')
-        
-        # If dates not provided, set to None
-        # The executor will use ALL available data for each symbol, not filter by dates
-        if not start_date:
-            start_date = None
-        if not end_date:
-            from django.utils import timezone
-            end_date = timezone.now()  # Set to current date for display purposes only
-        
-        # Broker is already loaded if broker_id was provided (for symbol filtering)
-        # Just get it again here for the backtest model
-        broker = None
-        if broker_id:
-            from live_trading.models import Broker
-            try:
-                broker = Broker.objects.get(id=broker_id)
-            except Broker.DoesNotExist:
-                pass  # Already handled in symbol filtering section above
-        
-        # Create backtest (position_modes normalized in BacktestCreateSerializer.validate)
-        pmodes = data.get('position_modes') or ['long', 'short']
-
-        backtest = Backtest.objects.create(
-            name=data.get('name', ''),
-            strategy=strategy,
-            strategy_assignment=strategy_assignment,
-            broker=broker,
-            start_date=start_date,
-            end_date=end_date,
-            split_ratio=data.get('split_ratio', 0.7),
-            initial_capital=data.get('initial_capital', 10000.0),
-            bet_size_percentage=data.get('bet_size_percentage', 100.0),
-            strategy_parameters=strategy_parameters,
-            hedge_enabled=bool(data.get('hedge_enabled', False)),
-            run_strategy_only_baseline=bool(data.get('run_strategy_only_baseline', True)),
-            hedge_config=(
-                resolved_hedge_config_for_backtest(data.get('hedge_config'))
-                if bool(data.get('hedge_enabled', False))
-                else {}
-            ),
-            position_modes=pmodes,
-            status='pending'
-        )
-        backtest.symbols.set(symbols)
-        
-        # Start backtest task asynchronously
-        try:
-            task = run_backtest_task.delay(backtest.id)
-            logger.info(f"Started backtest task for backtest {backtest.id}, task_id: {task.id}")
-            
-            # Return created backtest with task_id
-            serializer = BacktestSerializer(backtest)
-            response_data = serializer.data
-            response_data['task_id'] = task.id  # Include task_id in response
-            return Response(response_data, status=status.HTTP_201_CREATED)
-        except Exception as e:
-            logger.error(f"Error starting backtest task: {str(e)}")
-            backtest.status = 'failed'
-            backtest.error_message = f"Error starting backtest task: {str(e)}"
-            backtest.save()
-            return Response(
-                {'error': f'Error starting backtest: {str(e)}'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+        return create_backtest_from_validated_data(serializer.validated_data)
     
     @action(detail=True, methods=['get'])
     def trades(self, request, pk=None):
@@ -397,6 +211,211 @@ class BacktestViewSet(viewsets.ModelViewSet):
         )
         return Response(result)
 
+    @action(detail=True, methods=['get'])
+    def statistics(self, request, pk=None):
+        """Get all statistics for a backtest"""
+        backtest = self.get_object()
+        stats = backtest.statistics.all()
+        serializer = BacktestStatisticsSerializer(stats, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['get'], url_path='statistics/optimized')
+    def statistics_optimized(self, request, pk=None):
+        """Get optimized statistics for a backtest - organized by mode (LONG/SHORT)"""
+        backtest = self.get_object()
+
+        # Get portfolio stats (symbol=None)
+        portfolio_stats = backtest.statistics.filter(symbol__isnull=True).first()
+
+        result = {
+            'portfolio': None,
+            'symbols': []
+        }
+
+        if portfolio_stats:
+            serializer = BacktestStatisticsSerializer(portfolio_stats)
+            result['portfolio'] = {
+                'stats_by_mode': serializer.data.get('stats_by_mode', {}),
+                'equity_curve_x': serializer.data.get('equity_curve_x', []),
+                'equity_curve_y': serializer.data.get('equity_curve_y', []),
+                'benchmark_equity_curve_x': serializer.data.get('benchmark_equity_curve_x', []),
+                'benchmark_equity_curve_y': serializer.data.get('benchmark_equity_curve_y', []),
+                'benchmark_ticker': serializer.data.get('benchmark_ticker'),
+                'benchmark_error': serializer.data.get('benchmark_error'),
+                'hedge_equity_curve_x': serializer.data.get('hedge_equity_curve_x', []),
+                'hedge_equity_curve_y': serializer.data.get('hedge_equity_curve_y', []),
+                'hedge_metrics': serializer.data.get('hedge_metrics', {}),
+                'hedge_error': serializer.data.get('hedge_error'),
+                'hedge_enabled': backtest.hedge_enabled,
+            }
+
+        # Get symbol-level stats
+        symbol_stats = backtest.statistics.filter(symbol__isnull=False).select_related('symbol')
+        for stat in symbol_stats:
+            serializer = BacktestStatisticsSerializer(stat)
+            result['symbols'].append({
+                'symbol_ticker': serializer.data.get('symbol_ticker'),
+                'stats_by_mode': serializer.data.get('stats_by_mode', {}),
+                'equity_curve_x': serializer.data.get('equity_curve_x', []),
+                'equity_curve_y': serializer.data.get('equity_curve_y', []),
+            })
+
+        return Response(result)
+
+    @action(detail=True, methods=['get'], url_path='symbol-list')
+    def symbols(self, request, pk=None):
+        """Get paginated list of symbols associated with this backtest (with search support)"""
+        from market_data.serializers import SymbolListSerializer
+
+        # Get backtest - ensure we have the object
+        # Use pk from kwargs if available, otherwise use pk parameter
+        lookup_pk = self.kwargs.get('pk', pk)
+        try:
+            backtest = self.get_object()
+        except Exception:
+            # Try to get backtest directly if get_object() fails
+            from .models import Backtest
+            backtest = Backtest.objects.get(pk=lookup_pk)
+
+        # Get unique symbols from the backtest (ManyToMany relationship)
+        symbols_queryset = backtest.symbols.all().order_by('ticker')
+
+        # Apply search filter if provided
+        search = request.query_params.get('search', None)
+        if search:
+            # Trim whitespace and ensure search is not empty
+            search = search.strip()
+            if search:
+                symbols_queryset = symbols_queryset.filter(ticker__icontains=search)
+            else:
+                # If search is only whitespace, treat as no search
+                search = None
+
+        # Apply pagination
+        paginator = PageNumberPagination()
+        paginator.page_size = 20
+        paginator.page_size_query_param = 'page_size'
+        paginator.max_page_size = 100
+
+        page = paginator.paginate_queryset(symbols_queryset, request)
+        if page is not None:
+            # Serialize symbols to return full symbol objects
+            serializer = SymbolListSerializer(page, many=True)
+            # Get pagination metadata
+            paginated_response = paginator.get_paginated_response(serializer.data)
+            return paginated_response
+
+        # Fallback if pagination not requested - return all as array
+        serializer = SymbolListSerializer(symbols_queryset, many=True)
+        return Response({'results': serializer.data, 'count': len(serializer.data), 'next': None, 'previous': None})
+
+    @action(detail=True, methods=['get'], url_path=r'symbol/(?P<ticker>[^/]+)/$')
+    def by_symbol(self, request, pk=None, ticker=None):
+        """Get backtest statistics for a specific symbol"""
+        backtest = self.get_object()
+        try:
+            symbol = Symbol.objects.get(ticker=ticker)
+            stats = backtest.statistics.filter(symbol=symbol).first()
+            if stats:
+                serializer = BacktestStatisticsSerializer(stats)
+                return Response(serializer.data)
+            return Response(
+                {'error': f'No statistics found for symbol {ticker} in this backtest'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Symbol.DoesNotExist:
+            return Response(
+                {'error': f'Symbol {ticker} not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+
+class SymbolBacktestRunViewSet(viewsets.ModelViewSet):
+    """ViewSet for single-symbol SymbolBacktestRun."""
+
+    queryset = SymbolBacktestRun.objects.all().select_related('strategy', 'symbol', 'broker')
+    serializer_class = SymbolBacktestRunSerializer
+    filter_backends = [SearchFilter, OrderingFilter]
+    search_fields = ['name', 'strategy__name', 'symbol__ticker']
+    ordering_fields = ['created_at', 'updated_at', 'completed_at']
+    ordering = ['-created_at']
+    pagination_class = BacktestPagination
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        strategy_id = self.request.query_params.get('strategy', None)
+        if strategy_id:
+            qs = qs.filter(strategy_id=strategy_id)
+        ticker = self.request.query_params.get('ticker', None)
+        if ticker:
+            qs = qs.filter(symbol__ticker__iexact=ticker)
+        return qs
+
+    @action(detail=True, methods=['get'])
+    def trades(self, request, pk=None):
+        """Get trades for a symbol run with pagination and filtering (same params as backtests)."""
+        run = self.get_object()
+        trades = run.trades.select_related('symbol').all()
+
+        symbol_ticker = request.query_params.get('symbol', None)
+        if symbol_ticker:
+            trades = trades.filter(symbol__ticker__iexact=symbol_ticker)
+
+        mode = request.query_params.get('mode', None)
+        if mode:
+            trades = trades.filter(metadata__position_mode__iexact=mode)
+
+        no_pagination = request.query_params.get('no_pagination', '').lower() in ('1', 'true', 'yes')
+        if no_pagination:
+            serializer = SymbolBacktestTradeSerializer(trades, many=True)
+            return Response(serializer.data)
+
+        paginator = TradePagination()
+        page = paginator.paginate_queryset(trades, request)
+        serializer = SymbolBacktestTradeSerializer(page, many=True)
+        return paginator.get_paginated_response(serializer.data)
+
+    @action(detail=True, methods=['get'])
+    def statistics(self, request, pk=None):
+        run = self.get_object()
+        stats = run.statistics.all()
+        serializer = SymbolBacktestStatisticsSerializer(stats, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['get'], url_path='statistics/optimized')
+    def statistics_optimized(self, request, pk=None):
+        """Optimized statistics for a symbol run (same shape as backtest statistics/optimized)."""
+        run = self.get_object()
+        portfolio_stats = run.statistics.filter(symbol__isnull=True).first()
+        result = {'portfolio': None, 'symbols': []}
+        if portfolio_stats:
+            serializer = SymbolBacktestStatisticsSerializer(portfolio_stats)
+            result['portfolio'] = {
+                'stats_by_mode': serializer.data.get('stats_by_mode', {}),
+                'equity_curve_x': serializer.data.get('equity_curve_x', []),
+                'equity_curve_y': serializer.data.get('equity_curve_y', []),
+                'benchmark_equity_curve_x': serializer.data.get('benchmark_equity_curve_x', []),
+                'benchmark_equity_curve_y': serializer.data.get('benchmark_equity_curve_y', []),
+                'benchmark_ticker': serializer.data.get('benchmark_ticker'),
+                'benchmark_error': serializer.data.get('benchmark_error'),
+                'hedge_equity_curve_x': serializer.data.get('hedge_equity_curve_x', []),
+                'hedge_equity_curve_y': serializer.data.get('hedge_equity_curve_y', []),
+                'hedge_metrics': serializer.data.get('hedge_metrics', {}),
+                'hedge_error': serializer.data.get('hedge_error'),
+                'hedge_enabled': run.hedge_enabled,
+            }
+
+        symbol_stats = run.statistics.filter(symbol__isnull=False).select_related('symbol')
+        for stat in symbol_stats:
+            serializer = SymbolBacktestStatisticsSerializer(stat)
+            result['symbols'].append({
+                'symbol_ticker': serializer.data.get('symbol_ticker'),
+                'stats_by_mode': serializer.data.get('stats_by_mode', {}),
+                'equity_curve_x': serializer.data.get('equity_curve_x', []),
+                'equity_curve_y': serializer.data.get('equity_curve_y', []),
+            })
+        return Response(result)
+
     @action(detail=False, methods=['get', 'put'], url_path='hedge-lab-settings')
     def hedge_lab_settings(self, request):
         """GET: saved overrides + full effective defaults. PUT: save lab overrides."""
@@ -424,124 +443,6 @@ class BacktestViewSet(viewsets.ModelViewSet):
                 'effective_config': effective,
             }
         )
-    
-    @action(detail=True, methods=['get'])
-    def statistics(self, request, pk=None):
-        """Get all statistics for a backtest"""
-        backtest = self.get_object()
-        stats = backtest.statistics.all()
-        serializer = BacktestStatisticsSerializer(stats, many=True)
-        return Response(serializer.data)
-    
-    @action(detail=True, methods=['get'], url_path='statistics/optimized')
-    def statistics_optimized(self, request, pk=None):
-        """Get optimized statistics for a backtest - organized by mode (LONG/SHORT)"""
-        backtest = self.get_object()
-        
-        # Get portfolio stats (symbol=None)
-        portfolio_stats = backtest.statistics.filter(symbol__isnull=True).first()
-        
-        result = {
-            'portfolio': None,
-            'symbols': []
-        }
-        
-        if portfolio_stats:
-            serializer = BacktestStatisticsSerializer(portfolio_stats)
-            result['portfolio'] = {
-                'stats_by_mode': serializer.data.get('stats_by_mode', {}),
-                'equity_curve_x': serializer.data.get('equity_curve_x', []),
-                'equity_curve_y': serializer.data.get('equity_curve_y', []),
-                'benchmark_equity_curve_x': serializer.data.get('benchmark_equity_curve_x', []),
-                'benchmark_equity_curve_y': serializer.data.get('benchmark_equity_curve_y', []),
-                'benchmark_ticker': serializer.data.get('benchmark_ticker'),
-                'benchmark_error': serializer.data.get('benchmark_error'),
-                'hedge_equity_curve_x': serializer.data.get('hedge_equity_curve_x', []),
-                'hedge_equity_curve_y': serializer.data.get('hedge_equity_curve_y', []),
-                'hedge_metrics': serializer.data.get('hedge_metrics', {}),
-                'hedge_error': serializer.data.get('hedge_error'),
-                'hedge_enabled': backtest.hedge_enabled,
-            }
-        
-        # Get symbol-level stats
-        symbol_stats = backtest.statistics.filter(symbol__isnull=False).select_related('symbol')
-        for stat in symbol_stats:
-            serializer = BacktestStatisticsSerializer(stat)
-            result['symbols'].append({
-                'symbol_ticker': serializer.data.get('symbol_ticker'),
-                'stats_by_mode': serializer.data.get('stats_by_mode', {}),
-                'equity_curve_x': serializer.data.get('equity_curve_x', []),
-                'equity_curve_y': serializer.data.get('equity_curve_y', []),
-            })
-        
-        return Response(result)
-    
-    @action(detail=True, methods=['get'], url_path='symbol-list')
-    def symbols(self, request, pk=None):
-        """Get paginated list of symbols associated with this backtest (with search support)"""
-        from market_data.serializers import SymbolListSerializer
-        
-        # Get backtest - ensure we have the object
-        # Use pk from kwargs if available, otherwise use pk parameter
-        lookup_pk = self.kwargs.get('pk', pk)
-        try:
-            backtest = self.get_object()
-        except Exception:
-            # Try to get backtest directly if get_object() fails
-            from .models import Backtest
-            backtest = Backtest.objects.get(pk=lookup_pk)
-        
-        # Get unique symbols from the backtest (ManyToMany relationship)
-        symbols_queryset = backtest.symbols.all().order_by('ticker')
-        
-        # Apply search filter if provided
-        search = request.query_params.get('search', None)
-        if search:
-            # Trim whitespace and ensure search is not empty
-            search = search.strip()
-            if search:
-                symbols_queryset = symbols_queryset.filter(ticker__icontains=search)
-            else:
-                # If search is only whitespace, treat as no search
-                search = None
-        
-        # Apply pagination
-        paginator = PageNumberPagination()
-        paginator.page_size = 20
-        paginator.page_size_query_param = 'page_size'
-        paginator.max_page_size = 100
-        
-        page = paginator.paginate_queryset(symbols_queryset, request)
-        if page is not None:
-            # Serialize symbols to return full symbol objects
-            serializer = SymbolListSerializer(page, many=True)
-            # Get pagination metadata
-            paginated_response = paginator.get_paginated_response(serializer.data)
-            return paginated_response
-        
-        # Fallback if pagination not requested - return all as array
-        serializer = SymbolListSerializer(symbols_queryset, many=True)
-        return Response({'results': serializer.data, 'count': len(serializer.data), 'next': None, 'previous': None})
-    
-    @action(detail=True, methods=['get'], url_path=r'symbol/(?P<ticker>[^/]+)/$')
-    def by_symbol(self, request, pk=None, ticker=None):
-        """Get backtest statistics for a specific symbol"""
-        backtest = self.get_object()
-        try:
-            symbol = Symbol.objects.get(ticker=ticker)
-            stats = backtest.statistics.filter(symbol=symbol).first()
-            if stats:
-                serializer = BacktestStatisticsSerializer(stats)
-                return Response(serializer.data)
-            return Response(
-                {'error': f'No statistics found for symbol {ticker} in this backtest'},
-                status=status.HTTP_404_NOT_FOUND
-            )
-        except Symbol.DoesNotExist:
-            return Response(
-                {'error': f'Symbol {ticker} not found'},
-                status=status.HTTP_404_NOT_FOUND
-            )
 
 
 class TradeViewSet(viewsets.ReadOnlyModelViewSet):

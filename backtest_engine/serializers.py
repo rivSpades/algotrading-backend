@@ -4,7 +4,14 @@ Serializers for Backtest Engine models
 
 from decimal import Decimal
 from rest_framework import serializers
-from .models import Backtest, Trade, BacktestStatistics
+from .models import (
+    Backtest,
+    Trade,
+    BacktestStatistics,
+    SymbolBacktestRun,
+    SymbolBacktestTrade,
+    SymbolBacktestStatistics,
+)
 from .position_modes import normalize_position_modes
 from strategies.serializers import StrategyDefinitionSerializer
 from market_data.serializers import SymbolListSerializer
@@ -20,6 +27,33 @@ class TradeSerializer(serializers.ModelSerializer):
             'id', 'backtest', 'symbol', 'symbol_info', 'trade_type',
             'entry_price', 'exit_price', 'entry_timestamp', 'exit_timestamp',
             'quantity', 'pnl', 'pnl_percentage', 'is_winner', 'max_drawdown', 'metadata'
+        ]
+        read_only_fields = ['id']
+
+
+class SymbolBacktestTradeSerializer(serializers.ModelSerializer):
+    """Serializer for SymbolBacktestTrade"""
+
+    symbol_info = SymbolListSerializer(source='symbol', read_only=True)
+
+    class Meta:
+        model = SymbolBacktestTrade
+        fields = [
+            'id',
+            'run',
+            'symbol',
+            'symbol_info',
+            'trade_type',
+            'entry_price',
+            'exit_price',
+            'entry_timestamp',
+            'exit_timestamp',
+            'quantity',
+            'pnl',
+            'pnl_percentage',
+            'is_winner',
+            'max_drawdown',
+            'metadata',
         ]
         read_only_fields = ['id']
 
@@ -62,7 +96,7 @@ class BacktestStatisticsSerializer(serializers.ModelSerializer):
     def get_symbol_ticker(self, obj):
         """Get symbol ticker if symbol exists"""
         return obj.symbol.ticker if obj.symbol else None
-    
+
     def get_equity_curve_x(self, obj):
         """Convert equity curve to X-axis array (timestamps)"""
         if not obj.equity_curve or not isinstance(obj.equity_curve, list):
@@ -203,6 +237,17 @@ class BacktestStatisticsSerializer(serializers.ModelSerializer):
             y = [float(point.get('equity', 0)) for point in equity_curve_data if isinstance(point, dict)]
             return {'x': x, 'y': y}
 
+        # Benchmark curves only on portfolio row
+        bench_curve = self._portfolio_benchmark_curve(obj)
+        bench_x = [p.get('timestamp') for p in bench_curve if isinstance(p, dict)]
+        bench_y = [float(p.get('equity', 0)) for p in bench_curve if isinstance(p, dict)]
+
+        hedge_curve = (self._portfolio_hedge_block(obj).get('equity_curve') or []) if obj.symbol is None else []
+        hedge_x = [p.get('timestamp') for p in hedge_curve if isinstance(p, dict)]
+        hedge_y = [float(p.get('equity', 0)) for p in hedge_curve if isinstance(p, dict)]
+        hedge_m = self.get_hedge_metrics(obj)
+        hedge_err = self.get_hedge_error(obj)
+
         def block_from_model(so_bundle_key):
             """Build one mode block from top-level BacktestStatistics fields (primary row)."""
             eq = extract_equity_curve_arrays(obj.equity_curve)
@@ -277,21 +322,17 @@ class BacktestStatisticsSerializer(serializers.ModelSerializer):
                 'strategy_only_metrics': so['metrics'],
             }
 
-        bench_x = self.get_benchmark_equity_curve_x(obj)
-        bench_y = self.get_benchmark_equity_curve_y(obj)
-        hedge_x = self.get_hedge_equity_curve_x(obj)
-        hedge_y = self.get_hedge_equity_curve_y(obj)
-        hedge_m = self.get_hedge_metrics(obj)
-        hedge_err = self.get_hedge_error(obj)
+        extra = obj.additional_stats if isinstance(obj.additional_stats, dict) else {}
 
-        modes = normalize_position_modes(getattr(obj.backtest, 'position_modes', None))
+        # Decide which modes ran from the parent run/backtest configuration, not from
+        # the presence of nested blocks (those can be partial and still truthy).
+        parent = getattr(obj, 'backtest', None) or getattr(obj, 'run', None)
+        modes = normalize_position_modes(getattr(parent, 'position_modes', None))
         has_long = 'long' in modes
         has_short = 'short' in modes
 
-        extra = obj.additional_stats if isinstance(obj.additional_stats, dict) else {}
-
         if has_short and not has_long:
-            # Primary row is short only
+            # Primary row is short-only
             long_nested = extra.get('long') or {}
             return {
                 'short': block_from_model('short'),
@@ -304,6 +345,87 @@ class BacktestStatisticsSerializer(serializers.ModelSerializer):
             'long': block_from_model('long'),
             'short': block_from_nested(short_nested, 'short'),
         }
+
+
+class SymbolBacktestStatisticsSerializer(BacktestStatisticsSerializer):
+    """Serializer for SymbolBacktestStatistics (same shape as BacktestStatisticsSerializer)."""
+
+    class Meta(BacktestStatisticsSerializer.Meta):
+        model = SymbolBacktestStatistics
+        fields = [
+            'id',
+            'run',
+            'symbol',
+            'symbol_ticker',
+            'total_trades',
+            'winning_trades',
+            'losing_trades',
+            'win_rate',
+            'total_pnl',
+            'total_pnl_percentage',
+            'average_pnl',
+            'average_winner',
+            'average_loser',
+            'profit_factor',
+            'max_drawdown',
+            'max_drawdown_duration',
+            'avg_intra_trade_drawdown',
+            'worst_intra_trade_drawdown',
+            'sharpe_ratio',
+            'cagr',
+            'total_return',
+            'equity_curve',
+            'equity_curve_x',
+            'equity_curve_y',
+            'benchmark_equity_curve_x',
+            'benchmark_equity_curve_y',
+            'benchmark_ticker',
+            'benchmark_error',
+            'hedge_equity_curve_x',
+            'hedge_equity_curve_y',
+            'hedge_metrics',
+            'hedge_error',
+            'additional_stats',
+            'stats_by_mode',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['created_at', 'updated_at']
+
+
+class SymbolBacktestRunSerializer(serializers.ModelSerializer):
+    """Serializer for SymbolBacktestRun."""
+
+    strategy_name = serializers.CharField(source='strategy.name', read_only=True)
+    symbol_info = SymbolListSerializer(source='symbol', read_only=True)
+
+    class Meta:
+        model = SymbolBacktestRun
+        fields = [
+            'id',
+            'name',
+            'strategy',
+            'strategy_name',
+            'symbol',
+            'symbol_info',
+            'broker',
+            'start_date',
+            'end_date',
+            'split_ratio',
+            'initial_capital',
+            'bet_size_percentage',
+            'strategy_parameters',
+            'hedge_enabled',
+            'run_strategy_only_baseline',
+            'hedge_config',
+            'position_modes',
+            'status',
+            'error_message',
+            'created_at',
+            'updated_at',
+            'completed_at',
+        ]
+        read_only_fields = ['created_at', 'updated_at', 'completed_at', 'status', 'error_message']
 
 
 class BacktestListSerializer(serializers.ModelSerializer):
@@ -346,7 +468,7 @@ class BacktestDetailSerializer(serializers.ModelSerializer):
     class Meta:
         model = Backtest
         fields = [
-            'id', 'name', 'strategy', 'strategy_name', 'strategy_assignment',
+            'id', 'name', 'strategy', 'strategy_name', 'strategy_assignment', 'broker',
             'start_date', 'end_date', 'split_ratio',
             'initial_capital', 'bet_size_percentage', 'strategy_parameters',
             'hedge_enabled', 'run_strategy_only_baseline', 'hedge_config', 'position_modes',

@@ -52,8 +52,16 @@ class BacktestExecutor:
         self.position_mode = position_mode  # 'long' or 'short'
         self.preprocessed_data = preprocessed_data  # Pre-processed data from Phase 1
         
+        # Determine symbols for this run.
+        # Portfolio Backtest uses ManyToMany `symbols`; SymbolBacktestRun uses a single FK `symbol`.
+        if hasattr(backtest, "symbols"):
+            all_symbols = list(backtest.symbols.all())
+        elif hasattr(backtest, "symbol") and backtest.symbol is not None:
+            all_symbols = [backtest.symbol]
+        else:
+            all_symbols = []
+
         # Filter symbols based on broker associations if broker is set (long vs short capability)
-        all_symbols = list(backtest.symbols.all())
         self.symbols = self._filter_symbols_by_broker(all_symbols, position_mode)
         
         # If preprocessed_data is provided, filter symbols to only those that were pre-processed
@@ -429,6 +437,14 @@ class BacktestExecutor:
         For single-symbol backtests, uses symbol-specific capital.
         """
         logger.info(f"Executing strategy: {self.strategy.name}")
+
+        if not self.symbols:
+            bid = getattr(self.backtest, 'id', None)
+            raise ValueError(
+                f'Backtest {bid}: no symbols to execute for position_mode={self.position_mode!r} '
+                f'(broker_id={getattr(self.broker, "id", None)}). '
+                f'Check broker–symbol associations vs position_modes, or symbol status.'
+            )
         
         # Check if this is a multi-symbol backtest
         is_multi_symbol = len(self.symbols) > 1
@@ -1488,40 +1504,40 @@ class BacktestExecutor:
         logger.info("Calculating backtest statistics")
         
         stats = {}
-        
-        # Per-symbol statistics
-        # IMPORTANT: Always include stats for all symbols in self.symbols, even if they have 0 trades
-        # This ensures frontend always has a complete stats structure for each mode
-        for symbol in self.symbols:
-            symbol_trades = [t for t in self.trades if t['symbol'] == symbol]
-            
-            if not symbol_trades:
-                # Return empty statistics structure with all fields set to 0/None
-                # This ensures consistency across all modes
-                stats[symbol] = {
-                    'total_trades': 0,
-                    'winning_trades': 0,
-                    'losing_trades': 0,
-                    'win_rate': 0,
-                    'total_pnl': 0,
-                    'total_pnl_percentage': 0,
-                    'average_pnl': 0,
-                    'average_winner': 0,
-                    'average_loser': 0,
-                    'profit_factor': 0,
-                    'max_drawdown': 0,
-                    'max_drawdown_duration': 0,
-                    'avg_intra_trade_drawdown': 0,
-                    'worst_intra_trade_drawdown': 0,
-                    'sharpe_ratio': 0,
-                    'cagr': 0,
-                    'total_return': 0,
-                    'equity_curve': [],
-                    'independent_bet_amounts': {},
-                }
-            else:
-                symbol_stats = self._calculate_symbol_statistics(symbol, symbol_trades)
-                stats[symbol] = symbol_stats
+
+        # Portfolio Backtest: do not compute per-symbol statistics (CPU heavy and not needed).
+        # SymbolBacktestRun: keep per-symbol statistics (single-symbol runs).
+        is_portfolio_backtest = hasattr(self.backtest, "symbols")
+        if not is_portfolio_backtest:
+            # Per-symbol statistics (single-symbol run only)
+            for symbol in self.symbols:
+                symbol_trades = [t for t in self.trades if t['symbol'] == symbol]
+
+                if not symbol_trades:
+                    stats[symbol] = {
+                        'total_trades': 0,
+                        'winning_trades': 0,
+                        'losing_trades': 0,
+                        'win_rate': 0,
+                        'total_pnl': 0,
+                        'total_pnl_percentage': 0,
+                        'average_pnl': 0,
+                        'average_winner': 0,
+                        'average_loser': 0,
+                        'profit_factor': 0,
+                        'max_drawdown': 0,
+                        'max_drawdown_duration': 0,
+                        'avg_intra_trade_drawdown': 0,
+                        'worst_intra_trade_drawdown': 0,
+                        'sharpe_ratio': 0,
+                        'cagr': 0,
+                        'total_return': 0,
+                        'equity_curve': [],
+                        'independent_bet_amounts': {},
+                    }
+                else:
+                    symbol_stats = self._calculate_symbol_statistics(symbol, symbol_trades)
+                    stats[symbol] = symbol_stats
         
         # Portfolio-level statistics are calculated separately for each position_mode
         # This is handled in the task which runs the executor multiple times

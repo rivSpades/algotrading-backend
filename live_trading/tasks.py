@@ -415,3 +415,104 @@ def link_broker_symbols_task(self, broker_id, symbol_tickers=None, exchange_code
         }
 
 
+@shared_task(bind=True, name='live_trading.reverify_broker_symbol_associations')
+def reverify_broker_symbol_associations_task(self, broker_id):
+    """
+    Re-fetch broker tradability for every SymbolBrokerAssociation on this broker
+    and update long_active, short_active, verified_at (same semantics as link task).
+    """
+    try:
+        broker = Broker.objects.get(id=broker_id)
+        associations = list(
+            SymbolBrokerAssociation.objects.filter(broker=broker).select_related('symbol')
+        )
+        if not associations:
+            return {
+                'status': 'success',
+                'updated': 0,
+                'failed': 0,
+                'total': 0,
+                'message': 'No linked symbols to re-verify',
+                'broker_id': broker_id,
+                'broker_name': broker.name,
+            }
+
+        self.update_state(
+            state='PROGRESS',
+            meta={'progress': 5, 'message': f'Re-verifying {len(associations)} linked symbols…'},
+        )
+
+        from .adapters.factory import get_broker_adapter
+
+        adapter = get_broker_adapter(broker, paper_trading=True)
+        if not adapter and broker.has_real_money_credentials():
+            adapter = get_broker_adapter(broker, paper_trading=False)
+        if not adapter:
+            return {
+                'status': 'error',
+                'error': 'Broker must have paper or real-money credentials configured to verify capabilities',
+            }
+
+        broker_symbols_data = None
+        if hasattr(adapter, 'get_all_symbols_with_capabilities'):
+            try:
+                broker_symbols_data = adapter.get_all_symbols_with_capabilities()
+            except Exception as e:
+                logger.warning('Could not get bulk capabilities for reverify: %s', e)
+
+        now = timezone.now()
+        failed_count = 0
+        total = len(associations)
+
+        for index, assoc in enumerate(associations):
+            ticker = assoc.symbol.ticker
+            long_active = False
+            short_active = False
+            try:
+                if broker_symbols_data and ticker in broker_symbols_data:
+                    capabilities = broker_symbols_data[ticker]
+                    long_active = bool(capabilities.get('long_supported', False))
+                    short_active = bool(capabilities.get('short_supported', False))
+                else:
+                    capabilities = adapter.get_symbol_capabilities(ticker)
+                    long_active = bool(capabilities.get('long_supported', False))
+                    short_active = bool(capabilities.get('short_supported', False))
+            except Exception as e:
+                logger.error('Error re-verifying capabilities for %s: %s', ticker, e)
+                failed_count += 1
+
+            assoc.long_active = long_active
+            assoc.short_active = short_active
+            assoc.verified_at = now if (long_active or short_active) else None
+            assoc.updated_at = now
+
+            if (index + 1) % 100 == 0 or (index + 1) == total:
+                progress = 5 + int((index + 1) / total * 90)
+                self.update_state(
+                    state='PROGRESS',
+                    meta={
+                        'progress': progress,
+                        'message': f'Re-verified {index + 1}/{total} symbols…',
+                    },
+                )
+
+        SymbolBrokerAssociation.objects.bulk_update(
+            associations,
+            ['long_active', 'short_active', 'verified_at', 'updated_at'],
+            batch_size=500,
+        )
+
+        return {
+            'status': 'success',
+            'updated': total,
+            'failed': failed_count,
+            'total': total,
+            'broker_id': broker_id,
+            'broker_name': broker.name,
+        }
+    except Broker.DoesNotExist:
+        return {'status': 'error', 'error': f'Broker with id {broker_id} not found'}
+    except Exception as e:
+        logger.error('Error in reverify_broker_symbol_associations_task: %s', e, exc_info=True)
+        return {'status': 'error', 'error': str(e)}
+

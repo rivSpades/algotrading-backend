@@ -5,7 +5,14 @@ Celery tasks for backtest execution
 from celery import shared_task
 from django.utils import timezone
 from django.db import connections
-from .models import Backtest, Trade, BacktestStatistics
+from .models import (
+    Backtest,
+    Trade,
+    BacktestStatistics,
+    SymbolBacktestRun,
+    SymbolBacktestTrade,
+    SymbolBacktestStatistics,
+)
 from .position_modes import normalize_position_modes
 from .services.backtest_executor import BacktestExecutor
 from .services.sp500_benchmark import compute_sp500_buy_hold_curve
@@ -597,15 +604,8 @@ def run_backtest_task(self, backtest_id):
             if None in mode_stats:
                 all_statistics[None] = all_statistics.get(None, {})
                 all_statistics[None][position_mode] = mode_stats[None]
-            
-            # Store symbol-level statistics for each position mode (long, short)
-            # This allows frontend to display stats for each mode without calculations
-            for symbol, symbol_stats in mode_stats.items():
-                if symbol is not None:  # Skip portfolio-level stats (None key)
-                    if symbol not in all_statistics:
-                        all_statistics[symbol] = {}
-                    all_statistics[symbol][position_mode] = symbol_stats
-                    logger.info(f"Stored symbol-level statistics for {symbol.ticker} ({position_mode}): {len(symbol_stats)} fields")
+            # Intentionally skip symbol-level statistics for portfolio backtests.
+            # Single-symbol runs have their own storage (SymbolBacktestStatistics).
         
         # Update progress: 70% - Calculating statistics
         self.update_state(
@@ -950,82 +950,14 @@ def run_backtest_task(self, backtest_id):
                     additional_stats=extra_stats,
                 )
             else:
-                primary_stats = stats.get(primary_mode, {}) or {}
-                secondary_stats = stats.get(secondary_mode, {}) or {}
-                stats_to_save = {k: v for k, v in primary_stats.items() if k not in ['equity_curve', 'independent_bet_amounts', 'skipped_trades_count', 'additional_stats']} if primary_stats else {}
-                equity_curve_primary_main = primary_stats.get('equity_curve', []) if primary_stats else []
-                independent_bet_amounts_primary = primary_stats.get('independent_bet_amounts', {})
-                equity_curve_secondary = secondary_stats.get('equity_curve', [])
-                independent_bet_amounts_secondary = secondary_stats.get('independent_bet_amounts', {})
-                
-                if not primary_stats:
-                    stats_to_save = {
-                        'total_trades': 0,
-                        'winning_trades': 0,
-                        'losing_trades': 0,
-                        'win_rate': 0,
-                        'total_pnl': 0,
-                        'total_pnl_percentage': 0,
-                        'average_pnl': 0,
-                        'average_winner': 0,
-                        'average_loser': 0,
-                        'profit_factor': 0,
-                        'max_drawdown': 0,
-                        'max_drawdown_duration': 0,
-                        'avg_intra_trade_drawdown': 0,
-                        'worst_intra_trade_drawdown': 0,
-                        'sharpe_ratio': 0,
-                        'cagr': 0,
-                        'total_return': 0,
-                    }
-                
-                # Round and validate numeric fields in stats_to_save
-                numeric_fields = ['total_pnl', 'total_pnl_percentage', 'average_pnl', 'average_winner', 
-                                'average_loser', 'profit_factor', 'max_drawdown', 'avg_intra_trade_drawdown',
-                                'worst_intra_trade_drawdown', 'sharpe_ratio', 
-                                'cagr', 'total_return', 'win_rate']
-                
-                for field in numeric_fields:
-                    if field in stats_to_save:
-                        stats_to_save[field] = round_and_validate_stat(stats_to_save[field], field, decimal_places=2, symbol=symbol)
-                
-                skipped_trades_count = primary_stats.get('skipped_trades_count', 0) if primary_stats else 0
-                
-                sym_additional = {
-                    primary_mode: {
-                        'independent_bet_amounts': independent_bet_amounts_primary,
-                        'skipped_trades_count': skipped_trades_count,
-                    },
-                    secondary_mode: {
-                        **{k: v for k, v in secondary_stats.items() if k not in ['equity_curve', 'independent_bet_amounts', 'skipped_trades_count']},
-                        'equity_curve': equity_curve_secondary,
-                        'independent_bet_amounts': independent_bet_amounts_secondary,
-                    },
-                }
-                strategy_only_sym = {}
-                for pm in ('long', 'short'):
-                    bfull = all_baseline_stats_by_mode.get(pm) or {}
-                    sym_b = bfull.get(symbol)
-                    if sym_b:
-                        snap = _strategy_only_snapshot_from_stats(sym_b)
-                        if snap:
-                            strategy_only_sym[pm] = snap
-                if strategy_only_sym:
-                    sym_additional['strategy_only'] = strategy_only_sym
-                
-                BacktestStatistics.objects.create(
-                    backtest=backtest,
-                    symbol=symbol,
-                    equity_curve=equity_curve_primary_main,
-                    additional_stats=sym_additional,
-                    **stats_to_save
-                )
+                # Skip symbol-level BacktestStatistics for portfolio backtests.
+                continue
         
         # Mark as completed
         backtest.status = 'completed'
         backtest.completed_at = timezone.now()
         backtest.save()
-        
+
         logger.info(f"Backtest {backtest_id} completed successfully")
         
         # Calculate total trades count from all modes
@@ -1053,10 +985,319 @@ def run_backtest_task(self, backtest_id):
             backtest.status = 'failed'
             backtest.error_message = str(e)
             backtest.save()
+
         except Exception as db_error:
             logger.error(f"Error updating backtest status: {str(db_error)}")
         
         # Don't update state to FAILURE before raising - let Celery handle the exception
         # Just re-raise the exception so Celery can properly serialize it
         raise
+
+
+### Legacy bulk_symbol_snapshots_task removed: single-symbol runs now use SymbolBacktestRun + bulk_symbol_runs_queue_task.
+
+
+@shared_task(bind=True, name='backtest_engine.run_symbol_backtest_run', time_limit=60 * 60, soft_time_limit=60 * 60)
+def run_symbol_backtest_run_task(self, run_id: int):
+    """
+    Execute a SymbolBacktestRun and persist its trades + statistics.
+
+    This is intentionally separate from portfolio Backtest to avoid polluting Backtest table.
+    """
+    run = SymbolBacktestRun.objects.select_related('strategy', 'symbol', 'broker').get(id=run_id)
+
+    logger.info("Starting symbol backtest run %s: %s - %s", run_id, run.strategy.name, run.symbol.ticker)
+    self.update_state(state='PROGRESS', meta={'progress': 10, 'message': 'Initializing symbol run...'})
+
+    run.status = 'running'
+    run.error_message = ''
+    run.save(update_fields=['status', 'error_message', 'updated_at'])
+
+    # Ensure clean artifacts
+    SymbolBacktestTrade.objects.filter(run=run).delete()
+    SymbolBacktestStatistics.objects.filter(run=run).delete()
+
+    try:
+        hedge_overlay = None
+        if getattr(run, 'hedge_enabled', False):
+            raw_overlay = compute_trade_hedge_overlay(
+                run.start_date,
+                run.end_date,
+                run.hedge_config or {},
+                yahoo_only=False,
+            )
+            if raw_overlay and not raw_overlay.get('error') and raw_overlay.get('index_ns'):
+                hedge_overlay = raw_overlay
+            else:
+                logger.warning(
+                    "Symbol run %s: hedge_enabled but overlay unavailable (%s); running without hedge split",
+                    run_id,
+                    raw_overlay.get('error') if raw_overlay else 'no overlay',
+                )
+
+        position_modes_to_run = _position_modes_to_run(run)
+        mode_label = ' and '.join(m.upper() for m in position_modes_to_run)
+        self.update_state(state='PROGRESS', meta={'progress': 20, 'message': f'Executing strategy ({mode_label})...'})
+
+        all_trades_by_mode = {}
+        mode_stats_results = {}
+        all_baseline_stats_by_mode = {}
+
+        for idx, position_mode in enumerate(position_modes_to_run):
+            baseline_full_stats = None
+            if hedge_overlay and getattr(run, 'run_strategy_only_baseline', True):
+                ex_base = BacktestExecutor(
+                    run,
+                    position_mode=position_mode,
+                    preprocessed_data=None,
+                    hedge_overlay=None,
+                )
+                ex_base.execute_strategy()
+                baseline_full_stats = ex_base.calculate_statistics()
+
+            mode_executor = BacktestExecutor(
+                run,
+                position_mode=position_mode,
+                preprocessed_data=None,
+                hedge_overlay=hedge_overlay,
+            )
+            mode_executor.execute_strategy()
+            mode_stats = mode_executor.calculate_statistics()
+
+            all_trades_by_mode[position_mode] = mode_executor.trades
+            mode_stats_results[position_mode] = mode_stats
+            if baseline_full_stats:
+                all_baseline_stats_by_mode[position_mode] = baseline_full_stats
+
+            progress = 20 + int(((idx + 1) / max(len(position_modes_to_run), 1)) * 40)
+            self.update_state(
+                state='PROGRESS',
+                meta={
+                    'progress': progress,
+                    'message': f'Completed {idx + 1}/{len(position_modes_to_run)} position modes...',
+                },
+            )
+
+        self.update_state(state='PROGRESS', meta={'progress': 70, 'message': 'Saving trades...'})
+        for position_mode, trades in all_trades_by_mode.items():
+            for trade_data in trades:
+                trade_metadata = trade_data.get('metadata', {}) or {}
+
+                def convert_value(value, field_name):
+                    if value is None:
+                        return None
+                    try:
+                        float_value = float(value)
+                    except (ValueError, TypeError):
+                        logger.warning("Could not convert trade %s value %r to float, using None", field_name, value)
+                        return None
+                    places = _TRADE_FIELD_DECIMAL_PLACES.get(field_name, 2)
+                    return round(float_value, places)
+
+                entry_price = convert_value(trade_data['entry_price'], 'entry_price')
+                exit_price = convert_value(trade_data.get('exit_price'), 'exit_price')
+                quantity = convert_value(trade_data['quantity'], 'quantity')
+                trade_type = trade_data['trade_type']
+                if (
+                    exit_price is not None
+                    and entry_price is not None
+                    and quantity is not None
+                    and trade_metadata.get('strategy_pnl') is None
+                ):
+                    pnl, pnl_percentage = _trade_pnl_from_stored_prices(trade_type, entry_price, exit_price, quantity)
+                    is_winner = pnl > 0
+                else:
+                    pnl = convert_value(trade_data.get('pnl'), 'pnl')
+                    pnl_percentage = convert_value(trade_data.get('pnl_percentage'), 'pnl_percentage')
+                    is_winner = (pnl > 0) if pnl is not None else trade_data.get('is_winner')
+
+                SymbolBacktestTrade.objects.create(
+                    run=run,
+                    symbol=trade_data['symbol'],
+                    trade_type=trade_type,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    entry_timestamp=trade_data['entry_timestamp'],
+                    exit_timestamp=trade_data.get('exit_timestamp'),
+                    quantity=quantity,
+                    pnl=pnl,
+                    pnl_percentage=pnl_percentage,
+                    is_winner=is_winner,
+                    max_drawdown=convert_value(trade_data.get('max_drawdown'), 'max_drawdown'),
+                    metadata={**trade_metadata, 'position_mode': position_mode},
+                )
+
+        self.update_state(state='PROGRESS', meta={'progress': 85, 'message': 'Saving statistics...'})
+        primary_mode, secondary_mode = _primary_secondary_modes(position_modes_to_run)
+
+        # Run-level (portfolio-like) stats (key None)
+        primary_port = (mode_stats_results.get(primary_mode) or {}).get(None) or {}
+        secondary_port = (mode_stats_results.get(secondary_mode) or {}).get(None) or {}
+        SymbolBacktestStatistics.objects.create(
+            run=run,
+            symbol=None,
+            total_trades=primary_port.get('total_trades', 0) or 0,
+            winning_trades=primary_port.get('winning_trades', 0) or 0,
+            losing_trades=primary_port.get('losing_trades', 0) or 0,
+            win_rate=primary_port.get('win_rate'),
+            total_pnl=primary_port.get('total_pnl', 0) or 0,
+            total_pnl_percentage=primary_port.get('total_pnl_percentage'),
+            average_pnl=primary_port.get('average_pnl'),
+            average_winner=primary_port.get('average_winner'),
+            average_loser=primary_port.get('average_loser'),
+            profit_factor=primary_port.get('profit_factor'),
+            max_drawdown=primary_port.get('max_drawdown'),
+            max_drawdown_duration=primary_port.get('max_drawdown_duration'),
+            avg_intra_trade_drawdown=primary_port.get('avg_intra_trade_drawdown'),
+            worst_intra_trade_drawdown=primary_port.get('worst_intra_trade_drawdown'),
+            sharpe_ratio=primary_port.get('sharpe_ratio'),
+            cagr=primary_port.get('cagr'),
+            total_return=primary_port.get('total_return'),
+            equity_curve=primary_port.get('equity_curve') or [],
+            additional_stats={'by_mode': {primary_mode: primary_port, secondary_mode: secondary_port}},
+        )
+
+        # Symbol-level stats
+        symbol = run.symbol
+        sym_primary = (mode_stats_results.get(primary_mode) or {}).get(symbol) or {}
+        sym_secondary = (mode_stats_results.get(secondary_mode) or {}).get(symbol) or {}
+        # Keep the secondary mode equity curve so the single-symbol UI can render it.
+        # The primary mode curve is stored on the model field `equity_curve` already.
+        sym_additional = {
+            primary_mode: {k: v for k, v in sym_primary.items() if k != 'equity_curve'},
+            secondary_mode: dict(sym_secondary),
+        }
+        strategy_only_sym = {}
+        for pm in ('long', 'short'):
+            bfull = all_baseline_stats_by_mode.get(pm) or {}
+            sym_b = bfull.get(symbol)
+            if sym_b:
+                snap = _strategy_only_snapshot_from_stats(sym_b)
+                if snap:
+                    strategy_only_sym[pm] = snap
+        if strategy_only_sym:
+            sym_additional['strategy_only'] = strategy_only_sym
+
+        SymbolBacktestStatistics.objects.create(
+            run=run,
+            symbol=symbol,
+            total_trades=sym_primary.get('total_trades', 0) or 0,
+            winning_trades=sym_primary.get('winning_trades', 0) or 0,
+            losing_trades=sym_primary.get('losing_trades', 0) or 0,
+            win_rate=sym_primary.get('win_rate'),
+            total_pnl=sym_primary.get('total_pnl', 0) or 0,
+            total_pnl_percentage=sym_primary.get('total_pnl_percentage'),
+            average_pnl=sym_primary.get('average_pnl'),
+            average_winner=sym_primary.get('average_winner'),
+            average_loser=sym_primary.get('average_loser'),
+            profit_factor=sym_primary.get('profit_factor'),
+            max_drawdown=sym_primary.get('max_drawdown'),
+            max_drawdown_duration=sym_primary.get('max_drawdown_duration'),
+            avg_intra_trade_drawdown=sym_primary.get('avg_intra_trade_drawdown'),
+            worst_intra_trade_drawdown=sym_primary.get('worst_intra_trade_drawdown'),
+            sharpe_ratio=sym_primary.get('sharpe_ratio'),
+            cagr=sym_primary.get('cagr'),
+            total_return=sym_primary.get('total_return'),
+            equity_curve=sym_primary.get('equity_curve') or [],
+            additional_stats=sym_additional,
+        )
+
+        run.status = 'completed'
+        run.completed_at = timezone.now()
+        run.save(update_fields=['status', 'completed_at', 'updated_at'])
+
+        self.update_state(state='SUCCESS', meta={'progress': 100, 'message': 'Symbol run completed successfully'})
+        return {'status': 'completed', 'run_id': run_id}
+    except Exception as e:
+        logger.error("Error executing symbol run %s: %s", run_id, str(e), exc_info=True)
+        run.status = 'failed'
+        run.error_message = str(e)
+        run.save(update_fields=['status', 'error_message', 'updated_at'])
+        raise
+
+
+@shared_task(bind=True, name='backtest_engine.bulk_symbol_runs_queue', time_limit=60 * 60, soft_time_limit=60 * 60)
+def bulk_symbol_runs_queue_task(self, strategy_id: int, tickers: list, run_body: dict):
+    """
+    Queue many SymbolBacktestRun jobs (one per ticker) and report progress.
+
+    This task creates SymbolBacktestRun rows and enqueues `run_symbol_backtest_run_task` for each.
+    """
+    from strategies.models import StrategyDefinition, StrategyAssignment
+    from market_data.models import Symbol
+    from live_trading.models import Broker
+
+    tickers = [str(t).strip().upper() for t in (tickers or []) if str(t).strip()]
+    total = len(tickers)
+    self.update_state(state='PROGRESS', meta={'progress': 0, 'message': f'Queuing {total} symbol run(s)...'})
+
+    strategy = StrategyDefinition.objects.get(id=int(strategy_id))
+    broker = None
+    broker_id = (run_body or {}).get('broker_id')
+    if broker_id:
+        try:
+            broker = Broker.objects.get(id=int(broker_id))
+        except Exception:
+            broker = None
+
+    runs = []
+    errors = []
+
+    base_body = dict(run_body or {})
+    # Remove keys that are not SymbolBacktestRun fields
+    base_body.pop('symbol_tickers', None)
+    base_body.pop('strategy_id', None)
+
+    for idx, ticker in enumerate(tickers):
+        progress = int(((idx) / max(total, 1)) * 100)
+        self.update_state(
+            state='PROGRESS',
+            meta={'progress': progress, 'message': f'Queuing {ticker} ({idx + 1}/{total})'},
+        )
+        try:
+            sym = Symbol.objects.get(ticker=ticker, status='active')
+
+            # Merge strategy parameters the same way portfolio backtest creation does
+            merged_params = (strategy.default_parameters or {}).copy()
+            assignment = StrategyAssignment.objects.filter(strategy=strategy, symbol=sym).first()
+            if assignment:
+                merged_params.update(assignment.parameters or {})
+            else:
+                global_assignment = StrategyAssignment.objects.filter(strategy=strategy, symbol__isnull=True).first()
+                if global_assignment:
+                    merged_params.update(global_assignment.parameters or {})
+            merged_params.update(base_body.get('strategy_parameters') or {})
+
+            run = SymbolBacktestRun.objects.create(
+                name=base_body.get('name', '') or f'{strategy.name} — {ticker}',
+                strategy=strategy,
+                symbol=sym,
+                broker=broker,
+                start_date=base_body.get('start_date') or timezone.now().replace(year=1900, month=1, day=1),
+                end_date=base_body.get('end_date') or timezone.now(),
+                split_ratio=base_body.get('split_ratio', 0.7),
+                initial_capital=base_body.get('initial_capital', 10000.0),
+                bet_size_percentage=base_body.get('bet_size_percentage', 100.0),
+                strategy_parameters=merged_params,
+                hedge_enabled=bool(base_body.get('hedge_enabled', False)),
+                run_strategy_only_baseline=bool(base_body.get('run_strategy_only_baseline', True)),
+                hedge_config=base_body.get('hedge_config') or {},
+                position_modes=normalize_position_modes(base_body.get('position_modes')),
+                status='pending',
+            )
+            task = run_symbol_backtest_run_task.delay(run.id)
+            runs.append({'ticker': ticker, 'run_id': run.id, 'task_id': task.id})
+        except Exception as e:
+            errors.append({'ticker': ticker, 'error': str(e)})
+
+    self.update_state(state='SUCCESS', meta={'progress': 100, 'message': f'Queued {len(runs)} run(s).'})
+    return {
+        'status': 'completed',
+        'progress': 100,
+        'message': f'Queued {len(runs)} symbol run(s).',
+        'queued': runs,
+        'errors': errors,
+        'total_requested': total,
+        'total_queued': len(runs),
+    }
 
