@@ -5,11 +5,20 @@ from decimal import Decimal
 from typing import Any, Dict, Optional
 
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 
 
-def _iso(dt: Optional[datetime]) -> Optional[str]:
+def _iso(dt: Optional[Any]) -> Optional[str]:
     if dt is None:
         return None
+    if isinstance(dt, str):
+        s = dt.strip()
+        if s.endswith('Z'):
+            s = s[:-1] + '+00:00'
+        parsed = parse_datetime(s)
+        if parsed is None:
+            return s
+        dt = parsed
     if timezone.is_naive(dt):
         dt = timezone.make_aware(dt, timezone=dt_timezone.utc)
     return dt.astimezone(dt_timezone.utc).isoformat().replace('+00:00', 'Z')

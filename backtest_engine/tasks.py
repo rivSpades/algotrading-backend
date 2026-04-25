@@ -1005,7 +1005,22 @@ def run_symbol_backtest_run_task(self, run_id: int):
 
     This is intentionally separate from portfolio Backtest to avoid polluting Backtest table.
     """
-    run = SymbolBacktestRun.objects.select_related('strategy', 'symbol', 'broker').get(id=run_id)
+    try:
+        run = SymbolBacktestRun.objects.select_related('strategy', 'symbol', 'broker').get(id=run_id)
+    except SymbolBacktestRun.DoesNotExist:
+        # This happens when stale Celery messages exist (e.g., runs were deleted after being queued).
+        logger.warning("Symbol backtest run %s not found; skipping task (stale queue message?)", run_id)
+        # Do NOT use state='FAILURE' with a dict payload: many result backends expect FAILURE
+        # to contain serialized exception info and will crash decoding it.
+        # A custom terminal-ish state is safe for progress UIs and won't poison the backend meta.
+        try:
+            self.update_state(
+                state='SKIPPED',
+                meta={'progress': 0, 'message': 'Symbol run no longer exists (stale queued task).'},
+            )
+        except Exception:
+            pass
+        return
 
     logger.info("Starting symbol backtest run %s: %s - %s", run_id, run.strategy.name, run.symbol.ticker)
     self.update_state(state='PROGRESS', meta={'progress': 10, 'message': 'Initializing symbol run...'})

@@ -8,6 +8,7 @@ from rest_framework.response import Response
 from rest_framework.filters import SearchFilter, OrderingFilter
 from django.utils import timezone
 from django.db import transaction
+from django.utils.dateparse import parse_datetime
 from django.db.models import Q, Count, Max, OuterRef, Subquery
 from .models import StrategyDefinition, StrategyAssignment
 from .serializers import StrategyDefinitionSerializer, StrategyAssignmentSerializer
@@ -78,7 +79,10 @@ class StrategyDefinitionViewSet(viewsets.ModelViewSet):
         except Symbol.DoesNotExist:
             return Response({'error': f'Symbol {ticker} not found'}, status=status.HTTP_404_NOT_FOUND)
         rows = (
+            # Exclude orphan rows created during earlier failures (e.g. before parameter_set signature was set).
+            # All valid runs should have `parameter_set` populated.
             SymbolBacktestRun.objects.filter(strategy=strategy, symbol=sym)
+            .exclude(parameter_set__isnull=True)
             .order_by('-created_at')
         )
         runs = [self._symbol_run_item(r) for r in rows]
@@ -116,6 +120,23 @@ class StrategyDefinitionViewSet(viewsets.ModelViewSet):
         start_date = body.get('start_date') or None
         end_date = body.get('end_date') or None
 
+        def _parse_dt(val, default_dt):
+            if val is None or val == '':
+                return default_dt
+            if hasattr(val, 'utcoffset'):
+                dt = val
+            else:
+                s = str(val).strip()
+                # DRF/JS often send ISO with 'Z'; parse_datetime may require +00:00.
+                if s.endswith('Z'):
+                    s = s[:-1] + '+00:00'
+                dt = parse_datetime(s)
+                if dt is None:
+                    return default_dt
+            if timezone.is_naive(dt):
+                dt = timezone.make_aware(dt, timezone=timezone.utc)
+            return dt
+
         broker = None
         broker_id = body.get('broker_id')
         if broker_id:
@@ -130,8 +151,8 @@ class StrategyDefinitionViewSet(viewsets.ModelViewSet):
             symbol=sym,
             broker=broker,
             parameter_set=None,  # set below after signature computed
-            start_date=start_date or timezone.now().replace(year=1900, month=1, day=1),
-            end_date=end_date or timezone.now(),
+            start_date=_parse_dt(start_date, timezone.now().replace(year=1900, month=1, day=1)),
+            end_date=_parse_dt(end_date, timezone.now()),
             split_ratio=body.get('split_ratio', 0.7),
             initial_capital=body.get('initial_capital', 10000.0),
             bet_size_percentage=body.get('bet_size_percentage', 100.0),
