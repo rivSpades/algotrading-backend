@@ -6,16 +6,25 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.filters import SearchFilter, OrderingFilter
+from django.utils import timezone
 from django.db import transaction
-from django.db.models import Q, Count
+from django.db.models import Q, Count, Max, OuterRef, Subquery
 from .models import StrategyDefinition, StrategyAssignment
 from .serializers import StrategyDefinitionSerializer, StrategyAssignmentSerializer
 from market_data.models import Symbol
 from market_data.serializers import SymbolListSerializer
-from backtest_engine.models import Backtest, SymbolBacktestRun, SymbolBacktestTrade, SymbolBacktestStatistics
+from backtest_engine.models import (
+    Backtest,
+    SymbolBacktestRun,
+    SymbolBacktestTrade,
+    SymbolBacktestStatistics,
+    SymbolBacktestParameterSet,
+)
 from backtest_engine.position_modes import normalize_position_modes
 from backtest_engine.services.create_backtest import create_backtest_from_validated_data
 from backtest_engine.tasks import run_symbol_backtest_run_task, bulk_symbol_runs_queue_task
+from backtest_engine.parameter_sets import build_symbol_run_parameter_payload, signature_for_payload
+from backtest_engine.position_modes import normalize_position_modes
 from live_trading.models import SymbolBrokerAssociation, Broker
 
 
@@ -43,6 +52,7 @@ class StrategyDefinitionViewSet(viewsets.ModelViewSet):
             'completed_at': run_row.completed_at,
             'updated_at': run_row.updated_at,
             'error_message': run_row.error_message or '',
+            'parameter_set': run_row.parameter_set_id,
             'parameters': {
                 'name': run_row.name or '',
                 'split_ratio': float(run_row.split_ratio),
@@ -119,6 +129,7 @@ class StrategyDefinitionViewSet(viewsets.ModelViewSet):
             strategy=strategy,
             symbol=sym,
             broker=broker,
+            parameter_set=None,  # set below after signature computed
             start_date=start_date or timezone.now().replace(year=1900, month=1, day=1),
             end_date=end_date or timezone.now(),
             split_ratio=body.get('split_ratio', 0.7),
@@ -131,10 +142,36 @@ class StrategyDefinitionViewSet(viewsets.ModelViewSet):
             position_modes=normalize_position_modes(body.get('position_modes')),
             status='pending',
         )
+        payload = build_symbol_run_parameter_payload(
+            strategy_id=strategy.id,
+            broker_id=broker.id if broker else None,
+            start_date=run.start_date,
+            end_date=run.end_date,
+            split_ratio=run.split_ratio,
+            initial_capital=run.initial_capital,
+            bet_size_percentage=run.bet_size_percentage,
+            strategy_parameters=run.strategy_parameters,
+            position_modes=run.position_modes,
+            hedge_enabled=run.hedge_enabled,
+            run_strategy_only_baseline=run.run_strategy_only_baseline,
+            hedge_config=run.hedge_config,
+        )
+        sig = signature_for_payload(payload)
+        ps, _created = SymbolBacktestParameterSet.objects.get_or_create(
+            signature=sig,
+            defaults={'strategy': strategy, 'broker': broker, 'parameters': payload, 'label': str(name)[:200]},
+        )
+        if not ps.label and name:
+            ps.label = str(name)[:200]
+            ps.save(update_fields=['label'])
+        run.parameter_set = ps
+        run.save(update_fields=['parameter_set'])
         task = run_symbol_backtest_run_task.delay(run.id)
         return Response(
             {
                 'id': run.id,
+                'parameter_set': ps.signature,
+                'parameter_set_label': ps.label,
                 'task_id': task.id,
                 'status': run.status,
                 'ticker': ticker,
@@ -200,6 +237,7 @@ class StrategyDefinitionViewSet(viewsets.ModelViewSet):
         return Response(
             {
                 'id': run.id,
+                'parameter_set': run.parameter_set_id,
                 'task_id': task.id,
                 'status': run.status,
                 'ticker': ticker,
@@ -278,34 +316,196 @@ class StrategyDefinitionViewSet(viewsets.ModelViewSet):
     # `symbol-runs/(?P<ticker>...)` (router resolves "summary" as a ticker).
     @action(detail=True, methods=['get'], url_path='symbol-runs-summary')
     def symbol_runs_summary(self, request, pk=None):
-        """Distinct tickers that have at least one stored SymbolBacktestRun for this strategy."""
+        """Distinct tickers that have at least one stored SymbolBacktestRun for this strategy (paginated)."""
         strategy = self.get_object()
-        counts = (
-            SymbolBacktestRun.objects.filter(strategy=strategy)
-            .values('symbol__ticker')
-            .annotate(snapshot_count=Count('id'))
+        parameter_set = request.query_params.get('parameter_set') or None
+        # Do NOT use query param `search`: SearchFilter on this viewset also uses it and would
+        # filter the StrategyDefinition queryset so get_object() 404s. Prefer `ticker_q`.
+        search = (request.query_params.get('ticker_q') or request.query_params.get('q') or '').strip()
+        base_qs = SymbolBacktestRun.objects.filter(strategy=strategy)
+        if parameter_set:
+            base_qs = base_qs.filter(parameter_set_id=parameter_set)
+        if search:
+            base_qs = base_qs.filter(symbol__ticker__icontains=search)
+
+        # One DB row per ticker, including "latest" run fields via subquery.
+        latest_run_qs = base_qs.filter(symbol__ticker=OuterRef('symbol__ticker')).order_by('-created_at')
+        summary_qs = (
+            base_qs.values('symbol__ticker')
+            .annotate(
+                snapshot_count=Count('id'),
+                latest_run_id=Subquery(latest_run_qs.values('id')[:1]),
+                latest_run_status=Subquery(latest_run_qs.values('status')[:1]),
+                snapshot_updated_at=Subquery(latest_run_qs.values('updated_at')[:1]),
+                parameter_set=Subquery(latest_run_qs.values('parameter_set_id')[:1]),
+                parameter_set_label=Subquery(latest_run_qs.values('parameter_set__label')[:1]),
+                latest_created_at=Max('created_at'),
+            )
+            .order_by('symbol__ticker')
         )
-        count_map = {c['symbol__ticker']: c['snapshot_count'] for c in counts}
+
+        # Paginate.
+        from rest_framework.pagination import PageNumberPagination
+
+        paginator = PageNumberPagination()
+        paginator.page_size_query_param = 'page_size'
+        paginator.max_page_size = 200
+        page = paginator.paginate_queryset(summary_qs, request)
+        page_rows = list(page or [])
+
+        tickers = [r.get('symbol__ticker') for r in page_rows if r.get('symbol__ticker')]
+        symbols = Symbol.objects.filter(ticker__in=tickers)
+        sym_map = {s.ticker: s for s in symbols}
+
+        results = []
+        for row in page_rows:
+            t = row.get('symbol__ticker')
+            sym = sym_map.get(t)
+            if not sym:
+                continue
+            sym_data = dict(SymbolListSerializer(sym).data)
+            sym_data['snapshot_count'] = row.get('snapshot_count', 0)
+            sym_data['latest_run_id'] = row.get('latest_run_id')
+            sym_data['latest_run_status'] = row.get('latest_run_status')
+            su = row.get('snapshot_updated_at')
+            sym_data['snapshot_updated_at'] = su.isoformat() if hasattr(su, 'isoformat') and su else None
+            sym_data['parameter_set'] = row.get('parameter_set')
+            sym_data['parameter_set_label'] = row.get('parameter_set_label') or ''
+            results.append(sym_data)
+
+        return paginator.get_paginated_response(results)
+
+    @action(detail=True, methods=['get'], url_path='symbol-run-parameter-sets')
+    def symbol_run_parameter_sets(self, request, pk=None):
+        """List parameter sets for this strategy (for UI dropdowns)."""
+        strategy = self.get_object()
+        qs = (
+            SymbolBacktestParameterSet.objects.filter(strategy=strategy)
+            .order_by('-created_at')
+        )
+        rows = [
+            {
+                'signature': ps.signature,
+                'label': ps.label or '',
+                'created_at': ps.created_at.isoformat() if ps.created_at else None,
+            }
+            for ps in qs
+        ]
+        return Response({'parameter_sets': rows})
+
+    @action(detail=True, methods=['delete'], url_path=r'symbol-run-parameter-sets/(?P<signature>[0-9a-f]{64})')
+    def delete_symbol_run_parameter_set(self, request, pk=None, signature=None):
+        """Delete a parameter set AND all SymbolBacktestRuns linked to it for this strategy."""
+        strategy = self.get_object()
+        try:
+            ps = SymbolBacktestParameterSet.objects.get(signature=signature, strategy=strategy)
+        except SymbolBacktestParameterSet.DoesNotExist:
+            return Response({'error': 'Parameter set not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        qs = SymbolBacktestRun.objects.filter(strategy=strategy, parameter_set_id=ps.signature)
+        run_count = qs.count()
+        with transaction.atomic():
+            total_deleted, _by_model = qs.delete()
+            ps.delete()
+        return Response(
+            {
+                'deleted_runs': run_count,
+                'deleted_total_objects': total_deleted + 1,  # plus parameter set row
+                'parameter_set': signature,
+                'message': f'Deleted parameter set and {run_count} run(s).',
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=['get'], url_path=r'symbol-run-parameter-sets/(?P<signature>[0-9a-f]{64})/sharpe-heatmap')
+    def symbol_run_parameter_set_sharpe_heatmap(self, request, pk=None, signature=None):
+        """
+        Per-symbol risk/return metrics for a parameter set (used for charts):
+        sharpe + max_drawdown for LONG/SHORT.
+        Uses the latest run per symbol under this parameter_set.
+        """
+        strategy = self.get_object()
+        try:
+            ps = SymbolBacktestParameterSet.objects.get(signature=signature, strategy=strategy)
+        except SymbolBacktestParameterSet.DoesNotExist:
+            return Response({'error': 'Parameter set not found'}, status=status.HTTP_404_NOT_FOUND)
+
         runs = (
-            SymbolBacktestRun.objects.filter(strategy=strategy)
+            SymbolBacktestRun.objects.filter(strategy=strategy, parameter_set=ps)
             .select_related('symbol')
             .order_by('symbol__ticker', '-created_at')
         )
-        rows = []
-        seen = set()
+        latest_by_ticker = {}
         for r in runs:
             t = r.symbol.ticker
-            if t in seen:
+            if t not in latest_by_ticker:
+                latest_by_ticker[t] = r
+
+        # Load symbol-level stats rows for those runs.
+        run_ids = [r.id for r in latest_by_ticker.values()]
+        stats_rows = (
+            SymbolBacktestStatistics.objects.filter(run_id__in=run_ids, symbol__isnull=False)
+            .select_related('run', 'symbol')
+        )
+        # IMPORTANT: do not key only by run_id; in rare cases duplicates can exist.
+        # Always match the stats row for the run's symbol.
+        stats_by_run_symbol = {(s.run_id, s.symbol_id): s for s in stats_rows}
+
+        cells = []
+        for t in sorted(latest_by_ticker.keys()):
+            run = latest_by_ticker[t]
+            stats = stats_by_run_symbol.get((run.id, run.symbol_id))
+            if not stats:
+                cells.append(
+                    {
+                        'ticker': t,
+                        'run_id': run.id,
+                        'long': {'sharpe': None, 'max_drawdown': None},
+                        'short': {'sharpe': None, 'max_drawdown': None},
+                    }
+                )
                 continue
-            seen.add(t)
-            sym_data = dict(SymbolListSerializer(r.symbol).data)
-            sym_data['snapshot_count'] = count_map.get(t, 0)
-            sym_data['latest_run_id'] = r.id
-            sym_data['latest_run_status'] = r.status
-            sym_data['snapshot_updated_at'] = r.updated_at.isoformat() if r.updated_at else None
-            rows.append(sym_data)
-        rows.sort(key=lambda x: x.get('ticker') or '')
-        return Response({'symbols': rows})
+            modes = normalize_position_modes(run.position_modes)
+            primary = 'long' if 'long' in modes else 'short'
+            secondary = 'short' if primary == 'long' else 'long'
+
+            primary_sharpe = float(stats.sharpe_ratio) if stats.sharpe_ratio is not None else None
+            primary_dd = float(stats.max_drawdown) if stats.max_drawdown is not None else None
+            extra = stats.additional_stats if isinstance(stats.additional_stats, dict) else {}
+            sec_block = extra.get(secondary) or {}
+            secondary_sharpe = None
+            if isinstance(sec_block, dict) and sec_block.get('sharpe_ratio') is not None:
+                try:
+                    secondary_sharpe = float(sec_block.get('sharpe_ratio'))
+                except (TypeError, ValueError):
+                    secondary_sharpe = None
+            secondary_dd = None
+            if isinstance(sec_block, dict) and sec_block.get('max_drawdown') is not None:
+                try:
+                    secondary_dd = float(sec_block.get('max_drawdown'))
+                except (TypeError, ValueError):
+                    secondary_dd = None
+
+            long_metrics = (
+                {'sharpe': primary_sharpe, 'max_drawdown': primary_dd}
+                if primary == 'long'
+                else {'sharpe': secondary_sharpe, 'max_drawdown': secondary_dd}
+            )
+            short_metrics = (
+                {'sharpe': primary_sharpe, 'max_drawdown': primary_dd}
+                if primary == 'short'
+                else {'sharpe': secondary_sharpe, 'max_drawdown': secondary_dd}
+            )
+
+            cells.append({'ticker': t, 'run_id': run.id, 'long': long_metrics, 'short': short_metrics})
+
+        return Response(
+            {
+                'parameter_set': ps.signature,
+                'label': ps.label or '',
+                'cells': cells,
+            }
+        )
 
     @action(detail=True, methods=['delete'], url_path='symbol-runs')
     def delete_all_symbol_runs(self, request, pk=None):

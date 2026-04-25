@@ -349,6 +349,9 @@ class SymbolBacktestRunViewSet(viewsets.ModelViewSet):
         ticker = self.request.query_params.get('ticker', None)
         if ticker:
             qs = qs.filter(symbol__ticker__iexact=ticker)
+        parameter_set = self.request.query_params.get('parameter_set', None)
+        if parameter_set:
+            qs = qs.filter(parameter_set_id=parameter_set)
         return qs
 
     @action(detail=True, methods=['get'])

@@ -398,6 +398,7 @@ class SymbolBacktestRunSerializer(serializers.ModelSerializer):
 
     strategy_name = serializers.CharField(source='strategy.name', read_only=True)
     symbol_info = SymbolListSerializer(source='symbol', read_only=True)
+    parameter_set = serializers.CharField(source='parameter_set_id', read_only=True)
 
     class Meta:
         model = SymbolBacktestRun
@@ -409,6 +410,7 @@ class SymbolBacktestRunSerializer(serializers.ModelSerializer):
             'symbol',
             'symbol_info',
             'broker',
+            'parameter_set',
             'start_date',
             'end_date',
             'split_ratio',

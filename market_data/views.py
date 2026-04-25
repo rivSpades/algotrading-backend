@@ -973,88 +973,159 @@ class PeriodicTaskViewSet(viewsets.ModelViewSet):
 
 class TaskExecutionViewSet(viewsets.ViewSet):
     """ViewSet for managing active tasks and task history"""
+
+    def _redis_from_url(self, url: str):
+        """Best-effort Redis client from redis://host:port/db URL."""
+        if not url or not isinstance(url, str):
+            return None
+        if not url.startswith('redis://'):
+            return None
+        try:
+            # Parse redis://localhost:6379/0
+            parts = url.replace('redis://', '').split('/')
+            host_port = parts[0].split(':')
+            host = host_port[0] if len(host_port) > 0 and host_port[0] else 'localhost'
+            port = int(host_port[1]) if len(host_port) > 1 else 6379
+            db = int(parts[1]) if len(parts) > 1 else 0
+            return redis.Redis(host=host, port=port, db=db, decode_responses=True)
+        except Exception:
+            return None
+
+    def _task_progress_message(self, task_id: str):
+        task_result = AsyncResult(task_id, app=celery_app)
+        progress = 0
+        message = 'Running...'
+        try:
+            backend = task_result.backend
+            if backend:
+                meta = backend.get_task_meta(task_result.id)
+                if meta:
+                    result = meta.get('result')
+                    if isinstance(result, dict):
+                        progress = result.get('progress', 0)
+                        message = result.get('message', 'Running...')
+                    elif meta.get('meta') and isinstance(meta['meta'], dict):
+                        progress = meta['meta'].get('progress', 0)
+                        message = meta['meta'].get('message', 'Running...')
+            if progress == 0 and message == 'Running...':
+                info = task_result.info
+                if isinstance(info, dict):
+                    progress = info.get('progress', 0)
+                    message = info.get('message', 'Running...')
+                elif info:
+                    message = str(info)
+        except Exception:
+            pass
+        return progress, message
     
     @action(detail=False, methods=['get'])
     def active(self, request):
-        """Get all currently active/running tasks"""
+        """
+        Get worker-visible tasks.
+
+        NOTE: Celery inspect only shows tasks once a worker is online.
+        Tasks queued in the broker while no workers are connected are not inspectable,
+        so we also return broker queue depth (Redis broker) for visibility.
+        """
         try:
             inspect = celery_app.control.inspect()
-            active_tasks = inspect.active()
-            
-            if not active_tasks:
-                return Response({
-                    'results': [],
-                    'count': 0
-                })
-            
-            # Flatten the dictionary of worker -> tasks
+            active_tasks = inspect.active() or {}
+            reserved_tasks = inspect.reserved() or {}
+            scheduled_tasks = inspect.scheduled() or {}
+
             all_tasks = []
-            for worker, tasks in active_tasks.items():
-                for task in tasks:
+            seen = set()
+
+            # RUNNING / active
+            for worker, tasks in (active_tasks or {}).items():
+                for task in (tasks or []):
                     task_id = task.get('id')
-                    task_result = AsyncResult(task_id, app=celery_app)
-                    
-                    # Get task info from state metadata
-                    # Celery stores progress in backend metadata when update_state is called
-                    progress = 0
-                    message = 'Running...'
-                    
-                    try:
-                        # First try to get from backend metadata (most reliable)
-                        backend = task_result.backend
-                        if backend:
-                            meta = backend.get_task_meta(task_result.id)
-                            if meta:
-                                # Metadata is stored in meta['result'] when update_state is called
-                                result = meta.get('result')
-                                if isinstance(result, dict):
-                                    progress = result.get('progress', 0)
-                                    message = result.get('message', 'Running...')
-                                # Also check meta['meta'] for some backends
-                                elif meta.get('meta') and isinstance(meta['meta'], dict):
-                                    progress = meta['meta'].get('progress', 0)
-                                    message = meta['meta'].get('message', 'Running...')
-                        
-                        # Fallback to info property
-                        if progress == 0 and message == 'Running...':
-                            info = task_result.info
-                            if isinstance(info, dict):
-                                progress = info.get('progress', 0)
-                                message = info.get('message', 'Running...')
-                            elif info:
-                                message = str(info)
-                    except Exception:
-                        # If all else fails, use defaults
-                        pass
-                    
-                    # Convert time_start from Unix timestamp to ISO format
+                    if not task_id or task_id in seen:
+                        continue
+                    seen.add(task_id)
+                    progress, message = self._task_progress_message(task_id)
+
                     time_start = task.get('time_start')
                     if time_start:
                         try:
                             from datetime import datetime
-                            # time_start is Unix timestamp (seconds since epoch)
-                            time_start_dt = datetime.fromtimestamp(time_start)
-                            time_start = time_start_dt.isoformat()
+                            time_start = datetime.fromtimestamp(time_start).isoformat()
                         except (ValueError, TypeError, OSError):
-                            # If conversion fails, keep original value
                             pass
-                    
-                    all_tasks.append({
-                        'task_id': task_id,
-                        'name': task.get('name', 'Unknown'),
-                        'worker': worker,
-                        'args': task.get('args', []),
-                        'kwargs': task.get('kwargs', {}),
-                        'time_start': time_start,
-                        'progress': progress,
-                        'message': message,
-                        'status': 'RUNNING'
-                    })
-            
-            return Response({
-                'results': all_tasks,
-                'count': len(all_tasks)
-            })
+
+                    all_tasks.append(
+                        {
+                            'task_id': task_id,
+                            'name': task.get('name', 'Unknown'),
+                            'worker': worker,
+                            'args': task.get('args', []),
+                            'kwargs': task.get('kwargs', {}),
+                            'time_start': time_start,
+                            'progress': progress,
+                            'message': message,
+                            'status': 'RUNNING',
+                        }
+                    )
+
+            # RESERVED (prefetched, not started)
+            for worker, tasks in (reserved_tasks or {}).items():
+                for task in (tasks or []):
+                    task_id = task.get('id')
+                    if not task_id or task_id in seen:
+                        continue
+                    seen.add(task_id)
+                    progress, message = self._task_progress_message(task_id)
+                    all_tasks.append(
+                        {
+                            'task_id': task_id,
+                            'name': task.get('name', 'Unknown'),
+                            'worker': worker,
+                            'args': task.get('args', []),
+                            'kwargs': task.get('kwargs', {}),
+                            'time_start': None,
+                            'progress': progress,
+                            'message': message or 'Reserved…',
+                            'status': 'RESERVED',
+                        }
+                    )
+
+            # SCHEDULED (ETA/countdown)
+            for worker, tasks in (scheduled_tasks or {}).items():
+                for entry in (tasks or []):
+                    task = entry.get('request') if isinstance(entry, dict) else None
+                    if not isinstance(task, dict):
+                        continue
+                    task_id = task.get('id')
+                    if not task_id or task_id in seen:
+                        continue
+                    seen.add(task_id)
+                    progress, message = self._task_progress_message(task_id)
+                    all_tasks.append(
+                        {
+                            'task_id': task_id,
+                            'name': task.get('name', 'Unknown'),
+                            'worker': worker,
+                            'args': task.get('args', []),
+                            'kwargs': task.get('kwargs', {}),
+                            'time_start': None,
+                            'progress': progress,
+                            'message': message or 'Scheduled…',
+                            'status': 'SCHEDULED',
+                        }
+                    )
+
+            # Broker queue depth (Redis broker, default queue "celery")
+            broker = {'pending': None, 'queue_key': None, 'error': None}
+            try:
+                r = self._redis_from_url(settings.CELERY_BROKER_URL)
+                if r:
+                    queue_key = 'celery'
+                    broker['queue_key'] = queue_key
+                    broker['pending'] = int(r.llen(queue_key))
+            except Exception as ex:
+                broker['error'] = str(ex)
+
+            return Response({'results': all_tasks, 'count': len(all_tasks), 'broker': broker})
         except Exception as e:
             return Response({
                 'error': f'Failed to get active tasks: {str(e)}',
@@ -1067,8 +1138,12 @@ class TaskExecutionViewSet(viewsets.ViewSet):
         """Stop/revoke a running task"""
         task_id = pk
         try:
-            # Revoke the task
-            celery_app.control.revoke(task_id, terminate=True)
+            terminate = request.data.get('terminate', True)
+            try:
+                terminate = bool(terminate)
+            except Exception:
+                terminate = True
+            celery_app.control.revoke(task_id, terminate=terminate)
             
             return Response({
                 'message': f'Task {task_id} has been stopped',
@@ -1078,6 +1153,23 @@ class TaskExecutionViewSet(viewsets.ViewSet):
             return Response({
                 'error': f'Failed to stop task: {str(e)}'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=False, methods=['post'])
+    def purge(self, request):
+        """
+        Purge pending broker messages for the default queue.
+        This is the only reliable way to stop tasks that are queued while no workers are online.
+        """
+        try:
+            r = self._redis_from_url(settings.CELERY_BROKER_URL)
+            if not r:
+                return Response({'error': 'Broker is not Redis or could not be parsed'}, status=status.HTTP_400_BAD_REQUEST)
+            queue_key = str(request.data.get('queue_key') or 'celery')
+            pending = int(r.llen(queue_key))
+            r.delete(queue_key)
+            return Response({'message': f'Purged {pending} pending task message(s).', 'pending_deleted': pending, 'queue_key': queue_key})
+        except Exception as e:
+            return Response({'error': f'Failed to purge broker queue: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     
     @action(detail=False, methods=['get'])
     def history(self, request):
@@ -1194,7 +1286,46 @@ class TaskExecutionViewSet(viewsets.ViewSet):
         task_id = pk
         try:
             task_result = AsyncResult(task_id, app=celery_app)
-            
+
+            # Prefer backend metadata when available (works for PROGRESS updates).
+            meta = None
+            try:
+                backend = task_result.backend
+                if backend:
+                    meta = backend.get_task_meta(task_result.id)
+            except Exception:
+                meta = None
+
+            def _extract_running_payload():
+                # Celery stores update_state(meta=...) under meta['result'] for many backends.
+                if isinstance(meta, dict):
+                    r = meta.get('result')
+                    if isinstance(r, dict):
+                        return {
+                            'status': str(r.get('status') or task_result.state or 'running').lower(),
+                            'progress': r.get('progress', 0),
+                            'message': r.get('message', 'Running...'),
+                        }
+                    m = meta.get('meta')
+                    if isinstance(m, dict):
+                        return {
+                            'status': str(m.get('status') or task_result.state or 'running').lower(),
+                            'progress': m.get('progress', 0),
+                            'message': m.get('message', 'Running...'),
+                        }
+                info = task_result.info
+                if isinstance(info, dict):
+                    return {
+                        'status': str(info.get('status') or task_result.state or 'running').lower(),
+                        'progress': info.get('progress', 0),
+                        'message': info.get('message', 'Running...'),
+                    }
+                return {
+                    'status': str(task_result.state or 'pending').lower(),
+                    'progress': 0,
+                    'message': 'Task is pending',
+                }
+
             if task_result.ready():
                 if task_result.successful():
                     result = task_result.result
@@ -1232,26 +1363,17 @@ class TaskExecutionViewSet(viewsets.ViewSet):
                         'success': False
                     })
             else:
-                # Task still running
-                info = task_result.info
-                if isinstance(info, dict):
-                    return Response({
+                payload = _extract_running_payload()
+                return Response(
+                    {
                         'task_id': task_id,
-                        'status': 'running',
-                        'progress': info.get('progress', 0),
-                        'message': info.get('message', 'Running...'),
+                        'status': payload.get('status') or 'running',
+                        'progress': payload.get('progress', 0),
+                        'message': payload.get('message', 'Running...'),
                         'ready': False,
-                        'success': None
-                    })
-                else:
-                    return Response({
-                        'task_id': task_id,
-                        'status': 'pending',
-                        'progress': 0,
-                        'message': 'Task is pending',
-                        'ready': False,
-                        'success': None
-                    })
+                        'success': None,
+                    }
+                )
         except Exception as e:
             return Response({
                 'error': f'Failed to get task status: {str(e)}',

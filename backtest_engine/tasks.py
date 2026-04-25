@@ -3,6 +3,7 @@ Celery tasks for backtest execution
 """
 
 from celery import shared_task
+import time
 from django.utils import timezone
 from django.db import connections
 from .models import (
@@ -1226,6 +1227,8 @@ def bulk_symbol_runs_queue_task(self, strategy_id: int, tickers: list, run_body:
     from strategies.models import StrategyDefinition, StrategyAssignment
     from market_data.models import Symbol
     from live_trading.models import Broker
+    from backtest_engine.models import SymbolBacktestParameterSet
+    from backtest_engine.parameter_sets import build_symbol_run_parameter_payload, signature_for_payload
 
     tickers = [str(t).strip().upper() for t in (tickers or []) if str(t).strip()]
     total = len(tickers)
@@ -1247,6 +1250,51 @@ def bulk_symbol_runs_queue_task(self, strategy_id: int, tickers: list, run_body:
     # Remove keys that are not SymbolBacktestRun fields
     base_body.pop('symbol_tickers', None)
     base_body.pop('strategy_id', None)
+
+    # Create/get the shared parameter_set for this bulk request (shared across symbols).
+    # Signature excludes symbol and name by design.
+    start_dt = base_body.get('start_date') or timezone.now().replace(year=1900, month=1, day=1)
+    end_dt = base_body.get('end_date') or timezone.now()
+    # Accept ISO strings (API payload) as well as datetimes.
+    try:
+        from django.utils.dateparse import parse_datetime
+        if isinstance(start_dt, str):
+            start_dt = parse_datetime(start_dt) or start_dt
+        if isinstance(end_dt, str):
+            end_dt = parse_datetime(end_dt) or end_dt
+    except Exception:
+        pass
+    position_modes = normalize_position_modes(base_body.get('position_modes'))
+    # IMPORTANT: parameter_set is based on the user-chosen base config (not per-symbol assignment overrides),
+    # so many symbols can be grouped under the same global identifier for cross-symbol analysis.
+    payload = build_symbol_run_parameter_payload(
+        strategy_id=strategy.id,
+        broker_id=broker.id if broker else None,
+        start_date=start_dt,
+        end_date=end_dt,
+        split_ratio=base_body.get('split_ratio', 0.7),
+        initial_capital=base_body.get('initial_capital', 10000.0),
+        bet_size_percentage=base_body.get('bet_size_percentage', 100.0),
+        strategy_parameters=base_body.get('strategy_parameters') or {},
+        position_modes=position_modes,
+        hedge_enabled=bool(base_body.get('hedge_enabled', False)),
+        run_strategy_only_baseline=bool(base_body.get('run_strategy_only_baseline', True)),
+        hedge_config=base_body.get('hedge_config') or {},
+    )
+    sig = signature_for_payload(payload)
+    bulk_label = (base_body.get('name') or '').strip()
+    ps, _created = SymbolBacktestParameterSet.objects.get_or_create(
+        signature=sig,
+        defaults={
+            'strategy': strategy,
+            'broker': broker,
+            'parameters': payload,
+            'label': bulk_label[:200] if bulk_label else '',
+        },
+    )
+    if bulk_label and not ps.label:
+        ps.label = bulk_label[:200]
+        ps.save(update_fields=['label'])
 
     for idx, ticker in enumerate(tickers):
         progress = int(((idx) / max(total, 1)) * 100)
@@ -1273,6 +1321,7 @@ def bulk_symbol_runs_queue_task(self, strategy_id: int, tickers: list, run_body:
                 strategy=strategy,
                 symbol=sym,
                 broker=broker,
+                parameter_set=ps,
                 start_date=base_body.get('start_date') or timezone.now().replace(year=1900, month=1, day=1),
                 end_date=base_body.get('end_date') or timezone.now(),
                 split_ratio=base_body.get('split_ratio', 0.7),
@@ -1290,14 +1339,62 @@ def bulk_symbol_runs_queue_task(self, strategy_id: int, tickers: list, run_body:
         except Exception as e:
             errors.append({'ticker': ticker, 'error': str(e)})
 
-    self.update_state(state='SUCCESS', meta={'progress': 100, 'message': f'Queued {len(runs)} run(s).'})
+    # Wait for all queued runs to finish so the UI "100%" means truly done.
+    run_ids = [r.get('run_id') for r in runs if r.get('run_id') is not None]
+    terminal = {'completed', 'failed'}
+    total_runs = len(run_ids)
+    if total_runs == 0:
+        self.update_state(state='SUCCESS', meta={'progress': 100, 'message': 'No runs were queued.'})
+        return {
+            'status': 'completed',
+            'progress': 100,
+            'message': 'No runs were queued.',
+            'queued': runs,
+            'errors': errors,
+            'total_requested': total,
+            'total_queued': len(runs),
+            'total_completed': 0,
+            'total_failed': 0,
+            'parameter_set': ps.signature,
+        }
+
+    # Poll DB; avoids needing to track all subtask ids.
+    while True:
+        statuses = (
+            SymbolBacktestRun.objects.filter(id__in=run_ids)
+            .values_list('status', flat=True)
+        )
+        done = sum(1 for s in statuses if s in terminal)
+        failed = sum(1 for s in statuses if s == 'failed')
+        progress = int(done / max(total_runs, 1) * 100)
+        self.update_state(
+            state='PROGRESS' if done < total_runs else 'SUCCESS',
+            meta={
+                'progress': progress,
+                'message': f'Running symbol backtests… {done}/{total_runs} finished',
+                'queued': runs,
+                'errors': errors,
+                'total_requested': total,
+                'total_queued': len(runs),
+                'total_completed': done - failed,
+                'total_failed': failed,
+                'parameter_set': ps.signature,
+            },
+        )
+        if done >= total_runs:
+            break
+        time.sleep(3)
+
     return {
         'status': 'completed',
         'progress': 100,
-        'message': f'Queued {len(runs)} symbol run(s).',
+        'message': f'Completed {done}/{total_runs} symbol run(s).',
         'queued': runs,
         'errors': errors,
         'total_requested': total,
         'total_queued': len(runs),
+        'total_completed': done - failed,
+        'total_failed': failed,
+        'parameter_set': ps.signature,
     }
 

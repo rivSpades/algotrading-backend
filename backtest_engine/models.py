@@ -297,6 +297,16 @@ class SymbolBacktestRun(models.Model):
         help_text="Broker used for this run (optional - used for broker-aware filtering)",
     )
 
+    # Global identifier for the chosen parameter set (shared across many symbols/runs).
+    parameter_set = models.ForeignKey(
+        'backtest_engine.SymbolBacktestParameterSet',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='runs',
+        help_text="Deterministic global identifier derived from chosen parameters (used to group runs across symbols)",
+    )
+
     start_date = models.DateTimeField(help_text="Run start date")
     end_date = models.DateTimeField(help_text="Run end date")
     split_ratio = models.FloatField(
@@ -358,6 +368,48 @@ class SymbolBacktestRun(models.Model):
 
     def __str__(self):
         return f'{self.strategy.name} - {self.symbol.ticker} ({self.status})'
+
+
+class SymbolBacktestParameterSet(models.Model):
+    """
+    Global identifier for a single-symbol run configuration.
+
+    The primary key is a deterministic signature (sha256 hex) of a canonical JSON payload
+    describing the chosen parameters (strategy + run config, excluding symbol and name).
+    """
+
+    signature = models.CharField(max_length=64, primary_key=True)
+    label = models.CharField(
+        max_length=200,
+        blank=True,
+        help_text="Human-friendly name for this parameter set (used in UI selectors)",
+    )
+    strategy = models.ForeignKey(
+        StrategyDefinition,
+        on_delete=models.CASCADE,
+        related_name='symbol_backtest_parameter_sets',
+    )
+    broker = models.ForeignKey(
+        'live_trading.Broker',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='symbol_backtest_parameter_sets',
+    )
+    parameters = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['strategy', '-created_at']),
+            models.Index(fields=['broker']),
+        ]
+        verbose_name = 'Symbol backtest parameter set'
+        verbose_name_plural = 'Symbol backtest parameter sets'
+
+    def __str__(self):
+        return f'{self.strategy.name} parameter_set {self.signature[:10]}…'
 
 
 class SymbolBacktestTrade(models.Model):
