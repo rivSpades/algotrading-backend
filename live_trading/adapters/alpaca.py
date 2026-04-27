@@ -6,7 +6,8 @@ Implements BaseBrokerAdapter for Alpaca API
 import requests
 from typing import Optional, Dict, List
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timedelta
+from django.utils import timezone
 
 from .base import BaseBrokerAdapter, OrderResult, PositionInfo
 from ..models import Broker
@@ -124,6 +125,53 @@ class AlpacaBrokerAdapter(BaseBrokerAdapter):
             return None
         except Exception as e:
             print(f"Error getting Alpaca current price for {symbol}: {e}")
+            return None
+
+    def get_session_open_price(
+        self,
+        symbol: str,
+        *,
+        session_open: datetime,
+        window_minutes: int = 6,
+        feed: str = 'iex',
+    ) -> Optional[Decimal]:
+        """Return the session open price using minute bars around `session_open`.
+
+        Uses Alpaca *data* API (`https://data.alpaca.markets`) regardless of the
+        trading endpoint configured on the Broker model.
+        """
+        try:
+            if session_open is None:
+                return None
+            if timezone.is_naive(session_open):
+                session_open = timezone.make_aware(session_open, timezone=timezone.utc)
+            start = session_open
+            end = session_open + timedelta(minutes=max(1, int(window_minutes)))
+
+            # Alpaca market data base URL differs from trading endpoint.
+            data_base = 'https://data.alpaca.markets'
+            url = f'{data_base}/v2/stocks/{symbol}/bars'
+            params = {
+                'timeframe': '1Min',
+                'start': start.isoformat().replace('+00:00', 'Z'),
+                'end': end.isoformat().replace('+00:00', 'Z'),
+                'limit': 10,
+                'sort': 'asc',
+                'feed': feed,
+                'adjustment': 'all',
+            }
+            resp = requests.get(url, headers=self.headers, params=params, timeout=10)
+            if resp.status_code != 200:
+                return None
+            payload = resp.json() or {}
+            bars = payload.get('bars') or []
+            if not bars:
+                return None
+            first = bars[0]
+            o = first.get('o')
+            return Decimal(str(o)) if o is not None else None
+        except Exception as e:
+            print(f"Error getting Alpaca session open for {symbol}: {e}")
             return None
     
     def place_order(

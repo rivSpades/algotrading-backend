@@ -131,3 +131,64 @@ class OHLCV(models.Model):
 
     def __str__(self):
         return f"{self.symbol.ticker} - {self.timestamp} ({self.timeframe})"
+
+
+class ExchangeSchedule(models.Model):
+    """Exchange trading hours expressed in UTC.
+
+    Used to group deployments by their open time so a single Celery Beat
+    schedule can fan out signals for all exchanges that share the same
+    open minute (e.g. NYSE/NASDAQ both open at 13:30 UTC).
+    """
+
+    exchange = models.ForeignKey(
+        Exchange,
+        on_delete=models.CASCADE,
+        related_name='schedules',
+    )
+    open_utc = models.TimeField(help_text="Market open time expressed in UTC")
+    close_utc = models.TimeField(help_text="Market close time expressed in UTC")
+    weekdays = models.CharField(
+        max_length=20,
+        default='1,2,3,4,5',
+        help_text=(
+            "Comma-separated list of ISO weekdays this schedule applies to "
+            "(1=Mon … 7=Sun). Default 1,2,3,4,5 = Mon–Fri."
+        ),
+    )
+    active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['exchange__code', 'open_utc']
+        unique_together = [['exchange', 'open_utc', 'close_utc', 'weekdays']]
+        indexes = [
+            models.Index(fields=['active', 'open_utc']),
+            models.Index(fields=['exchange', 'active']),
+        ]
+        verbose_name = 'Exchange Schedule'
+        verbose_name_plural = 'Exchange Schedules'
+
+    def __str__(self):
+        return f"{self.exchange.code} {self.open_utc.strftime('%H:%M')}-{self.close_utc.strftime('%H:%M')} UTC"
+
+    def weekday_list(self):
+        """Return the schedule's weekdays as a sorted list of ints (1-7)."""
+        result = []
+        for piece in (self.weekdays or '').split(','):
+            piece = piece.strip()
+            if not piece:
+                continue
+            try:
+                value = int(piece)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= value <= 7:
+                result.append(value)
+        return sorted(set(result))
+
+    def open_group_key(self):
+        """Stable identifier for grouping schedules with the same open slot."""
+        weekdays_norm = ','.join(str(d) for d in self.weekday_list())
+        return f"{self.open_utc.strftime('%H%M')}_{weekdays_norm}"

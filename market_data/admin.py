@@ -3,7 +3,7 @@ Admin configuration for market_data app
 """
 
 from django.contrib import admin
-from .models import Symbol, Exchange, Provider, OHLCV
+from .models import Symbol, Exchange, ExchangeSchedule, Provider, OHLCV
 
 
 @admin.register(Exchange)
@@ -11,6 +11,14 @@ class ExchangeAdmin(admin.ModelAdmin):
     list_display = ['name', 'code', 'country', 'timezone']
     search_fields = ['name', 'code']
     list_filter = ['country']
+
+
+@admin.register(ExchangeSchedule)
+class ExchangeScheduleAdmin(admin.ModelAdmin):
+    list_display = ['exchange', 'open_utc', 'close_utc', 'weekdays', 'active', 'updated_at']
+    list_filter = ['active', 'exchange']
+    search_fields = ['exchange__name', 'exchange__code']
+    readonly_fields = ['created_at', 'updated_at']
 
 
 @admin.register(Provider)

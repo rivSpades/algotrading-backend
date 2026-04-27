@@ -472,6 +472,17 @@ class StrategyDefinitionViewSet(viewsets.ModelViewSet):
         # Always match the stats row for the run's symbol.
         stats_by_run_symbol = {(s.run_id, s.symbol_id): s for s in stats_rows}
 
+        def _safe_int(value):
+            if value is None:
+                return None
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                try:
+                    return int(float(value))
+                except (TypeError, ValueError):
+                    return None
+
         cells = []
         for t in sorted(latest_by_ticker.keys()):
             run = latest_by_ticker[t]
@@ -481,8 +492,8 @@ class StrategyDefinitionViewSet(viewsets.ModelViewSet):
                     {
                         'ticker': t,
                         'run_id': run.id,
-                        'long': {'sharpe': None, 'max_drawdown': None},
-                        'short': {'sharpe': None, 'max_drawdown': None},
+                        'long': {'sharpe': None, 'max_drawdown': None, 'total_trades': None},
+                        'short': {'sharpe': None, 'max_drawdown': None, 'total_trades': None},
                     }
                 )
                 continue
@@ -492,30 +503,39 @@ class StrategyDefinitionViewSet(viewsets.ModelViewSet):
 
             primary_sharpe = float(stats.sharpe_ratio) if stats.sharpe_ratio is not None else None
             primary_dd = float(stats.max_drawdown) if stats.max_drawdown is not None else None
+            primary_trades = _safe_int(getattr(stats, 'total_trades', None))
             extra = stats.additional_stats if isinstance(stats.additional_stats, dict) else {}
+
+            primary_block = extra.get(primary) if isinstance(extra.get(primary), dict) else {}
+            if primary_trades is None and primary_block:
+                primary_trades = _safe_int(primary_block.get('total_trades'))
+
             sec_block = extra.get(secondary) or {}
             secondary_sharpe = None
-            if isinstance(sec_block, dict) and sec_block.get('sharpe_ratio') is not None:
-                try:
-                    secondary_sharpe = float(sec_block.get('sharpe_ratio'))
-                except (TypeError, ValueError):
-                    secondary_sharpe = None
             secondary_dd = None
-            if isinstance(sec_block, dict) and sec_block.get('max_drawdown') is not None:
-                try:
-                    secondary_dd = float(sec_block.get('max_drawdown'))
-                except (TypeError, ValueError):
-                    secondary_dd = None
+            secondary_trades = None
+            if isinstance(sec_block, dict):
+                if sec_block.get('sharpe_ratio') is not None:
+                    try:
+                        secondary_sharpe = float(sec_block.get('sharpe_ratio'))
+                    except (TypeError, ValueError):
+                        secondary_sharpe = None
+                if sec_block.get('max_drawdown') is not None:
+                    try:
+                        secondary_dd = float(sec_block.get('max_drawdown'))
+                    except (TypeError, ValueError):
+                        secondary_dd = None
+                secondary_trades = _safe_int(sec_block.get('total_trades'))
 
             long_metrics = (
-                {'sharpe': primary_sharpe, 'max_drawdown': primary_dd}
+                {'sharpe': primary_sharpe, 'max_drawdown': primary_dd, 'total_trades': primary_trades}
                 if primary == 'long'
-                else {'sharpe': secondary_sharpe, 'max_drawdown': secondary_dd}
+                else {'sharpe': secondary_sharpe, 'max_drawdown': secondary_dd, 'total_trades': secondary_trades}
             )
             short_metrics = (
-                {'sharpe': primary_sharpe, 'max_drawdown': primary_dd}
+                {'sharpe': primary_sharpe, 'max_drawdown': primary_dd, 'total_trades': primary_trades}
                 if primary == 'short'
-                else {'sharpe': secondary_sharpe, 'max_drawdown': secondary_dd}
+                else {'sharpe': secondary_sharpe, 'max_drawdown': secondary_dd, 'total_trades': secondary_trades}
             )
 
             cells.append({'ticker': t, 'run_id': run.id, 'long': long_metrics, 'short': short_metrics})

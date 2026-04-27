@@ -21,10 +21,13 @@ from .services.hybrid_vix_hedge import (
     resolved_hedge_config_for_backtest,
     merge_defaults_into_hedge_config,
     get_hedge_lab_saved_overrides,
+    compute_hedge_panic_snapshot,
 )
+import json
+import logging
+
 from market_data.models import Symbol
 from .services.create_backtest import create_backtest_from_validated_data
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -208,6 +211,60 @@ class BacktestViewSet(viewsets.ModelViewSet):
             float(vd['initial_capital']),
             merged_cfg,
             yahoo_only=bool(vd.get('use_yahoo_only', True)),
+        )
+        return Response(result)
+
+    @action(detail=False, methods=['get'], url_path='hedge-panic-snapshot')
+    def hedge_panic_snapshot(self, request):
+        """Current VIX z-stress and level vs the hybrid hedge panic rule (same as live overlay)."""
+        yahoo_only = str(request.query_params.get('use_yahoo_only', 'true')).lower() in (
+            '1', 'true', 'yes', '',
+        )
+        user_cfg = {}
+        raw = request.query_params.get('hedge_config')
+        if raw:
+            try:
+                user_cfg = json.loads(raw)
+            except json.JSONDecodeError:
+                return Response({'error': 'Invalid hedge_config JSON'}, status=400)
+            if not isinstance(user_cfg, dict):
+                return Response({'error': 'hedge_config must be a JSON object'}, status=400)
+
+        dep_id = request.query_params.get('deployment')
+        if dep_id:
+            from live_trading.models import StrategyDeployment
+
+            dep = get_object_or_404(StrategyDeployment, pk=dep_id)
+            if not getattr(dep, 'hedge_enabled', False):
+                return Response(
+                    {
+                        'error': (
+                            'Hedge is disabled for this deployment; omit deployment= '
+                            'or pick a deployment with hedge enabled.'
+                        ),
+                    },
+                    status=400,
+                )
+            effective = resolved_hedge_config_for_backtest(dep.hedge_config or {})
+        else:
+            effective = resolved_hedge_config_for_backtest(
+                merge_lab_overrides_with_request(user_cfg)
+            )
+
+        include_chart = str(
+            request.query_params.get('include_chart', 'true'),
+        ).lower() not in ('0', 'false', 'no')
+        try:
+            chart_tail_days = int(request.query_params.get('chart_tail_days', '90'))
+        except (TypeError, ValueError):
+            chart_tail_days = 90
+        chart_tail_days = max(1, min(chart_tail_days, 500))
+
+        result = compute_hedge_panic_snapshot(
+            effective,
+            yahoo_only=yahoo_only,
+            include_chart=include_chart,
+            chart_tail_days=chart_tail_days,
         )
         return Response(result)
 

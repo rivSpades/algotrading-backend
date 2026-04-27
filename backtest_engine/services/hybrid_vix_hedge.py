@@ -386,6 +386,222 @@ def compute_trade_hedge_overlay(
     }
 
 
+def _hedge_panic_daily_rows(df: pd.DataFrame, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """One row per session after warmup — same gating as :func:`compute_trade_hedge_overlay`."""
+    Z_TH = float(cfg["z_threshold"])
+    VIX_FLOOR = float(cfg["vix_floor"])
+    SMOOTH_WIN = int(cfg["smooth_win"])
+    PANIC_SPY = float(cfg["panic_spy_weight"])
+    PANIC_VIXY = float(cfg["panic_vixy_weight"])
+    STATIC_SPY = float(cfg["normal_spy_weight"])
+    STATIC_SPREAD = float(cfg["normal_spread_weight"])
+    RW = int(cfg["rolling_vix_window"])
+    BETA_W = int(cfg["rolling_beta_window"])
+    MIN_W = int(cfg["min_warmup_days"])
+
+    n = len(df)
+    waiting_reset = False
+    out: List[Dict[str, Any]] = []
+    for i in range(n):
+        if i < MIN_W:
+            continue
+
+        vix_hist = df["VIX_Spot"].iloc[i - (RW + 3) : i]
+        rolling_m = vix_hist.rolling(RW).mean()
+        rolling_s = vix_hist.rolling(RW).std().replace(0, np.nan)
+        z_raw = (vix_hist - rolling_m) / rolling_s
+        z_last = z_raw.iloc[-SMOOTH_WIN:].dropna()
+        smoothed_z = float(z_last.mean()) if len(z_last) else 0.0
+
+        vix_yesterday = float(df["VIX_Spot"].iloc[i - 1])
+        row = df.iloc[i]
+        vix_today = float(row["VIX_Spot"])
+
+        if waiting_reset and smoothed_z < 0:
+            waiting_reset = False
+
+        is_panic = (smoothed_z > Z_TH) and (vix_yesterday > VIX_FLOOR) and (not waiting_reset)
+
+        if is_panic:
+            w_s, w_h = PANIC_SPY, PANIC_VIXY
+        else:
+            if smoothed_z > Z_TH:
+                waiting_reset = True
+            v_m_win = df["VIXM_Ret"].iloc[i - BETA_W : i].values
+            v_y_win = df["VIXY_Ret"].iloc[i - BETA_W : i].values
+            var_y = np.var(v_y_win)
+            if var_y < 1e-16:
+                dyn_ratio = 1.0
+            else:
+                dyn_ratio = float(np.cov(v_m_win, v_y_win)[0, 1] / var_y)
+                if not np.isfinite(dyn_ratio):
+                    dyn_ratio = 1.0
+            w_s, w_h = STATIC_SPY, STATIC_SPREAD
+
+        z_arm_met = smoothed_z > Z_TH
+        vix_arm_met = vix_yesterday > VIX_FLOOR
+        z_points_to_stress = max(0.0, Z_TH - smoothed_z)
+        vix_points_above_floor = max(0.0, VIX_FLOOR - vix_yesterday)
+
+        idx_ts = df.index[i]
+        as_of = pd.Timestamp(idx_ts).strftime("%Y-%m-%d")
+        as_of_ns = _overlay_row_day_ns(idx_ts)
+
+        out.append(
+            {
+                "as_of": as_of,
+                "as_of_index_ns": as_of_ns,
+                "z_threshold": Z_TH,
+                "vix_floor": VIX_FLOOR,
+                "smoothed_vix_z": round(smoothed_z, 6),
+                "vix_for_rule_prior_day": round(vix_yesterday, 4),
+                "vix_spot_on_as_of": round(vix_today, 4),
+                "z_stress_satisfied": z_arm_met,
+                "vix_level_satisfied": vix_arm_met,
+                "z_points_still_below_threshold": round(z_points_to_stress, 6)
+                if not z_arm_met
+                else 0.0,
+                "vix_points_still_needed_above_floor": round(vix_points_above_floor, 4)
+                if not vix_arm_met
+                else 0.0,
+                "z_headroom": round(Z_TH - smoothed_z, 6),
+                "vix_excess_over_floor": round(vix_yesterday - VIX_FLOOR, 4),
+                "both_arms_satisfied": bool(z_arm_met and vix_arm_met),
+                "panic_blocked_by_hysteresis": bool(
+                    (not is_panic) and z_arm_met and vix_arm_met
+                ),
+                "is_panic": bool(is_panic),
+                "waiting_reset": bool(waiting_reset),
+                "w_strategy": float(w_s),
+                "w_hedge": float(w_h),
+            }
+        )
+    return out
+
+
+def compute_hedge_panic_snapshot(
+    hedge_config: Optional[Dict] = None,
+    *,
+    yahoo_only: bool = True,
+    end_at: Optional[datetime] = None,
+    include_chart: bool = True,
+    chart_tail_days: int = 90,
+) -> Dict[str, Any]:
+    """
+    Live / dashboard: latest hybrid-VIX panic gating and distance to the two arms
+    (Z-stress and prior-day VIX vs floor), using the same loop as
+    :func:`compute_trade_hedge_overlay` and the same windowing as
+    :func:`live_hedge_weights_at` (end_at aligned to last common session in frame).
+
+    When ``include_chart`` is True, appends a ``chart`` object with the last
+    ``chart_tail_days`` sessions (for dashboard time-series / threshold lines).
+
+    The capital split :math:`w_{strategy} / w_{hedge}` does not differ between long
+    and short deployments; only the main symbol's direction changes in live trading.
+    """
+    cfg = _merge_hedge_config(hedge_config)
+    MIN_W = int(cfg["min_warmup_days"])
+    end_dt = _normalize_dt(end_at) if end_at is not None else timezone.now()
+    start_dt = end_dt - timedelta(days=400)
+    load_start = start_dt - timedelta(days=200)
+    df, meta = _build_aligned_frame(load_start, end_dt, yahoo_only=yahoo_only)
+    if df.empty:
+        return {
+            "error": "; ".join(meta.get("errors", [])) or "No hedge overlay data",
+            "data_source": meta.get("data_source", "database"),
+            "config": cfg,
+        }
+
+    n = len(df)
+    if n < MIN_W + 1:
+        return {
+            "regime": "warmup",
+            "min_warmup_days": MIN_W,
+            "bars_loaded": n,
+            "data_source": meta.get("data_source", "database"),
+            "config": cfg,
+        }
+
+    daily = _hedge_panic_daily_rows(df, cfg)
+    if not daily:
+        return {
+            "regime": "warmup",
+            "min_warmup_days": MIN_W,
+            "bars_loaded": n,
+            "data_source": meta.get("data_source", "database"),
+            "config": cfg,
+        }
+
+    snap: Dict[str, Any] = dict(daily[-1])
+    for k in ("z_threshold", "vix_floor"):
+        del snap[k]
+    snap["data_source"] = meta.get("data_source", "database")
+    snap["config"] = cfg
+    snap["z_threshold"] = float(cfg["z_threshold"])
+    snap["vix_floor"] = float(cfg["vix_floor"])
+
+    if snap.get("panic_blocked_by_hysteresis"):
+        snap["hysteresis_note"] = (
+            "VIX and Z criteria are in stress territory, but the overlay still uses the "
+            "normal spread path until mean Z rolls below 0 (hysteresis latch)."
+        )
+    else:
+        snap["hysteresis_note"] = None
+    snap["position_modes"] = {
+        "long": {
+            "w_strategy": snap["w_strategy"],
+            "w_hedge": snap["w_hedge"],
+            "interpretation": "Strategy leg: long the traded symbol. Hedge: vol sleeve (VIXY proxy).",
+        },
+        "short": {
+            "w_strategy": snap["w_strategy"],
+            "w_hedge": snap["w_hedge"],
+            "interpretation": "Strategy leg: short the traded symbol. Hedge: same vol-sleeve split as long.",
+        },
+    }
+    snap["note"] = (
+        "Regime and w_strategy / w_hedge are the same for long and short; only the main "
+        "position direction changes in live."
+    )
+    snap["regime"] = (
+        "panic"
+        if snap["is_panic"]
+        else (
+            "hysteresis"
+            if snap.get("panic_blocked_by_hysteresis")
+            else "normal"
+        )
+    )
+
+    if include_chart and chart_tail_days > 0:
+        zt = float(cfg["z_threshold"])
+        vf = float(cfg["vix_floor"])
+        tail = daily[-chart_tail_days:]
+        snap["chart"] = {
+            "z_threshold": zt,
+            "vix_floor": vf,
+            "y_label_z": "VIX z-score (smoothed)",
+            "y_label_vix": "VIX, prior day (rule input)",
+            "caption": (
+                "Z and VIX vs thresholds, then a three-way sleeve bar: normal (grey), "
+                "hysteresis (amber) = both rules true but model holds spread until mean z < 0, "
+                "panic (red) = heavy VIXY sleeve. "
+            ),
+            "points": [
+                {
+                    "d": r["as_of"],
+                    "z": r["smoothed_vix_z"],
+                    "vixP": r["vix_for_rule_prior_day"],
+                    "panic": bool(r["is_panic"]),
+                    "hysteresis_block": bool(r["panic_blocked_by_hysteresis"]),
+                    "waiting_reset": bool(r["waiting_reset"]),
+                }
+                for r in tail
+            ],
+        }
+    return snap
+
+
 def _metrics_from_returns(equity: np.ndarray, daily_ret: np.ndarray) -> Dict[str, float]:
     if len(equity) < 2 or len(daily_ret) < 2:
         return {"total_return_pct": 0.0, "sharpe_ratio": 0.0, "max_drawdown_pct": 0.0}
@@ -621,3 +837,50 @@ def run_hybrid_vix_hedge_for_backtest(
         float(initial_capital),
         cfg,
     )
+
+
+def live_hedge_weights_at(
+    fire_at,
+    hedge_config: Optional[Dict],
+    *,
+    yahoo_only: bool = True,
+) -> Tuple[float, float, Dict[str, Any]]:
+    """Strategy vs hedge capital weights for *fire_at*'s trading day (live entry).
+
+    Uses the same overlay as backtests. On failure, returns ``(1.0, 0.0, meta)``
+    so the entry falls back to a single strategy leg.
+    """
+    meta: Dict[str, Any] = {}
+    end_dt = _normalize_dt(fire_at)
+    start_dt = end_dt - timedelta(days=400)
+    overlay = compute_trade_hedge_overlay(
+        start_dt, end_dt, hedge_config, yahoo_only=yahoo_only,
+    )
+    if not overlay or overlay.get('error'):
+        meta['error'] = (overlay or {}).get('error', 'no_overlay')
+        return 1.0, 0.0, meta
+
+    index_ns = overlay.get('index_ns') or []
+    ws = overlay.get('w_strategy') or []
+    wh = overlay.get('w_hedge') or []
+    if not index_ns or not ws or not wh:
+        meta['error'] = 'empty_overlay'
+        return 1.0, 0.0, meta
+
+    target = _overlay_row_day_ns(fire_at)
+    try:
+        idx = list(index_ns).index(target)
+    except ValueError:
+        # Use last day at or before fire_at (rare edge if holiday mismatch)
+        best_i = -1
+        for i, ns in enumerate(index_ns):
+            if ns <= target:
+                best_i = i
+        idx = best_i if best_i >= 0 else len(ws) - 1
+
+    w_s = float(ws[idx])
+    w_h = float(wh[idx])
+    meta['data_source'] = overlay.get('data_source', '')
+    meta['w_strategy'] = w_s
+    meta['w_hedge'] = w_h
+    return w_s, w_h, meta

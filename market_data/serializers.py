@@ -85,77 +85,92 @@ class SymbolListSerializer(serializers.ModelSerializer):
 
 
 class CrontabScheduleSerializer(serializers.ModelSerializer):
-    """Serializer for CrontabSchedule"""
+    """CrontabSchedule; `timezone` is TimeZoneField (ZoneInfo) — stringify for JSON."""
+
     class Meta:
         model = CrontabSchedule
-        fields = ['minute', 'hour', 'day_of_week', 'day_of_month', 'month_of_year', 'timezone']
+        fields = [
+            'id', 'minute', 'hour', 'day_of_week', 'day_of_month',
+            'month_of_year', 'timezone',
+        ]
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if data.get('timezone') is not None:
+            data['timezone'] = str(data['timezone'])
+        return data
 
 
 class IntervalScheduleSerializer(serializers.ModelSerializer):
     """Serializer for IntervalSchedule"""
     class Meta:
         model = IntervalSchedule
-        fields = ['every', 'period']
+        fields = ['id', 'every', 'period']
+
+
+class CeleryTaskJSONTextField(serializers.Field):
+    """PeriodicTask `args` / `kwargs` are JSON stored in TextFields; API uses objects."""
+
+    def __init__(self, *, is_list: bool = False, **kwargs):
+        self._is_list = is_list
+        super().__init__(**kwargs)
+
+    def to_representation(self, value):
+        import json
+        if value in (None, ''):
+            return [] if self._is_list else {}
+        if isinstance(value, (list, dict)):
+            return value
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return value
+
+    def to_internal_value(self, data):
+        import json
+        if data is None:
+            return None
+        if isinstance(data, str):
+            return data
+        return json.dumps(data)
 
 
 class PeriodicTaskSerializer(serializers.ModelSerializer):
     """Serializer for PeriodicTask"""
     crontab = CrontabScheduleSerializer(read_only=True)
     interval = IntervalScheduleSerializer(read_only=True)
-    crontab_id = serializers.IntegerField(write_only=True, required=False, allow_null=True)
-    interval_id = serializers.IntegerField(write_only=True, required=False, allow_null=True)
+    crontab_id = serializers.IntegerField(
+        required=False, allow_null=True, write_only=True,
+    )
+    interval_id = serializers.IntegerField(
+        required=False, allow_null=True, write_only=True,
+    )
     last_run_at = serializers.DateTimeField(read_only=True)
     total_run_count = serializers.IntegerField(read_only=True)
-    kwargs = serializers.SerializerMethodField()
+    args = CeleryTaskJSONTextField(is_list=True, required=False, allow_null=True)
+    kwargs = CeleryTaskJSONTextField(is_list=False, required=False, allow_null=True)
+    schedule_type = serializers.SerializerMethodField()
 
     class Meta:
         model = PeriodicTask
         fields = [
             'id', 'name', 'task', 'enabled', 'description',
             'crontab', 'interval', 'crontab_id', 'interval_id',
+            'schedule_type',
             'args', 'kwargs', 'queue', 'exchange', 'routing_key',
             'expires', 'one_off', 'start_time', 'last_run_at',
-            'total_run_count', 'date_changed'
+            'total_run_count', 'date_changed',
         ]
-        read_only_fields = ['date_changed', 'last_run_at', 'total_run_count']
+        read_only_fields = ['date_changed', 'last_run_at', 'total_run_count', 'schedule_type']
 
-    def get_kwargs(self, obj):
-        """Parse kwargs JSON string to dict"""
-        if obj.kwargs:
-            try:
-                import json
-                return json.loads(obj.kwargs)
-            except:
-                return obj.kwargs
-        return {}
-
-    def create(self, validated_data):
-        crontab_id = validated_data.pop('crontab_id', None)
-        interval_id = validated_data.pop('interval_id', None)
-        kwargs = validated_data.pop('kwargs', {})
-        
-        if crontab_id:
-            validated_data['crontab_id'] = crontab_id
-        if interval_id:
-            validated_data['interval_id'] = interval_id
-        if kwargs:
-            import json
-            validated_data['kwargs'] = json.dumps(kwargs)
-        
-        return super().create(validated_data)
-
-    def update(self, instance, validated_data):
-        crontab_id = validated_data.pop('crontab_id', None)
-        interval_id = validated_data.pop('interval_id', None)
-        kwargs = validated_data.pop('kwargs', None)
-        
-        if crontab_id is not None:
-            validated_data['crontab_id'] = crontab_id
-        if interval_id is not None:
-            validated_data['interval_id'] = interval_id
-        if kwargs is not None:
-            import json
-            validated_data['kwargs'] = json.dumps(kwargs)
-        
-        return super().update(instance, validated_data)
+    def get_schedule_type(self, obj) -> str:
+        if obj.solar_id:
+            return 'solar'
+        if obj.clocked_id:
+            return 'clocked'
+        if obj.crontab_id:
+            return 'crontab'
+        if obj.interval_id:
+            return 'interval'
+        return 'none'
 

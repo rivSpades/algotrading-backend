@@ -893,12 +893,17 @@ class IntervalScheduleViewSet(viewsets.ModelViewSet):
 
 
 class PeriodicTaskViewSet(viewsets.ModelViewSet):
-    """ViewSet for PeriodicTask"""
-    queryset = PeriodicTask.objects.all()
+    """ViewSet for PeriodicTask (Celery Beat — full list for ops UI)."""
+
+    queryset = PeriodicTask.objects.select_related(
+        'crontab', 'interval', 'solar', 'clocked',
+    ).all()
     serializer_class = PeriodicTaskSerializer
+    # Return every periodic task; UI needs a complete Beat overview.
+    pagination_class = None
     filter_backends = [SearchFilter, OrderingFilter]
     search_fields = ['name', 'task', 'description']
-    ordering_fields = ['name', 'enabled', 'last_run_at', 'date_changed']
+    ordering_fields = ['name', 'enabled', 'last_run_at', 'date_changed', 'id']
     ordering = ['-date_changed']
 
     @action(detail=True, methods=['post'])
@@ -917,10 +922,38 @@ class PeriodicTaskViewSet(viewsets.ModelViewSet):
         task.save()
         return Response({'message': 'Task disabled', 'enabled': False})
 
+    @action(detail=True, methods=['post'], url_path='run-now')
+    def run_now(self, request, pk=None):
+        """Dispatch this periodic task immediately (manual mirror).
+
+        Uses the PeriodicTask's stored `task` + `args` + `kwargs` payload.
+        """
+        task = self.get_object()
+        try:
+            args = json.loads(task.args or '[]') if isinstance(task.args, str) else (task.args or [])
+        except Exception:
+            args = []
+        try:
+            kwargs = json.loads(task.kwargs or '{}') if isinstance(task.kwargs, str) else (task.kwargs or {})
+        except Exception:
+            kwargs = {}
+
+        async_result = celery_app.send_task(task.task, args=args, kwargs=kwargs)
+        return Response(
+            {
+                'success': True,
+                'task_id': async_result.id,
+                'dispatched_task': task.task,
+                'args': args,
+                'kwargs': kwargs,
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
+
     @action(detail=False, methods=['post'], url_path='create-fetch-symbols-task', url_name='create-fetch-symbols-task')
     def create_fetch_symbols_task(self, request):
         """Create a scheduled task for fetching symbols"""
-        task_name = request.data.get('name', 'Fetch Symbols')
+        task_name = request.data.get('name', '').strip() or None
         exchange_codes = request.data.get('exchange_codes', [])
         fetch_all = request.data.get('fetch_all', False)
         schedule_type = request.data.get('schedule_type', 'interval')  # 'interval' or 'crontab'
@@ -937,6 +970,13 @@ class PeriodicTaskViewSet(viewsets.ModelViewSet):
             task_path = 'market_data.tasks.fetch_symbols_from_multiple_exchanges_task'
             kwargs = {'exchange_codes': exchange_codes}
         
+        from market_data.services.beat_task_labels import (
+            MARKET_DATA_BEAT_MARKER,
+            relabel_fetch_periodic_task_by_id,
+        )
+
+        # Create schedule (placeholder name; relabeled after we have a PK)
+        create_name = task_name or 'Market data — Symbol import (saving…)'
         # Create schedule
         if schedule_type == 'interval':
             interval, created = IntervalSchedule.objects.get_or_create(
@@ -944,7 +984,7 @@ class PeriodicTaskViewSet(viewsets.ModelViewSet):
                 period=schedule_data.get('period', 'days')
             )
             periodic_task = PeriodicTask.objects.create(
-                name=task_name,
+                name=create_name,
                 task=task_path,
                 interval=interval,
                 enabled=True,
@@ -960,13 +1000,27 @@ class PeriodicTaskViewSet(viewsets.ModelViewSet):
                 timezone=schedule_data.get('timezone', 'UTC')
             )
             periodic_task = PeriodicTask.objects.create(
-                name=task_name,
+                name=create_name,
                 task=task_path,
                 crontab=crontab,
                 enabled=True,
                 kwargs=json.dumps(kwargs)
             )
-        
+
+        # User-supplied `name` wins over auto label when provided
+        if not task_name:
+            relabel_fetch_periodic_task_by_id(periodic_task.id)
+        else:
+            if not (periodic_task.description or '').strip():
+                periodic_task.description = (
+                    MARKET_DATA_BEAT_MARKER
+                    + 'Symbol list import for the selected exchange(s) or all venues, per your request.'
+                )
+                periodic_task.save()
+
+        periodic_task = PeriodicTask.objects.select_related('interval', 'crontab').get(
+            pk=periodic_task.pk
+        )
         serializer = PeriodicTaskSerializer(periodic_task)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 

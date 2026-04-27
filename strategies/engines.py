@@ -130,7 +130,7 @@ class BaseLiveTradingEngine(ABC):
         Args:
             strategy: StrategyDefinition instance
             parameters: Strategy parameters dict
-            deployment: LiveTradingDeployment instance
+            deployment: StrategyDeployment instance
             broker_adapter: BrokerAdapter instance for executing trades
             position_mode: 'all', 'long', or 'short'
         """
