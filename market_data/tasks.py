@@ -437,7 +437,12 @@ def fetch_symbols_from_all_exchanges_task(self):
         }
 
 
-@shared_task(bind=True)
+@shared_task(
+    bind=True,
+    # yfinance / IO can be slow; hard limit prevents one fetch from wedging a worker forever.
+    soft_time_limit=100,
+    time_limit=120,
+)
 def fetch_ohlcv_data_task(
     self,
     ticker: str,
@@ -655,7 +660,11 @@ def fetch_ohlcv_data_task(
         }
 
 
-@shared_task(bind=True)
+@shared_task(
+    bind=True,
+    soft_time_limit=600,
+    time_limit=720,
+)
 def fetch_ohlcv_data_multiple_symbols_task(
     self,
     tickers: List[str],

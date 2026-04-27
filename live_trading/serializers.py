@@ -89,6 +89,23 @@ class LiveTradeSerializer(serializers.ModelSerializer):
     symbol_info = SymbolListSerializer(source='symbol', read_only=True)
     deployment_name = serializers.CharField(source='deployment.name', read_only=True)
     deployment_type = serializers.CharField(source='deployment.deployment_type', read_only=True)
+    hedge_legs = serializers.SerializerMethodField()
+
+    def get_hedge_legs(self, obj):
+        if self.context.get('skip_hedge_embed'):
+            return []
+        meta = obj.metadata or {}
+        if meta.get('is_hedge_leg'):
+            return []
+        by_parent = self.context.get('hedge_by_parent')
+        if not by_parent:
+            return []
+        legs = by_parent.get(obj.id, [])
+        return LiveTradeSerializer(
+            legs,
+            many=True,
+            context={**self.context, 'skip_hedge_embed': True},
+        ).data
 
     class Meta:
         model = LiveTrade
@@ -98,9 +115,10 @@ class LiveTradeSerializer(serializers.ModelSerializer):
             'position_mode', 'trade_type', 'entry_price', 'exit_price',
             'quantity', 'entry_timestamp', 'exit_timestamp', 'pnl', 'pnl_percentage',
             'is_winner', 'status', 'broker_order_id', 'metadata',
+            'hedge_legs',
             'created_at', 'updated_at',
         ]
-        read_only_fields = ['created_at', 'updated_at']
+        read_only_fields = ['created_at', 'updated_at', 'hedge_legs']
 
 
 # ---------------------------------------------------------------------------

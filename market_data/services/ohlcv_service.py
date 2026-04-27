@@ -276,25 +276,37 @@ class OHLCVService:
         if provider is None:
             provider = OHLCVService.get_or_create_yahoo_provider()
         
+        # Some reference series are intentionally Yahoo-backed even when other
+        # providers (e.g. Alpaca) are used elsewhere. Allow provider override
+        # for these tickers without requiring manual disabling.
+        FORCE_YAHOO_TICKERS = {'SPY', 'VIXM', 'VIXY', '^VIX'}
+
         # Check if symbol has a different provider
         if symbol.provider is not None and symbol.provider.id != provider.id:
-            # Only allow overwrite if symbol is in disabled state
-            if symbol.status != 'disabled':
-                raise ValueError(
-                    f"Cannot update OHLCV data for symbol {symbol.ticker} with provider {provider.code}. "
-                    f"Symbol already has data from provider {symbol.provider.code} and is in '{symbol.status}' status. "
-                    f"Only disabled symbols can have their provider changed. Please disable the symbol first."
-                )
-            
-            # Symbol is disabled - allow overwrite: delete all existing OHLCV data and update provider
-            deleted_count, _ = OHLCV.objects.filter(symbol=symbol).delete()
-            
-            # Update provider field
-            symbol.provider = provider
-            symbol.save(update_fields=['provider'])
-            
-            # Reset replace_existing flag since we've already deleted all data
-            replace_existing = False
+            if (symbol.ticker or '').upper() in FORCE_YAHOO_TICKERS and (provider.code or '').upper() == 'YAHOO':
+                # Forced reference provider: delete existing OHLCV and flip provider.
+                OHLCV.objects.filter(symbol=symbol).delete()
+                symbol.provider = provider
+                symbol.save(update_fields=['provider'])
+                replace_existing = False
+            else:
+                # Only allow overwrite if symbol is in disabled state
+                if symbol.status != 'disabled':
+                    raise ValueError(
+                        f"Cannot update OHLCV data for symbol {symbol.ticker} with provider {provider.code}. "
+                        f"Symbol already has data from provider {symbol.provider.code} and is in '{symbol.status}' status. "
+                        f"Only disabled symbols can have their provider changed. Please disable the symbol first."
+                    )
+
+                # Symbol is disabled - allow overwrite: delete all existing OHLCV data and update provider
+                OHLCV.objects.filter(symbol=symbol).delete()
+
+                # Update provider field
+                symbol.provider = provider
+                symbol.save(update_fields=['provider'])
+
+                # Reset replace_existing flag since we've already deleted all data
+                replace_existing = False
         
         # Update symbol provider if not set
         if symbol.provider is None:

@@ -230,11 +230,13 @@ def build_market_open_beat_name_and_description(
     )
     description = (
         LIVE_BEAT_MARKER
-        + 'Market open: runs once per open group, then dispatches one worker task per live deployment. '
+        + 'Market open: runs once per open group, then dispatches one or more `deployment_market_open` '
+        + 'worker tasks per live deployment in symbol chunks (see LIVE_TRADING_MARKET_OPEN_SYMBOLS_PER_TASK) '
+        + 'so the full universe is processed. '
         + f'open_group_key={group_key}; exchanges={ex_for_desc}. '
         + 'Flow: beat → market_open_fanout (refresh SPY + VIXM + VIXY + ^VIX first, always) → '
-        + 'dispatch deployment_market_open per deployment (refresh that deployment’s symbols) → '
-        + 'evaluate symbols in priority order → place orders when actionable.'
+        + 'dispatch deployment_market_open per chunk (refresh those symbols) → '
+        + 'evaluate in priority order → place orders when actionable.'
     )
     return task_name, description
 

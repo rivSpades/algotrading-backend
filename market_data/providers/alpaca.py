@@ -287,7 +287,8 @@ class AlpacaProvider:
                             'symbols': ','.join(batch_tickers),
                             'timeframe': alpaca_timeframe,
                             'adjustment': 'all',  # Apply all adjustments (split, dividend, spin-off) to get adjusted prices
-                            # Note: Don't specify feed parameter - let Alpaca API choose (works for 2016-2025 on free tier with pagination)
+                            # Free tier: use IEX feed (SIP requires subscription, esp. for recent data).
+                            'feed': 'iex',
                         }
                         
                         if chunk_start:
@@ -383,8 +384,8 @@ class AlpacaProvider:
                                         'timeframe': params['timeframe'],
                                         'adjustment': params.get('adjustment', 'all'),  # Include adjustment parameter
                                         'page_token': next_page_token,
+                                        'feed': params.get('feed', 'iex'),
                                     }
-                                    # Don't include feed parameter in pagination requests - let API choose
                                     # Don't include start/end in pagination - page_token handles continuation
                                     
                                     # Small delay before next page request

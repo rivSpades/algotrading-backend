@@ -3,10 +3,14 @@ Yahoo Finance Provider
 Handles fetching OHLCV data from Yahoo Finance using yfinance library
 """
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 import yfinance as yf
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
 from django.utils import timezone
+
+# yfinance can block indefinitely on network issues; cap wall time so Celery workers don't hang.
+YAHOO_HISTORY_TIMEOUT_SEC = 90
 
 
 class YahooFinanceProvider:
@@ -45,24 +49,29 @@ class YahooFinanceProvider:
             ]
         """
         try:
-            # Create yfinance ticker object
-            stock = yf.Ticker(ticker)
-            
-            # Fetch historical data
-            if period:
-                hist = stock.history(period=period, interval=interval)
-            elif start_date and end_date:
-                # Yahoo Finance's history() method excludes the end_date (end_date is exclusive)
-                # To include the end_date, we need to add 1 day to it
-                end_date_inclusive = end_date + timedelta(days=1)
-                hist = stock.history(start=start_date, end=end_date_inclusive, interval=interval)
-            elif start_date:
-                # If only start_date, fetch until today
-                hist = stock.history(start=start_date, interval=interval)
-            else:
-                # Default: fetch last 1 year
-                hist = stock.history(period='1y', interval=interval)
-            
+            def _load_history():
+                stock = yf.Ticker(ticker)
+                if period:
+                    return stock.history(period=period, interval=interval)
+                if start_date and end_date:
+                    end_date_inclusive = end_date + timedelta(days=1)
+                    return stock.history(
+                        start=start_date, end=end_date_inclusive, interval=interval,
+                    )
+                if start_date:
+                    return stock.history(start=start_date, interval=interval)
+                return stock.history(period='1y', interval=interval)
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_load_history)
+                try:
+                    hist = future.result(timeout=YAHOO_HISTORY_TIMEOUT_SEC)
+                except FuturesTimeout as exc:
+                    raise TimeoutError(
+                        f"Yahoo Finance history timed out after {YAHOO_HISTORY_TIMEOUT_SEC}s "
+                        f"for {ticker!r}"
+                    ) from exc
+
             if hist.empty:
                 return []
             

@@ -19,6 +19,7 @@ from .order_service import (
     OrderPlacementError,
     exit_open_trades_for_deployment,
     get_adapter_for_deployment,
+    manual_close_live_trade,
     place_signal_order,
     update_open_trades,
 )
@@ -66,6 +67,7 @@ __all__ = [
     'OrderPlacementError',
     'exit_open_trades_for_deployment',
     'get_adapter_for_deployment',
+    'manual_close_live_trade',
     'place_signal_order',
     'update_open_trades',
     'ReconciliationSummary',

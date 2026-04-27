@@ -10,11 +10,13 @@ describing the signal; order placement happens in the orchestrating task
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone as dt_tz
 from decimal import Decimal
 from typing import Optional
 
 from django.utils import timezone
+
+from backtest_engine.services.hybrid_vix_hedge import HEDGE_VOL_ETF_TICKERS
 
 from market_data.models import OHLCV
 from market_data.models import ExchangeSchedule
@@ -62,6 +64,27 @@ class GapUpGapDownLiveEngine(BaseLiveTradingEngine):
     def evaluate(self, deployment_symbol, fire_at: datetime) -> EngineEvaluation:
         fire_at = fire_at or self.now()
         ticker = deployment_symbol.symbol.ticker
+
+        # Backtest: hybrid sleeve uses VIXM/VIXY returns as one overlay (β-weighted VIXM−VIXY spread
+        # in normal, or VIXY in panic) — it does *not* open separate gap strategy trades on these
+        # tickers. Live must mirror that: with hedge on, do not treat them as regular symbols.
+        if self.deployment.hedge_enabled and ticker in HEDGE_VOL_ETF_TICKERS:
+            return EngineEvaluation(
+                deployment_symbol_id=deployment_symbol.id,
+                ticker=ticker,
+                fire_at=fire_at,
+                skipped_reason='hedge_vol_etf_excluded',
+                ohlcv_count=0,
+                signal=LiveSignal(
+                    action=SIGNAL_HOLD,
+                    context={
+                        'reason': (
+                            'VIXM/VIXY are hedge-sleeve inputs only when hybrid hedge is enabled. '
+                            'Remove them from this deployment; hedge orders are placed automatically.'
+                        ),
+                    },
+                ),
+            )
 
         std_period = int(self.parameters.get('std_period', 90))
         threshold = float(self.parameters.get('threshold', 0.25))
@@ -138,7 +161,7 @@ class GapUpGapDownLiveEngine(BaseLiveTradingEngine):
 
         session_open = timezone.make_aware(
             datetime.combine(session_date, open_utc),
-            timezone=timezone.utc,
+            timezone=dt_tz.utc,
         )
 
         # Fetch today's session open from the broker adapter (minute bars).
@@ -167,6 +190,7 @@ class GapUpGapDownLiveEngine(BaseLiveTradingEngine):
                         'today_open': today_open,
                         'prev_close': prev_close,
                         'prev_close_timestamp': prev_bar.timestamp.isoformat() if prev_bar.timestamp else None,
+                        'session_open_utc': session_open.isoformat(),
                     },
                     error='missing_open_or_prev_close',
                 ),
@@ -202,7 +226,7 @@ class GapUpGapDownLiveEngine(BaseLiveTradingEngine):
                 deployment_symbol_id=deployment_symbol.id,
                 ticker=ticker,
                 fire_at=fire_at,
-                ohlcv_count=len(ohlcv_rows),
+                ohlcv_count=len(hist_rows),
                 indicators_count=0,
                 skipped_reason='indicator_failure',
                 signal=LiveSignal(

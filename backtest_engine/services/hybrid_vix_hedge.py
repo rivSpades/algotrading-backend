@@ -21,6 +21,9 @@ from market_data.services.ohlcv_service import OHLCVService
 logger = logging.getLogger(__name__)
 
 HEDGE_TICKERS = ("SPY", "VIXM", "VIXY", "^VIX")
+# VIXM/VIXY are the tradeable vol legs used in the spread (normal) or VIXY-only (panic); they must
+# not be run as primary gap-strategy symbols when hybrid hedge is on (backtest does not do that).
+HEDGE_VOL_ETF_TICKERS = frozenset({"VIXM", "VIXY"})
 # Minimum daily bars to trust DB-only; below this we try Yahoo in-memory (no DB write).
 _MIN_DAILY_BARS = 20
 BENCHMARK_EXCHANGE_CODE = "BENCHMARK"

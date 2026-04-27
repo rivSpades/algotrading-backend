@@ -7,6 +7,7 @@ from .views import (
     BrokerViewSet,
     DeploymentEventViewSet,
     LiveTradeViewSet,
+    MarketOpenProgressViewSet,
     StrategyDeploymentViewSet,
     SymbolBrokerAssociationViewSet,
 )
@@ -17,6 +18,7 @@ router.register(r'symbol-broker-associations', SymbolBrokerAssociationViewSet, b
 router.register(r'live-trades', LiveTradeViewSet, basename='live-trade')
 router.register(r'strategy-deployments', StrategyDeploymentViewSet, basename='strategy-deployment')
 router.register(r'deployment-events', DeploymentEventViewSet, basename='deployment-event')
+router.register(r'market-open-progress', MarketOpenProgressViewSet, basename='market-open-progress')
 
 urlpatterns = [
     path('', include(router.urls)),

@@ -3,14 +3,30 @@ Alpaca Broker Adapter
 Implements BaseBrokerAdapter for Alpaca API
 """
 
+import logging
 import requests
 from typing import Optional, Dict, List
-from decimal import Decimal
-from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
+from datetime import datetime, timedelta, timezone as dt_tz
 from django.utils import timezone
 
 from .base import BaseBrokerAdapter, OrderResult, PositionInfo
 from ..models import Broker
+
+logger = logging.getLogger(__name__)
+
+def _safe_decimal(value, default: str = '0') -> Decimal:
+    if value is None:
+        return Decimal(default)
+    if isinstance(value, Decimal):
+        return value
+    s = str(value).strip()
+    if not s:
+        return Decimal(default)
+    try:
+        return Decimal(s)
+    except (InvalidOperation, ValueError):
+        return Decimal(default)
 
 
 class AlpacaBrokerAdapter(BaseBrokerAdapter):
@@ -112,8 +128,10 @@ class AlpacaBrokerAdapter(BaseBrokerAdapter):
             Decimal: Current price, or None if error
         """
         try:
+            # Alpaca market data base URL differs from trading endpoint.
+            data_base = 'https://data.alpaca.markets'
             response = requests.get(
-                f'{self.base_url}/v2/stocks/{symbol}/bars/latest',
+                f'{data_base}/v2/stocks/{symbol}/bars/latest',
                 headers=self.headers,
                 params={'feed': 'iex'},  # Use IEX feed for free tier
                 timeout=10
@@ -135,7 +153,10 @@ class AlpacaBrokerAdapter(BaseBrokerAdapter):
         window_minutes: int = 6,
         feed: str = 'iex',
     ) -> Optional[Decimal]:
-        """Return the session open price using minute bars around `session_open`.
+        """Return the session open price.
+
+        Primary: Alpaca snapshot endpoint -> today's daily bar open (intraday-safe on free tier).
+        Fallback: minute bars around the exchange open.
 
         Uses Alpaca *data* API (`https://data.alpaca.markets`) regardless of the
         trading endpoint configured on the Broker model.
@@ -144,31 +165,102 @@ class AlpacaBrokerAdapter(BaseBrokerAdapter):
             if session_open is None:
                 return None
             if timezone.is_naive(session_open):
-                session_open = timezone.make_aware(session_open, timezone=timezone.utc)
-            start = session_open
+                session_open = timezone.make_aware(session_open, timezone=dt_tz.utc)
+            # 1) Snapshot (preferred): today's session daily bar open.
+            data_base = 'https://data.alpaca.markets'
+            snap_url = f'{data_base}/v2/stocks/{symbol}/snapshot'
+            snap_params = {'feed': feed}
+            snap = requests.get(snap_url, headers=self.headers, params=snap_params, timeout=10)
+            if snap.status_code == 200:
+                payload = snap.json() or {}
+                daily = payload.get('dailyBar') or payload.get('daily_bar') or {}
+                o = daily.get('o') if isinstance(daily, dict) else None
+                if o is not None:
+                    return Decimal(str(o))
+            else:
+                try:
+                    msg = (snap.text or '')[:200]
+                except Exception:
+                    msg = ''
+                print(f"Alpaca snapshot fetch failed for {symbol}: {snap.status_code} {msg} (feed={feed})")
+            # Start a touch before the open to avoid boundary issues.
+            start = session_open - timedelta(minutes=1)
             end = session_open + timedelta(minutes=max(1, int(window_minutes)))
 
             # Alpaca market data base URL differs from trading endpoint.
-            data_base = 'https://data.alpaca.markets'
             url = f'{data_base}/v2/stocks/{symbol}/bars'
-            params = {
-                'timeframe': '1Min',
-                'start': start.isoformat().replace('+00:00', 'Z'),
-                'end': end.isoformat().replace('+00:00', 'Z'),
-                'limit': 10,
-                'sort': 'asc',
-                'feed': feed,
-                'adjustment': 'all',
-            }
-            resp = requests.get(url, headers=self.headers, params=params, timeout=10)
+
+            def _fetch(feed_to_use: str, start_dt: datetime, end_dt: datetime, limit: int = 1000):
+                params = {
+                    'timeframe': '1Min',
+                    'start': start_dt.isoformat().replace('+00:00', 'Z'),
+                    'end': end_dt.isoformat().replace('+00:00', 'Z'),
+                    'limit': limit,
+                    'sort': 'asc',
+                    'feed': feed_to_use,
+                    'adjustment': 'all',
+                }
+                return requests.get(url, headers=self.headers, params=params, timeout=10)
+
+            # First attempt: small window, requested feed (default IEX).
+            resp = _fetch(feed, start, end, limit=50)
+            if resp.status_code == 200:
+                payload = resp.json() or {}
+                bars = payload.get('bars') or []
+            else:
+                bars = None
+
+            # If no bars, widen the window substantially (some symbols trade sporadically on IEX).
+            if resp.status_code == 200 and not bars:
+                wide_end = session_open + timedelta(hours=6)
+                resp = _fetch(feed, start, wide_end, limit=10000)
+                if resp.status_code == 200:
+                    payload = resp.json() or {}
+                    bars = payload.get('bars') or []
+
+            # If IEX returns no bars, try SIP (will 403 on free tier; we log it).
+            if (resp.status_code == 200 and not bars) and feed.lower() == 'iex':
+                sip_end = session_open + timedelta(hours=6)
+                sip_resp = _fetch('sip', start, sip_end, limit=10000)
+                if sip_resp.status_code == 200:
+                    payload = sip_resp.json() or {}
+                    bars = payload.get('bars') or []
+                    resp = sip_resp
+                    feed = 'sip'
+                else:
+                    try:
+                        msg = (sip_resp.text or '')[:200]
+                    except Exception:
+                        msg = ''
+                    print(f"Alpaca session open fetch failed for {symbol}: {sip_resp.status_code} {msg} (feed=sip)")
+
             if resp.status_code != 200:
+                try:
+                    msg = resp.text[:200]
+                except Exception:
+                    msg = ''
+                print(f"Alpaca session open fetch failed for {symbol}: {resp.status_code} {msg} (feed={feed})")
                 return None
-            payload = resp.json() or {}
-            bars = payload.get('bars') or []
+
             if not bars:
+                print(f"Alpaca session open fetch returned 0 bars for {symbol} (feed={feed})")
                 return None
-            first = bars[0]
-            o = first.get('o')
+
+            # Pick the first bar at/after the official session open time.
+            chosen = None
+            for b in bars:
+                t = b.get('t')
+                if not t:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(str(t).replace('Z', '+00:00'))
+                except Exception:
+                    continue
+                if ts >= session_open:
+                    chosen = b
+                    break
+            chosen = chosen or bars[0]
+            o = chosen.get('o')
             return Decimal(str(o)) if o is not None else None
         except Exception as e:
             print(f"Error getting Alpaca session open for {symbol}: {e}")
@@ -198,9 +290,10 @@ class AlpacaBrokerAdapter(BaseBrokerAdapter):
             OrderResult: Order execution result
         """
         try:
+            qty_str = format(quantity, 'f')
             order_data = {
                 'symbol': symbol,
-                'qty': str(int(quantity)),
+                'qty': qty_str,
                 'side': side,
                 'type': order_type,
                 'time_in_force': 'day',
@@ -220,8 +313,9 @@ class AlpacaBrokerAdapter(BaseBrokerAdapter):
             
             if response.status_code == 200 or response.status_code == 201:
                 order = response.json()
-                filled_qty = Decimal(str(order.get('filled_qty', '0')))
-                filled_price = Decimal(str(order.get('filled_avg_price', '0')))
+                # Alpaca sometimes returns '' for these fields until filled.
+                filled_qty = _safe_decimal(order.get('filled_qty', '0'))
+                filled_price = _safe_decimal(order.get('filled_avg_price', '0'))
                 order_status = order.get('status', 'pending')
                 return OrderResult(
                     order_id=str(order.get('id', '')),
@@ -235,7 +329,16 @@ class AlpacaBrokerAdapter(BaseBrokerAdapter):
                     broker_order_id=str(order.get('id', '')),
                 )
             else:
-                error_msg = response.json().get('message', 'Unknown error')
+                # Alpaca can return HTML or non-JSON errors; capture something useful.
+                error_msg = 'Unknown error'
+                try:
+                    payload = response.json() or {}
+                    error_msg = payload.get('message') or payload.get('code') or error_msg
+                except Exception:
+                    try:
+                        error_msg = (response.text or '').strip()[:200] or error_msg
+                    except Exception:
+                        error_msg = error_msg
                 return OrderResult(
                     order_id='',
                     symbol=symbol,
@@ -245,7 +348,7 @@ class AlpacaBrokerAdapter(BaseBrokerAdapter):
                     price=Decimal('0'),
                     status='rejected',
                     timestamp=datetime.now(),
-                    error_message=f"Order failed: {error_msg}",
+                    error_message=f"Order failed ({response.status_code}): {error_msg}",
                 )
         except Exception as e:
             return OrderResult(
@@ -369,9 +472,11 @@ class AlpacaBrokerAdapter(BaseBrokerAdapter):
                 asset = response.json()
                 tradable = asset.get('tradable', False)
                 shortable = asset.get('shortable', False)
+                fractionable = asset.get('fractionable', False)
                 return {
                     'long_supported': tradable,
                     'short_supported': shortable and tradable,
+                    'fractionable': bool(fractionable),
                 }
             return {'long_supported': False, 'short_supported': False}
         except Exception:

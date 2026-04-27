@@ -8,6 +8,7 @@ The viewsets here cover:
 
 import logging
 
+from celery.result import AsyncResult
 from django.db import transaction
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
@@ -18,7 +19,10 @@ from rest_framework.filters import OrderingFilter, SearchFilter
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 
+from algo_trading_backend.celery import app as celery_app
+
 from market_data.models import Symbol
+from market_data.models import ExchangeSchedule
 from backtest_engine.models import SymbolBacktestParameterSet
 from strategies.models import StrategyDefinition
 
@@ -53,6 +57,7 @@ from .services import (
     evaluate_deployment_symbol,
     exit_open_trades_for_deployment,
     log_event,
+    manual_close_live_trade,
     promote_to_real_money,
     queue_snapshot_recalc,
     reconcile_deployment_symbols,
@@ -60,8 +65,39 @@ from .services import (
     update_open_trades,
 )
 from .services.hedge_inherit import inherit_hedge_from_symbol_runs
+from .tasks import reconcile_close_until_sync_task
 
 logger = logging.getLogger(__name__)
+
+
+def _find_next_occurrence(*, now, open_utc, weekdays):
+    """Return the next datetime (UTC) matching open_utc on allowed weekdays."""
+    from datetime import datetime, timedelta, timezone as dt_tz
+
+    today = now.date()
+    for i in range(0, 10):
+        d = today + timedelta(days=i)
+        if weekdays and d.isoweekday() not in weekdays:
+            continue
+        candidate = timezone.make_aware(datetime.combine(d, open_utc), timezone=dt_tz.utc)
+        if candidate > now:
+            return candidate
+    return None
+
+
+def _find_prev_occurrence(*, now, open_utc, weekdays):
+    """Return the most recent datetime (UTC) <= now matching open_utc on allowed weekdays."""
+    from datetime import datetime, timedelta, timezone as dt_tz
+
+    today = now.date()
+    for i in range(0, 10):
+        d = today - timedelta(days=i)
+        if weekdays and d.isoweekday() not in weekdays:
+            continue
+        candidate = timezone.make_aware(datetime.combine(d, open_utc), timezone=dt_tz.utc)
+        if candidate <= now:
+            return candidate
+    return None
 
 
 class BrokerPagination(PageNumberPagination):
@@ -433,7 +469,115 @@ class LiveTradeViewSet(viewsets.ReadOnlyModelViewSet):
         if deployment_type:
             queryset = queryset.filter(deployment__deployment_type=deployment_type)
 
+        omit_hedge = str(self.request.query_params.get('omit_hedge_legs', '')).lower() in (
+            '1', 'true', 'yes',
+        )
+        if omit_hedge and deployment_id:
+            # Strategy rows only; nest hedge legs on each row via `hedge_legs`.
+            # Do NOT use exclude(metadata__is_hedge_leg=True): for rows where the
+            # key is missing, JSON lookups are NULL and SQL "NOT (x = true)" drops
+            # them, which hid every normal (non-hedge) trade and showed an empty list.
+            queryset = queryset.filter(
+                Q(metadata__is_hedge_leg__isnull=True)
+                | Q(metadata__is_hedge_leg=False)
+                | ~Q(metadata__has_key='is_hedge_leg')
+            )
+
         return queryset
+
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        if getattr(self, 'action', None) != 'list':
+            return ctx
+        dep = self.request.query_params.get('deployment')
+        omit_hedge = str(self.request.query_params.get('omit_hedge_legs', '')).lower() in (
+            '1', 'true', 'yes',
+        )
+        if dep and omit_hedge:
+            by_parent: dict = {}
+            for h in (
+                LiveTrade.objects.filter(
+                    deployment_id=dep,
+                    metadata__is_hedge_leg=True,
+                )
+                .select_related('symbol', 'deployment', 'deployment__strategy')
+            ):
+                raw_pid = (h.metadata or {}).get('hedge_parent_live_trade_id')
+                if raw_pid is None:
+                    continue
+                try:
+                    pid = int(raw_pid)
+                except (TypeError, ValueError):
+                    continue
+                by_parent.setdefault(pid, []).append(h)
+            ctx['hedge_by_parent'] = by_parent
+        return ctx
+
+    @action(detail=True, methods=['post'], url_path='manual-close')
+    def manual_close(self, request, pk=None):
+        """Manually submit a market close for a single `LiveTrade`.
+
+        Optional JSON body: ``{"force": true}`` to skip broker position pre-check and
+        submit using app ``trade_type``/``quantity`` (when the broker reports no row
+        but the trade is still open in the app, or wrong account until fixed).
+        """
+        trade = self.get_object()
+        actor_type, actor_id = _actor_for(request)
+
+        def _truthy(val):
+            if val is None:
+                return False
+            if isinstance(val, bool):
+                return val
+            return str(val).lower() in ('1', 'true', 'yes')
+
+        trust_db = _truthy(request.data.get('force')) or _truthy(
+            request.query_params.get('force')
+        )
+
+        outcome = manual_close_live_trade(
+            trade,
+            actor_type=actor_type,
+            actor_id=actor_id,
+            trust_db=trust_db,
+        )
+        payload = outcome.to_dict()
+        if (
+            not trust_db
+            and outcome.live_trade_id
+            and outcome.status not in ('failed', 'skipped')
+        ):
+            async_result = reconcile_close_until_sync_task.delay(outcome.live_trade_id)
+            payload['reconcile_task_id'] = async_result.id
+        return Response(payload)
+
+    @action(detail=False, methods=['get'], url_path='reconcile-close-status')
+    def reconcile_close_status(self, request):
+        """Poll Celery result for `reconcile_close_until_sync_task` (browser → wait for close)."""
+        task_id = request.query_params.get('task_id')
+        if not task_id:
+            return Response(
+                {'error': 'task_id query parameter is required'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        r = AsyncResult(task_id, app=celery_app)
+        if r.state == 'PENDING':
+            return Response({'ready': False, 'state': r.state})
+        if r.state == 'FAILURE':
+            err = str(r.result) if r.result is not None else 'task failed'
+            return Response(
+                {'ready': True, 'state': r.state, 'status': 'error', 'error': err},
+            )
+        if r.state == 'SUCCESS':
+            result = r.result if isinstance(r.result, dict) else {'value': r.result}
+            return Response({'ready': True, 'state': r.state, 'result': result})
+        return Response(
+            {
+                'ready': False,
+                'state': r.state,
+                'meta': r.info if isinstance(r.info, dict) else None,
+            },
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1264,3 +1408,64 @@ class DeploymentEventViewSet(viewsets.ReadOnlyModelViewSet):
         if since:
             qs = qs.filter(created_at__gte=since)
         return qs
+
+
+class MarketOpenProgressViewSet(viewsets.ViewSet):
+    """Grouped exchange open countdown/progress for the dashboard."""
+
+    def list(self, request):
+        from datetime import datetime, timezone as dt_tz
+
+        now = timezone.now()
+        schedules = (
+            ExchangeSchedule.objects.filter(active=True)
+            .select_related('exchange')
+            .order_by('open_utc', 'exchange__code')
+        )
+
+        groups = {}
+        for s in schedules:
+            gk = s.open_group_key()
+            groups.setdefault(gk, []).append(s)
+
+        out = []
+        for gk, rows in groups.items():
+            sample = rows[0]
+            open_utc = sample.open_utc
+            close_utc = sample.close_utc
+            weekdays = sample.weekday_list() or [1, 2, 3, 4, 5]
+
+            next_open = _find_next_occurrence(now=now, open_utc=open_utc, weekdays=weekdays)
+            prev_open = _find_prev_occurrence(now=now, open_utc=open_utc, weekdays=weekdays)
+            if next_open is None or prev_open is None:
+                continue
+
+            # Determine whether the market is currently open for this group.
+            session_date = prev_open.date()
+            close_at = timezone.make_aware(datetime.combine(session_date, close_utc), timezone=dt_tz.utc)
+            is_open = prev_open <= now < close_at
+            seconds_to_close = max(0, int((close_at - now).total_seconds())) if is_open else None
+
+            total = max(1.0, (next_open - prev_open).total_seconds())
+            elapsed = (now - prev_open).total_seconds()
+            progress = min(1.0, max(0.0, elapsed / total))
+            seconds_to_open = max(0, int((next_open - now).total_seconds()))
+
+            out.append(
+                {
+                    'open_group_key': gk,
+                    'open_utc': open_utc.strftime('%H:%M'),
+                    'close_utc': close_utc.strftime('%H:%M'),
+                    'weekdays': weekdays,
+                    'exchanges': sorted({r.exchange.code for r in rows}),
+                    'next_open_at': next_open.isoformat(),
+                    'seconds_to_open': seconds_to_open,
+                    'progress': (None if is_open else round(progress, 6)),
+                    'is_open': bool(is_open),
+                    'close_at': close_at.isoformat(),
+                    'seconds_to_close': seconds_to_close,
+                }
+            )
+
+        out.sort(key=lambda r: (r['seconds_to_open'], r['open_group_key']))
+        return Response({'results': out, 'as_of': now.isoformat()})

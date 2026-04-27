@@ -161,6 +161,22 @@ class BaseBrokerAdapter(ABC):
             PositionInfo instance or None if no position
         """
         pass
+
+    def get_position_resolved(self, symbol: str) -> Optional[PositionInfo]:
+        """Try ``get_position``; if not found, match ``get_all_positions()`` by symbol (any case)."""
+        raw = (symbol or '').strip()
+        if not raw:
+            return None
+        pos = self.get_position(raw)
+        if pos is not None:
+            return pos
+        try:
+            for p in self.get_all_positions():
+                if (p.symbol or '').strip().upper() == raw.upper():
+                    return p
+        except Exception:
+            return None
+        return None
     
     @abstractmethod
     def get_all_positions(self) -> List[PositionInfo]:

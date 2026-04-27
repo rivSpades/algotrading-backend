@@ -171,6 +171,13 @@ CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_TIME_LIMIT = 2 * 60 * 60  # 2 hours (7200 seconds)
 CELERY_TASK_SOFT_TIME_LIMIT = 2 * 60 * 60  # 2 hours soft limit
 
+# Live trading: max `DeploymentSymbol` rows one `deployment_market_open` Celery
+# task processes per run. `market_open_fanout` (and full-universe manual runs)
+# split larger universes into multiple tasks so every symbol is covered.
+LIVE_TRADING_MARKET_OPEN_SYMBOLS_PER_TASK = int(
+    os.environ.get('LIVE_TRADING_MARKET_OPEN_SYMBOLS_PER_TASK', '250')
+)
+
 # Celery Beat Configuration
 CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
 
