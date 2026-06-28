@@ -111,6 +111,24 @@ def _celery_cleanup_name_and_description() -> tuple[str, str]:
     return name, desc
 
 
+def _relabel_periodic_task(pt, new_name: str, new_desc: str) -> bool:
+    """Update name/description when changed; drop same-path rows that already own the name."""
+    from django_celery_beat.models import PeriodicTask
+
+    if pt.name == new_name and (pt.description or '') == new_desc:
+        return False
+
+    PeriodicTask.objects.filter(
+        name=new_name,
+        task=pt.task,
+    ).exclude(pk=pt.pk).delete()
+
+    pt.name = new_name
+    pt.description = new_desc
+    pt.save()
+    return True
+
+
 @transaction.atomic
 def apply_friendly_periodic_task_labels() -> dict[str, int | str]:
     """Update names/descriptions, merge known duplicates, return simple counters.
@@ -128,6 +146,7 @@ def apply_friendly_periodic_task_labels() -> dict[str, int | str]:
         'weekend_merged': 0,
         'weekend_relabeled': 0,
         'fetch_relabeled': 0,
+        'celery_cleanup_merged': 0,
         'celery_cleanup_relabeled': 0,
     }
 
@@ -150,10 +169,7 @@ def apply_friendly_periodic_task_labels() -> dict[str, int | str]:
         for extra in rows[1:]:
             extra.delete()
             stats['market_open_merged'] = int(stats['market_open_merged']) + 1
-        if keep.name != new_name or (keep.description or '') != new_desc:
-            keep.name = new_name
-            keep.description = new_desc
-            keep.save()
+        if _relabel_periodic_task(keep, new_name, new_desc):
             stats['market_open_relabeled'] = int(stats['market_open_relabeled']) + 1
 
     # —— Weekend (task path) ——
@@ -163,10 +179,7 @@ def apply_friendly_periodic_task_labels() -> dict[str, int | str]:
         for extra in wk[1:]:
             extra.delete()
             stats['weekend_merged'] = int(stats['weekend_merged']) + 1
-        if keep.name != WEEKEND_BEAT_NAME or (keep.description or '') != WEEKEND_BEAT_DESCRIPTION:
-            keep.name = WEEKEND_BEAT_NAME
-            keep.description = WEEKEND_BEAT_DESCRIPTION
-            keep.save()
+        if _relabel_periodic_task(keep, WEEKEND_BEAT_NAME, WEEKEND_BEAT_DESCRIPTION):
             stats['weekend_relabeled'] = int(stats['weekend_relabeled']) + 1
 
     # —— Symbol import tasks ——
@@ -179,19 +192,20 @@ def apply_friendly_periodic_task_labels() -> dict[str, int | str]:
         if not pair:
             continue
         new_name, new_desc = pair
-        if pt.name != new_name or (pt.description or '') != new_desc:
-            pt.name = new_name
-            pt.description = new_desc
-            pt.save()
+        if _relabel_periodic_task(pt, new_name, new_desc):
             stats['fetch_relabeled'] = int(stats['fetch_relabeled']) + 1
 
     # —— Celery backend cleanup ——
     n0, d0 = _celery_cleanup_name_and_description()
-    for pt in PeriodicTask.objects.filter(task=_CELERY_BACKEND_CLEANUP):
-        if pt.name != n0 or (pt.description or '') != d0:
-            pt.name = n0
-            pt.description = d0
-            pt.save()
+    cleanup_rows = list(
+        PeriodicTask.objects.filter(task=_CELERY_BACKEND_CLEANUP).order_by('id')
+    )
+    if cleanup_rows:
+        keep = cleanup_rows[0]
+        for extra in cleanup_rows[1:]:
+            extra.delete()
+            stats['celery_cleanup_merged'] = int(stats['celery_cleanup_merged']) + 1
+        if _relabel_periodic_task(keep, n0, d0):
             stats['celery_cleanup_relabeled'] = int(stats['celery_cleanup_relabeled']) + 1
 
     return stats

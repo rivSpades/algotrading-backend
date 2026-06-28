@@ -39,7 +39,7 @@ import logging
 from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
-from typing import Optional
+from typing import Any, Optional
 
 from django.db import transaction
 from django.utils import timezone
@@ -57,12 +57,71 @@ from ..engines.base import (
 )
 from ..models import DeploymentSymbol, LiveTrade, StrategyDeployment
 from .audit import log_event
+from .trade_metadata import (
+    enrich_flat_entry_metadata,
+    enrich_hybrid_entry_hedge_metadata,
+    patch_main_trade_hedge_leg_link,
+    enrich_hybrid_entry_main_metadata,
+    merge_exit_rollups_for_main_trade,
+)
 
 logger = logging.getLogger(__name__)
 
 # Hedge sleeve tickers (normal/hysteresis uses VIXM; panic uses VIXY).
 HEDGE_TICKER_NORMAL = 'VIXM'
 HEDGE_TICKER_PANIC = 'VIXY'
+
+
+def _positive_decimal(val: Any) -> Optional[Decimal]:
+    """Return ``Decimal`` value only when strictly positive ('' and 0 are unknown/absent)."""
+    if val is None or val == '':
+        return None
+    try:
+        d = Decimal(str(val))
+        return d if d > 0 else None
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def _resolve_exit_execution_price(
+    *,
+    order_price: Any,
+    entry_price_fallback: Decimal,
+    metadata_exit_subset: Optional[dict] = None,
+    broker_adapter: Optional[BaseBrokerAdapter] = None,
+    quote_symbol: Optional[str] = None,
+) -> Decimal:
+    """Resolve realised exit avg for PnL and ``LiveTrade.exit_price``.
+
+    ``if order_result.price`` is unsafe: ``Decimal('0')`` is falsy yet is a common
+    placeholder before ``filled_avg_price`` is populated. Prefer positive prices
+    only, then persisted exit-metadata from the synchronous response, then a live
+    quote, then sleeve entry as last resort.
+    """
+    c = _positive_decimal(order_price)
+    if c is not None:
+        return c
+    ex = metadata_exit_subset if isinstance(metadata_exit_subset, dict) else {}
+    for key in (
+        'synced_avg_price',
+        'filled_avg_price',
+        'executed_avg_price',
+        'filled_price',
+    ):
+        c = _positive_decimal(ex.get(key))
+        if c is not None:
+            return c
+    if broker_adapter and quote_symbol:
+        try:
+            c = _positive_decimal(broker_adapter.get_current_price(quote_symbol))
+            if c is not None:
+                return c
+        except Exception:
+            pass
+    try:
+        return Decimal(str(entry_price_fallback))
+    except Exception:
+        return Decimal('0')
 
 
 class OrderPlacementError(Exception):
@@ -205,6 +264,16 @@ class OrderOutcome:
         return d
 
 
+def _hedge_parent_live_trade_ids_match(meta_parent: Any, main_id: Any) -> bool:
+    """Match JSON ``hedge_parent_live_trade_id`` (int/str) to ``LiveTrade.id``."""
+    if meta_parent is None or main_id is None:
+        return False
+    try:
+        return int(meta_parent) == int(main_id)
+    except (TypeError, ValueError):
+        return str(meta_parent).strip() == str(main_id).strip()
+
+
 def _hedge_leg_child_trades(trade: LiveTrade) -> list:
     """Open hedge legs whose metadata points at this main trade as parent."""
     out: list = []
@@ -213,7 +282,10 @@ def _hedge_leg_child_trades(trade: LiveTrade) -> list:
         .select_related('symbol')
     ):
         m = ht.metadata or {}
-        if m.get('is_hedge_leg') and m.get('hedge_parent_live_trade_id') == trade.id:
+        if m.get('is_hedge_leg') and _hedge_parent_live_trade_ids_match(
+            m.get('hedge_parent_live_trade_id'),
+            trade.id,
+        ):
             out.append(ht)
     return out
 
@@ -222,18 +294,41 @@ def _finalize_hedge_leg_on_exit_fill(
     ht: LiveTrade,
     order_result,
     fire_at: datetime,
+    *,
+    broker_adapter: Optional[BaseBrokerAdapter] = None,
 ) -> None:
     """Persist closed state for a hedge LiveTrade when the broker reports a fill."""
     filled = order_result.filled_quantity or Decimal('0')
     if filled <= 0:
         return
-    exit_price = order_result.price if order_result.price else ht.entry_price
+    meta_u = dict(ht.metadata or {})
+    exit_block_raw = meta_u.get('exit') if isinstance(meta_u.get('exit'), dict) else {}
+    exit_block = dict(exit_block_raw)
+    ticker = getattr(ht.symbol, 'ticker', None) if ht.symbol_id else None
+    exit_price = _resolve_exit_execution_price(
+        order_price=order_result.price,
+        entry_price_fallback=ht.entry_price or Decimal('0'),
+        metadata_exit_subset=exit_block,
+        broker_adapter=broker_adapter,
+        quote_symbol=ticker,
+    )
+    exit_block['executed_avg_price'] = str(exit_price)
+    meta_u['exit'] = exit_block
     quantity_closed = min(filled, ht.quantity) if ht.quantity else filled
     pnl = _compute_pnl(
         ht.entry_price, exit_price, quantity_closed, ht.position_mode,
     )
     pnl_pct = _safe_pct(ht.entry_price, exit_price, ht.position_mode)
     with transaction.atomic():
+        ht.refresh_from_db()
+        fresh_meta = dict(ht.metadata or {})
+        db_exit = dict(
+            fresh_meta.get('exit') if isinstance(fresh_meta.get('exit'), dict) else {}
+        )
+        merged_exit = {**db_exit, **exit_block}
+        merged_exit['executed_avg_price'] = str(exit_price)
+        fresh_meta['exit'] = merged_exit
+        ht.metadata = fresh_meta
         ht.exit_price = exit_price
         ht.exit_timestamp = fire_at
         ht.pnl = pnl
@@ -282,7 +377,9 @@ def _submit_hedge_leg_exits_for_main_trade(
             }
             ht.metadata = meta
             if hx.status != 'rejected' and (hx.filled_quantity or Decimal('0')) > 0:
-                _finalize_hedge_leg_on_exit_fill(ht, hx, fire_at)
+                _finalize_hedge_leg_on_exit_fill(
+                    ht, hx, fire_at, broker_adapter=broker_adapter,
+                )
                 log_event(
                     deployment,
                     deployment_symbol=deployment_symbol,
@@ -290,9 +387,12 @@ def _submit_hedge_leg_exits_for_main_trade(
                     actor_type=actor_type,
                     actor_id=actor_id,
                     message=(
-                        f"{ht.symbol.ticker}: hedge leg #{ht.id} closed (parent main #{main_trade.id})"
+                        f"{main_trade.symbol.ticker} exit: hedge sleeve "
+                        f"{ht.symbol.ticker} leg #{ht.id} filled (parent main #{main_trade.id})"
                     ),
                     context={
+                        'main_ticker': main_trade.symbol.ticker,
+                        'hedge_ticker': ht.symbol.ticker,
                         'ticker': ht.symbol.ticker,
                         'live_trade_id': ht.id,
                         'hedge_parent_live_trade_id': main_trade.id,
@@ -612,11 +712,33 @@ def manual_close_live_trade(
         trade.quantity = quantity_closed
     trade.metadata = meta
 
-    exit_price = order_result.price if order_result.price else trade.entry_price
+    exit_exit_sub = meta.get('exit') if isinstance(meta.get('exit'), dict) else {}
+    exit_price = _resolve_exit_execution_price(
+        order_price=order_result.price,
+        entry_price_fallback=trade.entry_price,
+        metadata_exit_subset=exit_exit_sub,
+        broker_adapter=broker_adapter,
+        quote_symbol=getattr(trade.symbol, 'ticker', None) if trade.symbol_id else None,
+    )
+    exit_exit_written = dict(
+        meta.get('exit') if isinstance(meta.get('exit'), dict) else {}
+    )
+    exit_exit_written['executed_avg_price'] = str(exit_price)
+    meta['exit'] = exit_exit_written
     pnl = _compute_pnl(
         trade.entry_price, exit_price, quantity_closed, trade.position_mode,
     )
     pnl_pct = _safe_pct(trade.entry_price, exit_price, trade.position_mode)
+    if not meta.get('is_hedge_leg') and (
+        meta.get('hedge_enabled') or getattr(trade.deployment, 'hedge_enabled', False)
+    ):
+        meta = merge_exit_rollups_for_main_trade(
+            meta,
+            main_pnl=pnl,
+            parent_trade_id=trade.id,
+            closed_main_quantity=quantity_closed,
+        )
+    trade.metadata = meta
     with transaction.atomic():
         trade.exit_price = exit_price
         trade.exit_timestamp = fire_at
@@ -1058,6 +1180,20 @@ def _place_entry_order(
     filled = order_result.filled_quantity or Decimal('0')
     entry_price = order_result.price if filled > 0 else reference_price
 
+    entry_meta = {
+        'signal': signal.to_dict(),
+        'reference_price': str(reference_price),
+        'requested_quantity': str(quantity),
+        'broker': {
+            'order_id': order_result.order_id,
+            'broker_order_id': order_result.broker_order_id,
+            'status': order_result.status,
+            'filled_quantity': str(order_result.filled_quantity),
+            'filled_price': str(order_result.price),
+        },
+    }
+    enrich_flat_entry_metadata(entry_meta, entry_price=entry_price, quantity=quantity)
+
     with transaction.atomic():
         live_trade = LiveTrade.objects.create(
             deployment=deployment,
@@ -1070,18 +1206,7 @@ def _place_entry_order(
             entry_timestamp=fire_at,
             status='open',
             broker_order_id=order_result.broker_order_id or order_result.order_id or '',
-            metadata={
-                'signal': signal.to_dict(),
-                'reference_price': str(reference_price),
-                'requested_quantity': str(quantity),
-                'broker': {
-                    'order_id': order_result.order_id,
-                    'broker_order_id': order_result.broker_order_id,
-                    'status': order_result.status,
-                    'filled_quantity': str(order_result.filled_quantity),
-                    'filled_price': str(order_result.price),
-                },
-            },
+            metadata=entry_meta,
         )
 
     if filled > 0 and order_result.status in ('filled', 'partially_filled', 'partial'):
@@ -1395,6 +1520,7 @@ def _place_hedged_entry_order(
         'signal': signal.to_dict(),
         'reference_price': str(reference_price),
         'full_bet_shares': str(quantity),
+        'main_opening_strategyleg_qty': str(strat_qty_d),
         'strategyleg_quantity': str(strat_qty_d),
         'requested_quantity': str(strat_qty_d),
         'broker': {
@@ -1405,6 +1531,9 @@ def _place_hedged_entry_order(
             'filled_price': str(order_result.price),
         },
     }
+    enrich_hybrid_entry_main_metadata(
+        meta, strat_entry_price=entry_price, strat_quantity=strat_qty_d,
+    )
 
     with transaction.atomic():
         live_trade = LiveTrade.objects.create(
@@ -1443,28 +1572,48 @@ def _place_hedged_entry_order(
                     if hedge_filled > 0
                     else broker_adapter.get_current_price(hedge_sym_ticker) or Decimal('0')
                 )
-                LiveTrade.objects.create(
+                target_decimal = Decimal(str(h_qty))
+                hedge_qty_effective = target_decimal
+                if hedge_filled > Decimal('0'):
+                    hedge_qty_effective = min(hedge_filled, target_decimal)
+                hedge_md = {
+                    'is_hedge_leg': True,
+                    'hedge_parent_ticker': ticker,
+                    'hedge_parent_live_trade_id': live_trade.id,
+                    'hedge_target_quantity': str(h_qty),
+                    'overlay': hw_meta,
+                    'w_strategy': w_s,
+                    'w_hedge': w_h,
+                    'hedge_ticker': hedge_sym_ticker,
+                    'regime': hedge_regime,
+                }
+                enrich_hybrid_entry_hedge_metadata(
+                    hedge_md,
+                    hedge_entry_price=hedge_entry_px,
+                    hedge_quantity=hedge_qty_effective,
+                )
+                hedge_row = LiveTrade.objects.create(
                     deployment=deployment,
                     deployment_symbol=deployment_symbol,
                     symbol=hedge_symbol,
                     position_mode='long',
                     trade_type='buy',
                     entry_price=hedge_entry_px,
-                    quantity=Decimal(str(h_qty)),
+                    quantity=hedge_qty_effective,
                     entry_timestamp=fire_at,
                     status='open',
                     broker_order_id=hedge_result.broker_order_id or hedge_result.order_id or '',
-                    metadata={
-                        'is_hedge_leg': True,
-                        'hedge_parent_ticker': ticker,
-                        'hedge_parent_live_trade_id': live_trade.id,
-                        'overlay': hw_meta,
-                        'w_strategy': w_s,
-                        'w_hedge': w_h,
-                        'hedge_ticker': hedge_sym_ticker,
-                        'regime': hedge_regime,
-                    },
+                    metadata=hedge_md,
                 )
+                main_refresh = dict(live_trade.metadata or {})
+                patch_main_trade_hedge_leg_link(
+                    main_refresh,
+                    hedge_live_trade_id=hedge_row.id,
+                    hedge_ticker=hedge_sym_ticker,
+                    hedge_quantity=hedge_qty_effective,
+                )
+                live_trade.metadata = main_refresh
+                live_trade.save(update_fields=['metadata', 'updated_at'])
 
     if filled > 0 and order_result.status in ('filled', 'partially_filled', 'partial'):
         log_event(
@@ -1544,6 +1693,12 @@ def _place_exit_order(
         )
         return OrderOutcome(status='skipped', reason='no_open_trade_for_exit')
 
+    hedge_children_before = list(_hedge_leg_child_trades(open_trade))
+    hedge_inventory = [
+        {'live_trade_id': h.id, 'hedge_ticker': h.symbol.ticker}
+        for h in hedge_children_before
+    ]
+
     log_event(
         deployment,
         deployment_symbol=deployment_symbol,
@@ -1552,14 +1707,19 @@ def _place_exit_order(
         actor_id=actor_id,
         message=(
             f"{ticker}: submitting {closing_side.upper()} {open_trade.quantity} "
-            f"to close {position_mode} trade #{open_trade.id}"
+            f"to close {position_mode} trade #{open_trade.id}; "
+            f"hedge legs to unwind: {[h['hedge_ticker'] for h in hedge_inventory]}"
         ),
         context={
+            'main_ticker': ticker,
             'ticker': ticker,
             'side': closing_side,
             'quantity': str(open_trade.quantity),
             'live_trade_id': open_trade.id,
+            'hedge_symbols': [h['hedge_ticker'] for h in hedge_inventory],
+            'hedge_leg_live_trade_ids': [h['live_trade_id'] for h in hedge_inventory],
             'signal': signal.to_dict(),
+            'source': 'exit_signal',
         },
     )
 
@@ -1653,11 +1813,43 @@ def _place_exit_order(
             quantity=open_trade.quantity,
         )
 
-    exit_price = order_result.price
-    pnl = _compute_pnl(open_trade.entry_price, exit_price, open_trade.quantity, position_mode)
+    oq = open_trade.quantity or Decimal('0')
+    qty_closed = oq
+    if filled > 0:
+        try:
+            fc = Decimal(str(filled))
+            if fc > 0:
+                qty_closed = min(fc, oq)
+        except Exception:
+            pass
+    exit_price = _resolve_exit_execution_price(
+        order_price=order_result.price,
+        entry_price_fallback=open_trade.entry_price,
+        metadata_exit_subset=meta.get('exit') if isinstance(meta.get('exit'), dict) else {},
+        broker_adapter=broker_adapter,
+        quote_symbol=ticker,
+    )
+
+    pnl = _compute_pnl(open_trade.entry_price, exit_price, qty_closed, position_mode)
     pnl_pct = _safe_pct(open_trade.entry_price, exit_price, position_mode)
 
     with transaction.atomic():
+        open_trade.refresh_from_db()
+        merge_meta = dict(open_trade.metadata or {})
+        ex_inner = merge_meta.get('exit') if isinstance(merge_meta.get('exit'), dict) else {}
+        ex_inner_merge = dict(ex_inner)
+        ex_inner_merge['executed_avg_price'] = str(exit_price)
+        merge_meta['exit'] = ex_inner_merge
+        if not merge_meta.get('is_hedge_leg') and (
+            merge_meta.get('hedge_enabled') or getattr(deployment, 'hedge_enabled', False)
+        ):
+            merge_meta = merge_exit_rollups_for_main_trade(
+                merge_meta,
+                main_pnl=pnl,
+                parent_trade_id=open_trade.id,
+                closed_main_quantity=qty_closed,
+            )
+        open_trade.metadata = merge_meta
         open_trade.exit_price = exit_price
         open_trade.exit_timestamp = fire_at
         open_trade.pnl = pnl
@@ -1666,6 +1858,7 @@ def _place_exit_order(
         open_trade.status = 'closed'
         open_trade.save(
             update_fields=[
+                'metadata',
                 'exit_price', 'exit_timestamp', 'pnl', 'pnl_percentage',
                 'is_winner', 'status', 'updated_at',
             ],
@@ -1697,12 +1890,14 @@ def _place_exit_order(
         actor_type=actor_type,
         actor_id=actor_id,
         message=(
-            f"{ticker}: closed {position_mode} trade #{open_trade.id} "
-            f"PnL={pnl}"
+            f"{ticker} exit: main leg #{open_trade.id} closed (PnL={pnl}); "
+            f"VIX hedge rows submitted for unwind: {[h['hedge_ticker'] for h in hedge_inventory]}"
         ),
         context={
+            'main_ticker': ticker,
             'ticker': ticker,
             'live_trade_id': open_trade.id,
+            'main_live_trade_id': open_trade.id,
             'position_mode': position_mode,
             'entry_price': str(open_trade.entry_price),
             'exit_price': str(exit_price),
@@ -1710,6 +1905,9 @@ def _place_exit_order(
             'pnl_percentage': str(pnl_pct) if pnl_pct is not None else None,
             'is_winner': open_trade.is_winner,
             'broker_order_id': order_result.broker_order_id,
+            'hedge_symbols': [h['hedge_ticker'] for h in hedge_inventory],
+            'hedge_leg_live_trade_ids': [h['live_trade_id'] for h in hedge_inventory],
+            'source': 'exit_signal',
         },
     )
 
@@ -1725,6 +1923,150 @@ def _place_exit_order(
 # ---------------------------------------------------------------------------
 # Position polling reconciliation
 # ---------------------------------------------------------------------------
+
+
+def _try_close_main_trade_via_exit_order_metadata(
+    trade: LiveTrade,
+    broker_adapter: BaseBrokerAdapter,
+    deployment: StrategyDeployment,
+    *,
+    actor_type: str,
+    actor_id: str,
+) -> bool:
+    """When a market close was submitted but returned 0 fill, finalize once the exit order fills.
+
+    Manual/signal exits persist ``metadata['exit']['broker_order_id']``. Unlike hedge legs, the
+    main row's model ``broker_order_id`` often still points at the *entry* order, so polling
+    that id never observes the close — this path mirrors
+    ``_try_close_hedge_leg_via_exit_order_metadata`` for strategy sleeve rows.
+    """
+    if trade.status != 'open':
+        return False
+    m = trade.metadata or {}
+    if m.get('is_hedge_leg'):
+        return False
+    exit_block_raw = m.get('exit') or {}
+    if not isinstance(exit_block_raw, dict):
+        return False
+    exit_oid = exit_block_raw.get('broker_order_id') or exit_block_raw.get('order_id')
+    if not exit_oid:
+        return False
+    if exit_block_raw.get('source') == 'manual_close_force':
+        return False
+
+    try:
+        ord_res = broker_adapter.get_order_status(str(exit_oid).strip())
+    except Exception:  # pragma: no cover - network
+        logger.exception('Exit order poll failed trade=%s order=%s', trade.id, exit_oid)
+        return False
+
+    st = (ord_res.status or '').lower()
+    if st in ('rejected', 'canceled', 'cancelled', 'expired'):
+        return False
+    if st in (
+        'new', 'pending_new', 'accepted', 'pending_replace',
+        'pending_cancel', 'accepted_for_bidding',
+    ):
+        return False
+
+    filled = ord_res.filled_quantity or Decimal('0')
+    if filled <= 0 and st in ('filled', 'done', 'complete'):
+        filled = trade.quantity or ord_res.quantity or Decimal('0')
+    if filled <= 0 and st in ('partially_filled', 'partial'):
+        return False
+    if filled <= 0:
+        return False
+
+    ord_for_finalize = replace(ord_res, filled_quantity=filled)
+
+    fire_at = timezone.now()
+    ts = exit_block_raw.get('requested_at')
+    if ts:
+        try:
+            from django.utils.dateparse import parse_datetime
+
+            p = parse_datetime(str(ts).replace('Z', '+00:00'))
+            if p is not None:
+                fire_at = p
+        except Exception:
+            pass
+
+    quantity_closed = filled
+    meta = dict(trade.metadata or {})
+    exit_block = dict(exit_block_raw)
+    exit_block['synced_status'] = ord_res.status
+    exit_block['synced_filled_quantity'] = str(filled)
+    exit_block['synced_avg_price'] = str(ord_for_finalize.price or '')
+    meta['exit'] = exit_block
+
+    if quantity_closed != trade.quantity:
+        meta['quantity_reconciled_to_fill'] = {
+            'db_quantity': str(trade.quantity),
+            'closed_quantity': str(quantity_closed),
+        }
+
+    exit_price = _resolve_exit_execution_price(
+        order_price=ord_for_finalize.price,
+        entry_price_fallback=trade.entry_price,
+        metadata_exit_subset=exit_block,
+        broker_adapter=broker_adapter,
+        quote_symbol=getattr(trade.symbol, 'ticker', None) if trade.symbol_id else None,
+    )
+    exit_block['executed_avg_price'] = str(exit_price)
+    meta['exit'] = exit_block
+    pnl = _compute_pnl(
+        trade.entry_price, exit_price, quantity_closed, trade.position_mode,
+    )
+    pnl_pct = _safe_pct(trade.entry_price, exit_price, trade.position_mode)
+    if not meta.get('is_hedge_leg') and (
+        meta.get('hedge_enabled') or getattr(trade.deployment, 'hedge_enabled', False)
+    ):
+        meta = merge_exit_rollups_for_main_trade(
+            meta,
+            main_pnl=pnl,
+            parent_trade_id=trade.id,
+            closed_main_quantity=quantity_closed,
+        )
+
+    with transaction.atomic():
+        trade.refresh_from_db()
+        if trade.status != 'open':
+            return False
+        trade.metadata = meta
+        if quantity_closed != trade.quantity:
+            trade.quantity = quantity_closed
+        trade.exit_price = exit_price
+        trade.exit_timestamp = fire_at
+        trade.pnl = pnl
+        trade.pnl_percentage = pnl_pct
+        trade.is_winner = pnl is not None and pnl > 0
+        trade.status = 'closed'
+        trade.save(
+            update_fields=[
+                'exit_price', 'exit_timestamp', 'pnl', 'pnl_percentage',
+                'is_winner', 'status', 'quantity', 'metadata', 'updated_at',
+            ],
+        )
+
+    log_event(
+        deployment,
+        deployment_symbol=trade.deployment_symbol,
+        event_type='trade_closed',
+        actor_type=actor_type,
+        actor_id=actor_id,
+        message=(
+            f"{trade.symbol.ticker}: main leg #{trade.id} closed via exit order sync "
+            f"(order {exit_oid})"
+        ),
+        context={
+            'ticker': trade.symbol.ticker,
+            'live_trade_id': trade.id,
+            'source': 'exit_order_sync_main',
+            'exit_order_id': str(exit_oid),
+            'pnl': str(pnl) if pnl is not None else None,
+        },
+    )
+    return True
 
 
 def _try_close_hedge_leg_via_exit_order_metadata(
@@ -1785,7 +2127,18 @@ def _try_close_hedge_leg_via_exit_order_metadata(
         except Exception:
             pass
 
-    _finalize_hedge_leg_on_exit_fill(trade, ord_for_finalize, fire_at)
+    ex_up = dict(exit_block) if isinstance(exit_block, dict) else {}
+    ex_up['synced_status'] = ord_res.status
+    ex_up['synced_filled_quantity'] = str(filled)
+    if ord_for_finalize.price is not None:
+        ex_up['synced_avg_price'] = str(ord_for_finalize.price)
+    tm = dict(trade.metadata or {})
+    tm['exit'] = ex_up
+    trade.metadata = tm
+
+    _finalize_hedge_leg_on_exit_fill(
+        trade, ord_for_finalize, fire_at, broker_adapter=broker_adapter,
+    )
     log_event(
         deployment,
         deployment_symbol=trade.deployment_symbol,
@@ -1805,6 +2158,98 @@ def _try_close_hedge_leg_via_exit_order_metadata(
     return True
 
 
+def _reconcile_open_main_trade_quantity_to_broker(
+    trade: LiveTrade,
+    position: PositionInfo,
+    deployment: StrategyDeployment,
+    *,
+    actor_type: str,
+    actor_id: str,
+) -> bool:
+    """If the broker holds fewer shares than this open main row claims, shrink ``quantity``.
+
+    Alpaca (and manual partial exits outside the app) can leave the ledger claiming e.g. 13
+    shares while the account only has ~1.1 — manual close then sells the broker cap, but the
+    UI and statistics stay wrong until we align the row to the broker's net position.
+
+    Hedge legs are skipped: VIXM/VIXY quantity is often a slice of a shared account position.
+    """
+    if trade.status != 'open':
+        return False
+    meta0 = trade.metadata or {}
+    if meta0.get('is_hedge_leg'):
+        return False
+
+    pq = position.quantity or Decimal('0')
+    if pq == 0:
+        return False
+    tq = trade.quantity or Decimal('0')
+    if tq <= 0:
+        return False
+
+    new_q: Optional[Decimal] = None
+    if trade.position_mode == 'long':
+        if position.position_type != 'long' or pq <= 0:
+            return False
+        if pq >= tq:
+            return False
+        new_q = pq
+    elif trade.position_mode == 'short':
+        if position.position_type != 'short' or pq >= 0:
+            return False
+        cover = abs(pq)
+        if cover >= tq:
+            return False
+        new_q = cover
+    else:
+        return False
+
+    if new_q is None or new_q <= 0:
+        return False
+
+    with transaction.atomic():
+        trade.refresh_from_db()
+        if trade.status != 'open':
+            return False
+        meta = dict(trade.metadata or {})
+        log_entry = {
+            'from_db': str(trade.quantity),
+            'to_broker_qty': str(new_q),
+            'synced_at': timezone.now().isoformat(),
+        }
+        prev = meta.get('broker_quantity_reconcile')
+        if isinstance(prev, list):
+            prev = prev + [log_entry]
+        elif prev:
+            prev = [prev, log_entry]
+        else:
+            prev = [log_entry]
+        meta['broker_quantity_reconcile'] = prev[-10:]
+        trade.quantity = new_q
+        trade.metadata = meta
+        trade.save(update_fields=['quantity', 'metadata', 'updated_at'])
+
+    log_event(
+        deployment,
+        deployment_symbol=trade.deployment_symbol,
+        event_type='info',
+        actor_type=actor_type,
+        actor_id=actor_id,
+        message=(
+            f"{trade.symbol.ticker}: reconciled open trade #{trade.id} quantity "
+            f"{tq} -> {new_q} (broker-held shares lower than DB row)"
+        ),
+        context={
+            'ticker': trade.symbol.ticker,
+            'live_trade_id': trade.id,
+            'source': 'broker_quantity_reconcile',
+            'from_quantity': str(tq),
+            'to_quantity': str(new_q),
+        },
+    )
+    return True
+
+
 def update_open_trades(
     deployment: StrategyDeployment,
     *,
@@ -1819,6 +2264,9 @@ def update_open_trades(
     `current_price` if available, falling back to the entry price). Trades
     that the broker still tracks have their `metadata['last_position_sync']`
     refreshed but remain `open`.
+
+    When the broker reports a smaller position than ``trade.quantity`` (main sleeves only),
+    we shrink ``quantity`` to match so closes and KPIs reflect reality.
     """
 
     broker_adapter = broker_adapter or get_adapter_for_deployment(deployment)
@@ -1841,11 +2289,22 @@ def update_open_trades(
     refreshed = 0
     order_refreshed = 0
     order_terminal = 0
+    quantity_reconciled = 0
     errors = 0
     for trade in open_trades:
         # Hedge sleeve: close from the *sell* order id in metadata, not net position in
         # the symbol (other deployments may still hold VIXM/VIXY).
         if _try_close_hedge_leg_via_exit_order_metadata(
+            trade,
+            broker_adapter,
+            deployment,
+            actor_type=actor_type,
+            actor_id=actor_id,
+        ):
+            closed += 1
+            continue
+
+        if _try_close_main_trade_via_exit_order_metadata(
             trade,
             broker_adapter,
             deployment,
@@ -1958,6 +2417,20 @@ def update_open_trades(
             refreshed += 1
             continue
 
+        if position is not None and (position.quantity or Decimal('0')) != 0:
+            if _reconcile_open_main_trade_quantity_to_broker(
+                trade,
+                position,
+                deployment,
+                actor_type=actor_type,
+                actor_id=actor_id,
+            ):
+                quantity_reconciled += 1
+                try:
+                    position = broker_adapter.get_position(trade.symbol.ticker)
+                except Exception:  # pragma: no cover
+                    position = None
+
         if position is None or (position.quantity or Decimal('0')) == 0:
             # Broker has no position -> close the trade.
             exit_price = (
@@ -1977,6 +2450,16 @@ def update_open_trades(
                 trade.status = 'closed'
                 meta = dict(trade.metadata or {})
                 meta['closed_via_position_sync'] = True
+                if not meta.get('is_hedge_leg') and (
+                    meta.get('hedge_enabled')
+                    or getattr(trade.deployment, 'hedge_enabled', False)
+                ):
+                    meta = merge_exit_rollups_for_main_trade(
+                        meta,
+                        main_pnl=pnl,
+                        parent_trade_id=trade.id,
+                        closed_main_quantity=trade.quantity,
+                    )
                 trade.metadata = meta
                 trade.save(
                     update_fields=[
@@ -2023,6 +2506,7 @@ def update_open_trades(
         'refreshed': refreshed,
         'orders_refreshed': order_refreshed,
         'orders_terminal': order_terminal,
+        'quantity_reconciled': quantity_reconciled,
         'errors': errors,
     }
     log_event(
@@ -2078,6 +2562,24 @@ def _resolve_reference_price(
     except Exception:  # pragma: no cover - defensive
         logger.exception('Broker.get_current_price raised for %s', ticker)
         return None
+
+
+# Minimum bet notional (equity * bet_pct) below which we stop scanning new entries.
+LIVE_ENTRY_MIN_NOTIONAL_USD = Decimal('2')
+
+
+def entry_phase_bankroll_exhausted(
+    deployment: StrategyDeployment,
+    broker_adapter: BaseBrokerAdapter,
+) -> bool:
+    """True when deployable sizing base cannot fund a minimal new entry."""
+    cap = _sizing_base_capital(deployment, broker_adapter)
+    if cap is None or cap <= 0:
+        return True
+    bet_pct = Decimal(str(deployment.bet_size_percentage or 0)) / Decimal('100')
+    if bet_pct <= 0:
+        return True
+    return (cap * bet_pct) < LIVE_ENTRY_MIN_NOTIONAL_USD
 
 
 def _sizing_base_capital(

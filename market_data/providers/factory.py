@@ -4,10 +4,13 @@ Creates provider instances based on provider code
 """
 
 from typing import Optional
+
 from ..models import Provider
 from .yahoo_finance import YahooFinanceProvider
 from .polygon import PolygonProvider
 from .alpaca import AlpacaProvider
+from .alpha_vantage import AlphaVantageProvider
+from . import credentials as provider_credentials
 
 
 class ProviderFactory:
@@ -17,6 +20,7 @@ class ProviderFactory:
         'YAHOO': YahooFinanceProvider,
         'POLYGON': PolygonProvider,
         'ALPACA': AlpacaProvider,
+        'ALPHA_VANTAGE': AlphaVantageProvider,
     }
     
     @classmethod
@@ -30,60 +34,58 @@ class ProviderFactory:
         Returns:
             Provider instance or None if not found
         """
-        provider_class = cls.PROVIDERS.get(provider_code.upper())
+        code = provider_code.upper()
+        provider_class = cls.PROVIDERS.get(code)
         if not provider_class:
             raise ValueError(f"Unknown provider code: {provider_code}")
         
-        # For Yahoo Finance, return static class (no initialization needed)
-        if provider_code.upper() == 'YAHOO':
+        if code == 'YAHOO':
             return provider_class
-        
-        # For other providers, get provider from database and initialize
-        try:
-            provider = Provider.objects.get(code=provider_code.upper(), is_active=True)
-            
-            if provider_code.upper() == 'POLYGON':
-                if not all([provider.access_key_id, provider.secret_access_key, provider.endpoint_url, provider.bucket_name]):
-                    raise ValueError(f"Polygon provider missing required credentials")
-                
-                # Initialize Polygon provider with credentials (uses class variables)
-                provider_class.initialize(
-                    access_key_id=provider.access_key_id,
-                    secret_access_key=provider.secret_access_key,
-                    endpoint_url=provider.endpoint_url,
-                    bucket_name=provider.bucket_name
+
+        if code == 'POLYGON':
+            creds = provider_credentials.get_polygon_credentials()
+            if not creds:
+                raise ValueError(
+                    'Polygon provider missing credentials. '
+                    'Set POLYGON_* env vars or Provider DB row.'
                 )
-                
-                return provider_class
-            
-            if provider_code.upper() == 'ALPACA':
-                if not provider.api_key:
-                    raise ValueError(f"Alpaca provider missing required credentials (API key)")
-                
-                # Alpaca needs API key ID and API secret
-                # api_key stores the API Key ID, secret_access_key stores the API Secret
-                # If secret_access_key is not set, we'll check if there's a description or notes field
-                # For now, secret_access_key should be set for Alpaca provider
-                api_secret = provider.secret_access_key
-                
-                if not api_secret:
-                    raise ValueError(f"Alpaca provider missing API secret. Please set secret_access_key field.")
-                
-                # Initialize Alpaca provider with credentials
-                # base_url defaults to paper-api.alpaca.markets if not provided
-                provider_class.initialize(
-                    api_key=provider.api_key,
-                    api_secret=api_secret,
-                    base_url=provider.base_url  # Optional, defaults to paper-api
-                )
-                
-                return provider_class
-            
-            # Add more provider types here as needed
+            access_key_id, secret_access_key, endpoint_url, bucket_name = creds
+            provider_class.initialize(
+                access_key_id=access_key_id,
+                secret_access_key=secret_access_key,
+                endpoint_url=endpoint_url,
+                bucket_name=bucket_name,
+            )
             return provider_class
-            
-        except Provider.DoesNotExist:
-            raise ValueError(f"Provider {provider_code} not found in database")
+
+        if code == 'ALPACA':
+            creds = provider_credentials.get_alpaca_credentials()
+            if not creds:
+                raise ValueError(
+                    'Alpaca provider missing credentials. '
+                    'Set ALPACA_API_KEY and ALPACA_API_SECRET in .env '
+                    'or Provider DB row.'
+                )
+            provider_class.initialize(
+                api_key=creds.api_key,
+                api_secret=creds.api_secret,
+                base_url=creds.base_url,
+            )
+            return provider_class
+
+        if code == 'ALPHA_VANTAGE':
+            api_key = provider_credentials.get_alpha_vantage_api_key()
+            if not api_key:
+                raise ValueError(
+                    'Alpha Vantage provider missing API key. '
+                    'Set ALPHA_VANTAGE_API_KEY in .env or Provider DB row.'
+                )
+            provider_class.initialize(api_key=api_key)
+            return provider_class
+
+        # Ensure catalog row exists for unknown future providers
+        Provider.objects.get(code=code, is_active=True)
+        return provider_class
     
     @classmethod
     def get_provider_instance(cls, provider: Provider):
@@ -97,4 +99,3 @@ class ProviderFactory:
             Provider instance
         """
         return cls.get_provider(provider.code)
-

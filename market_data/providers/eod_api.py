@@ -70,7 +70,36 @@ class EODAPIProvider:
         except Exception as e:
             print(f"Error fetching symbols for {exchange_code}: {str(e)}")
             return []
-    
+
+    @classmethod
+    def search_symbols(cls, query: str, limit: int = 20) -> List[Dict]:
+        """
+        Search symbols by ticker or name via EOD API.
+
+        Args:
+            query: Search term (ticker or company name)
+            limit: Maximum number of results to return
+
+        Returns:
+            List of symbol candidate dicts
+        """
+        try:
+            url = f"{cls.BASE_URL}/search/{query}"
+            params = {
+                'api_token': cls.API_KEY,
+                'fmt': 'json',
+                'limit': limit,
+            }
+            response = requests.get(url, params=params, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, list):
+                return []
+            return [item for item in data if isinstance(item, dict) and item.get('Code')]
+        except Exception as e:
+            print(f"Error searching symbols for {query}: {str(e)}")
+            return []
+
     @classmethod
     def get_multiple_exchange_symbols(cls, exchange_codes: List[str]) -> Dict[str, List[Dict]]:
         """

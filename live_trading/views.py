@@ -7,10 +7,12 @@ The viewsets here cover:
 """
 
 import logging
+from decimal import Decimal
 
 from celery.result import AsyncResult
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Q, Sum, Value, DecimalField
+from django.db.models.functions import Coalesce
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status, viewsets
@@ -56,6 +58,7 @@ from .services import (
     evaluate_deployment_for_promotion,
     evaluate_deployment_symbol,
     exit_open_trades_for_deployment,
+    get_adapter_for_deployment,
     log_event,
     manual_close_live_trade,
     promote_to_real_money,
@@ -447,8 +450,9 @@ class LiveTradeViewSet(viewsets.ReadOnlyModelViewSet):
     pagination_class = LiveTradePagination
     filter_backends = [SearchFilter, OrderingFilter]
     search_fields = ['symbol__ticker', 'deployment__name', 'broker_order_id']
-    ordering_fields = ['entry_timestamp', 'exit_timestamp', 'pnl']
-    ordering = ['-entry_timestamp']
+    # Default: most recently closed (or opened) first so exits are not buried behind old entries.
+    ordering_fields = ['entry_timestamp', 'exit_timestamp', 'pnl', 'activity_ts', 'id']
+    ordering = ['-activity_ts', '-id']
 
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -464,6 +468,34 @@ class LiveTradeViewSet(viewsets.ReadOnlyModelViewSet):
         status_filter = self.request.query_params.get('status', None)
         if status_filter:
             queryset = queryset.filter(status=status_filter)
+
+        only_open = self.request.query_params.get('open_only')
+        only_closed = self.request.query_params.get('closed_only')
+        if only_open is not None and str(only_open).lower() in ('1', 'true', 'yes'):
+            queryset = queryset.filter(status='open')
+        if only_closed is not None and str(only_closed).lower() in ('1', 'true', 'yes'):
+            queryset = queryset.filter(status='closed')
+
+        entry_after = self.request.query_params.get('entry_after')
+        entry_before = self.request.query_params.get('entry_before')
+        if entry_after:
+            queryset = queryset.filter(entry_timestamp__date__gte=entry_after)
+        if entry_before:
+            queryset = queryset.filter(entry_timestamp__date__lte=entry_before)
+
+        exit_after = self.request.query_params.get('exit_after')
+        exit_before = self.request.query_params.get('exit_before')
+        if exit_after:
+            queryset = queryset.filter(exit_timestamp__date__gte=exit_after)
+        if exit_before:
+            queryset = queryset.filter(exit_timestamp__date__lte=exit_before)
+
+        hedge_only = self.request.query_params.get('hedge_only')
+        main_only_trade = self.request.query_params.get('main_only')
+        if hedge_only is not None and str(hedge_only).lower() in ('1', 'true', 'yes'):
+            queryset = queryset.filter(metadata__is_hedge_leg=True)
+        if main_only_trade is not None and str(main_only_trade).lower() in ('1', 'true', 'yes'):
+            queryset = queryset.exclude(metadata__is_hedge_leg=True)
 
         deployment_type = self.request.query_params.get('deployment_type', None)
         if deployment_type:
@@ -483,7 +515,9 @@ class LiveTradeViewSet(viewsets.ReadOnlyModelViewSet):
                 | ~Q(metadata__has_key='is_hedge_leg')
             )
 
-        return queryset
+        return queryset.annotate(
+            activity_ts=Coalesce('exit_timestamp', 'entry_timestamp'),
+        )
 
     def get_serializer_context(self):
         ctx = super().get_serializer_context()
@@ -1288,7 +1322,7 @@ class StrategyDeploymentViewSet(viewsets.ModelViewSet):
         since = request.query_params.get('since')
         if since:
             qs = qs.filter(created_at__gte=since)
-        return qs
+        return qs.order_by('-created_at', '-id')
 
     @action(detail=True, methods=['get'], url_path='events')
     def events(self, request, pk=None):
@@ -1311,6 +1345,7 @@ class StrategyDeploymentViewSet(viewsets.ModelViewSet):
         since = request.query_params.get('since')
         if since:
             qs = qs.filter(created_at__gte=since)
+        qs = qs.order_by('-created_at', '-id')
         paginator = DeploymentEventPagination()
         page = paginator.paginate_queryset(qs, request, view=self)
         if page is not None:
@@ -1323,36 +1358,73 @@ class StrategyDeploymentViewSet(viewsets.ModelViewSet):
         deployment = self.get_object()
         trades_qs = LiveTrade.objects.filter(deployment=deployment).select_related('symbol')
         open_trades_qs = trades_qs.filter(status='open')
-        closed_trades_qs = trades_qs.filter(status='closed').exclude(pnl__isnull=True)
+        closed_all_qs = trades_qs.filter(status='closed')
+        closed_main_qs = closed_all_qs.exclude(metadata__is_hedge_leg=True)
 
-        from django.db.models import Sum
+        monetized = DecimalField(max_digits=24, decimal_places=10)
 
-        realized_pnl = closed_trades_qs.aggregate(total=Sum('pnl'))['total'] or 0
+        realized_pnl_main = closed_main_qs.aggregate(
+            total=Sum(Coalesce('pnl', Value(0), output_field=monetized)),
+        )['total'] or 0
+        realized_pnl_all = closed_all_qs.aggregate(
+            total=Sum(Coalesce('pnl', Value(0), output_field=monetized)),
+        )['total'] or 0
         open_count = open_trades_qs.count()
-        closed_count = closed_trades_qs.count()
-        winning_trades = closed_trades_qs.filter(is_winner=True).count()
-        win_rate = (winning_trades / closed_count) if closed_count else None
+        closed_count = closed_all_qs.count()
+        closed_main_count = closed_main_qs.count()
+        winning_trades = closed_main_qs.filter(
+            Q(pnl__gt=0) | Q(is_winner=True),
+        ).distinct().count()
+        win_rate = (winning_trades / closed_main_count) if closed_main_count else None
 
-        # “Total invested” approximated as current exposure from open trades.
-        total_invested_open = 0
+        # Notional tied up in open deployment rows (ledger), split main vs hedge sleeves.
+        invested_main_open = Decimal('0')
+        invested_hedge_open = Decimal('0')
         for t in open_trades_qs:
             try:
-                total_invested_open += (t.entry_price or 0) * (t.quantity or 0)
+                px = t.entry_price if t.entry_price is not None else Decimal('0')
+                q = t.quantity if t.quantity is not None else Decimal('0')
+                notion = Decimal(str(px)) * Decimal(str(q))
             except Exception:
                 continue
+            if bool((t.metadata or {}).get('is_hedge_leg')):
+                invested_hedge_open += notion
+            else:
+                invested_main_open += notion
+        total_current_invested = invested_main_open + invested_hedge_open
+        try:
+            total_invested_open = float(total_current_invested)
+        except Exception:
+            total_invested_open = 0.0
+
+        account_equity = None
+        account_cash = None
+        try:
+            adapter = get_adapter_for_deployment(deployment)
+            if adapter is not None:
+                eq = adapter.get_account_equity()
+                if eq is not None:
+                    account_equity = str(eq)
+                cash = adapter.get_account_balance()
+                if cash is not None:
+                    account_cash = str(cash)
+        except Exception:
+            pass
 
         # Equity curve from realised PnL over time (closed trades by exit time).
         equity_curve = []
         equity = float(deployment.initial_capital or 0)
-        for t in closed_trades_qs.order_by('exit_timestamp', 'id'):
-            equity += float(t.pnl or 0)
+        for t in closed_all_qs.order_by('exit_timestamp', 'id'):
+            step = float(t.pnl) if t.pnl is not None else 0.0
+            equity += step
             equity_curve.append(
                 {
                     'timestamp': (t.exit_timestamp.isoformat() if t.exit_timestamp else t.entry_timestamp.isoformat()),
                     'equity': equity,
-                    'pnl': float(t.pnl or 0),
+                    'pnl': step,
                     'ticker': t.symbol.ticker,
                     'trade_id': t.id,
+                    'is_hedge_leg': bool((t.metadata or {}).get('is_hedge_leg')),
                 }
             )
 
@@ -1366,11 +1438,19 @@ class StrategyDeploymentViewSet(viewsets.ModelViewSet):
             'active_symbol_count': active_symbol_count,
             'open_trades': open_count,
             'closed_trades': closed_count,
+            'closed_trades_main': closed_main_count,
             'winning_trades': winning_trades,
             'win_rate': win_rate,
-            'current_pnl': str(realized_pnl),
-            'total_pnl': str(realized_pnl),
+            'current_pnl': str(realized_pnl_main),
+            'total_pnl': str(realized_pnl_main),
+            'total_pnl_main': str(realized_pnl_main),
+            'total_pnl_all': str(realized_pnl_all),
             'total_invested_open': str(total_invested_open),
+            'total_current_invested_exposure': str(total_current_invested),
+            'total_invested_main_open': str(invested_main_open),
+            'total_invested_hedge_open': str(invested_hedge_open),
+            'account_equity': account_equity,
+            'account_cash': account_cash,
             'equity_curve': equity_curve,
             'metrics': metrics,
             'last_signal_at': deployment.last_signal_at,

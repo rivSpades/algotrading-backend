@@ -1382,27 +1382,53 @@ class BacktestExecutor:
         
         IMPORTANT: Returns and STD are calculated using only data up to today's open
         to avoid lookahead bias.
+
+        Core inequalities are delegated to ``gap_up_gap_down_decision`` (shared with live).
         """
-        threshold = self.parameters.get('threshold', 0.25)
+        from live_trading.engines._rules import gap_up_gap_down_decision
+
+        threshold = float(self.parameters.get('threshold', 0.25))
         std_period = self.parameters.get('std_period', 90)
-        
+
         # Get indicators - Returns and RollingSTD
         # Indicator keys are formatted as: {tool_name}_{period} if period exists, else {tool_name}
         returns_key = 'Returns'
         std_key = f'RollingSTD_{std_period}'
-        
+
         # Try multiple key formats for compatibility
         returns = indicators.get(returns_key) or indicators.get('returns')
         std = indicators.get(std_key) or indicators.get(f'STD_{std_period}') or indicators.get('RollingSTD')
-        
+
         if returns is None or std is None:
-            logger.debug(f"Gap-Up and Gap-Down: Missing indicators. returns={returns}, std={std}, keys={list(indicators.keys())}")
+            logger.debug(
+                'Gap-Up and Gap-Down: Missing indicators. returns=%s, std=%s, keys=%s',
+                returns,
+                std,
+                list(indicators.keys()),
+            )
             return None
-        
+
+        try:
+            returns_f = float(returns)
+            std_f = float(std)
+        except (TypeError, ValueError):
+            return None
+
+        dec = gap_up_gap_down_decision(
+            returns=returns_f,
+            std=std_f,
+            threshold=threshold,
+        )
+        long_signal = dec.long_signal
+        short_signal = dec.short_signal
+        long_threshold = dec.long_threshold
+        short_threshold = dec.short_threshold
+
         long_allowed = True
         short_allowed = True
         if self.broker and symbol:
             from live_trading.models import SymbolBrokerAssociation
+
             try:
                 association = SymbolBrokerAssociation.objects.get(symbol=symbol, broker=self.broker)
                 long_allowed = association.long_active
@@ -1410,44 +1436,43 @@ class BacktestExecutor:
             except SymbolBrokerAssociation.DoesNotExist:
                 long_allowed = False
                 short_allowed = False
-        
+
         # Check if we have an open position
         has_position = position is not None
         position_type = position['type'] if has_position else None  # "buy" or "sell"
-        
-        # Calculate signal thresholds
-        long_threshold = threshold * std
-        short_threshold = -threshold * std
-        
-        long_signal = returns > long_threshold
-        short_signal = returns < short_threshold
-        
+
         # EXIT CONDITIONS (check exits first, before entries)
         if has_position and position_type == 'buy':
             if self.position_mode == 'short':
                 logger.info(f"[{self.position_mode.upper()}] LONG EXIT signal: mode doesn't allow long")
                 return 'sell'
             if self.position_mode == 'long' and short_signal:
-                logger.info(f"[{self.position_mode.upper()}] LONG EXIT signal: returns ({returns:.4f})")
+                logger.info(f"[{self.position_mode.upper()}] LONG EXIT signal: returns ({returns_f:.4f})")
                 return 'sell'
-        
+
         if has_position and position_type == 'sell':
             if self.position_mode == 'long':
                 logger.info(f"[{self.position_mode.upper()}] SHORT EXIT signal: mode doesn't allow short")
                 return 'buy'
             if self.position_mode == 'short' and long_signal:
-                logger.info(f"[{self.position_mode.upper()}] SHORT EXIT signal: returns ({returns:.4f})")
+                logger.info(f"[{self.position_mode.upper()}] SHORT EXIT signal: returns ({returns_f:.4f})")
                 return 'buy'
-        
+
         # ENTRY (no flip: opposite direction closes first on a later bar)
         if long_signal and long_allowed and self.position_mode == 'long' and not has_position:
-            logger.info(f"[{self.position_mode.upper()}] LONG ENTRY signal: returns ({returns:.4f}) > threshold×std ({long_threshold:.4f})")
+            logger.info(
+                f"[{self.position_mode.upper()}] LONG ENTRY signal: returns ({returns_f:.4f}) > "
+                f"threshold×std ({long_threshold:.4f})"
+            )
             return 'buy'
-        
+
         if short_signal and short_allowed and self.position_mode == 'short' and not has_position:
-            logger.info(f"[{self.position_mode.upper()}] SHORT ENTRY signal: returns ({returns:.4f}) < -threshold×std ({short_threshold:.4f})")
+            logger.info(
+                f"[{self.position_mode.upper()}] SHORT ENTRY signal: returns ({returns_f:.4f}) < "
+                f"-threshold×std ({short_threshold:.4f})"
+            )
             return 'sell'
-        
+
         return None
     
     def _rsi_mean_reversion_signal(self, row: pd.Series, indicators: Dict) -> Optional[str]:

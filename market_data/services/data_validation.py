@@ -6,7 +6,26 @@ OHLCV logical constraints, large time gaps, extreme price jumps, and suspicious 
 
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Tuple, Optional
+from dataclasses import dataclass
+from datetime import datetime
+from typing import List, Dict, Tuple, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..models import Symbol
+
+
+@dataclass
+class DataQualityResult:
+    is_valid: bool
+    reason: str
+    record_count: int = 0
+
+    def to_dict(self) -> Dict:
+        return {
+            'is_valid': self.is_valid,
+            'reason': self.reason,
+            'record_count': self.record_count,
+        }
 
 
 def validate_ohlcv_data(ohlcv_data: List[Dict]) -> Tuple[bool, str]:
@@ -273,4 +292,53 @@ def validate_ohlcv_data(ohlcv_data: List[Dict]) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Validation error: {str(e)}"
 
+
+def check_data_quality(
+    symbol: 'Symbol',
+    *,
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None,
+    ohlcv_data: Optional[List[Dict]] = None,
+    update_symbol: bool = True,
+) -> DataQualityResult:
+    """
+    Reusable OHLCV data quality check for a symbol.
+
+    Loads OHLCV from DB when ohlcv_data is not provided.
+    Optionally updates symbol.validation_status and symbol.status.
+    """
+    from ..models import OHLCV
+
+    if ohlcv_data is None:
+        qs = OHLCV.objects.filter(symbol=symbol, timeframe='daily').order_by('timestamp')
+        if start_date:
+            qs = qs.filter(timestamp__gte=start_date)
+        if end_date:
+            qs = qs.filter(timestamp__lte=end_date)
+        ohlcv_data = [
+            {
+                'timestamp': row.timestamp,
+                'open': float(row.open),
+                'high': float(row.high),
+                'low': float(row.low),
+                'close': float(row.close),
+                'volume': int(row.volume),
+            }
+            for row in qs
+        ]
+
+    is_valid, reason = validate_ohlcv_data(ohlcv_data)
+    result = DataQualityResult(
+        is_valid=is_valid,
+        reason=reason,
+        record_count=len(ohlcv_data or []),
+    )
+
+    if update_symbol:
+        symbol.validation_status = 'valid' if is_valid else 'invalid'
+        symbol.validation_reason = reason if not is_valid else ''
+        symbol.status = 'active' if is_valid else 'disabled'
+        symbol.save(update_fields=['validation_status', 'validation_reason', 'status'])
+
+    return result
 

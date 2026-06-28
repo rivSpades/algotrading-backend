@@ -12,6 +12,8 @@ import threading
 from .models import Symbol, OHLCV, Exchange, Provider
 from .services.symbol_service import SymbolService
 from .services.ohlcv_service import OHLCVService
+from .services.market_data_service import get_daily_data, get_daily_data_bulk, normalize_date_range, parse_task_dates
+from .services.symbol_resolution import ensure_symbol, ensure_exchange_symbols, ensure_exchange
 from .providers.eod_api import EODAPIProvider
 from .providers.yahoo_finance import YahooFinanceProvider
 from .providers.factory import ProviderFactory
@@ -451,7 +453,8 @@ def fetch_ohlcv_data_task(
     period: Optional[str] = None,
     replace_existing: bool = False,
     broker_id: Optional[int] = None,
-    provider_code: str = 'YAHOO'
+    provider_code: str = 'YAHOO',
+    exchange_code: Optional[str] = None,
 ):
     """
     Background task to fetch and save OHLCV data for a single symbol
@@ -473,15 +476,20 @@ def fetch_ohlcv_data_task(
             }
         )
         
-        # Get symbol
+        # Get or create symbol
         try:
             symbol = Symbol.objects.get(ticker=ticker)
         except Symbol.DoesNotExist:
-            return {
-                'progress': 0,
-                'message': f'Symbol {ticker} not found',
-                'status': 'failed'
-            }
+            symbol = ensure_symbol(ticker, exchange_code=exchange_code)
+            if not symbol:
+                return {
+                    'progress': 0,
+                    'message': (
+                        f'Symbol {ticker} not found. '
+                        'Resolve symbol via /symbols/resolve-symbol/ first or provide exchange_code.'
+                    ),
+                    'status': 'failed',
+                }
         
         # If broker_id is provided, verify the symbol is linked to the broker
         if broker_id:
@@ -505,17 +513,8 @@ def fetch_ohlcv_data_task(
                     'status': 'failed'
                 }
         
-        # Parse dates if provided and make timezone-aware
-        start_dt = None
-        end_dt = None
-        if start_date:
-            start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-            if timezone.is_naive(start_dt):
-                start_dt = timezone.make_aware(start_dt)
-        if end_date:
-            end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
-            if timezone.is_naive(end_dt):
-                end_dt = timezone.make_aware(end_dt)
+        # Parse dates (end_date defaults to today when not using period)
+        start_dt, end_dt = parse_task_dates(start_date, end_date, period)
         
         # Check if date range is already fully covered (only for daily timeframe with date range)
         if not replace_existing and start_dt and end_dt and not period:
@@ -527,6 +526,7 @@ def fetch_ohlcv_data_task(
             )
             if is_covered:
                 # Date range is already covered, skip API call
+                OHLCVService.finalize_symbol_after_fetch(symbol)
                 connections.close_all()
                 return {
                     'progress': 100,
@@ -535,9 +535,8 @@ def fetch_ohlcv_data_task(
                     'result': {'created': 0, 'updated': 0, 'errors': 0, 'total': 0, 'skipped': True}
                 }
         
-        # Get provider instance
+        # Get provider model for saving
         try:
-            data_provider = ProviderFactory.get_provider(provider_code)
             provider_model = OHLCVService.get_provider(provider_code)
         except Exception as e:
             connections.close_all()
@@ -557,21 +556,27 @@ def fetch_ohlcv_data_task(
             }
         )
         
-        ohlcv_data = data_provider.get_historical_data(
+        ohlcv_data = get_daily_data(
+            provider_code=provider_code,
             ticker=ticker,
             start_date=start_dt,
             end_date=end_dt,
             period=period,
-            interval='1d'
+            interval='1d',
         )
         
         if not ohlcv_data:
+            OHLCVService.mark_fetch_failed(
+                symbol,
+                f'No OHLCV data returned from provider {provider_code}',
+                provider=provider_model,
+            )
             connections.close_all()
             return {
                 'progress': 100,
                 'message': f'No data found for {ticker}',
                 'status': 'completed',
-                'result': {'created': 0, 'updated': 0, 'errors': 0, 'total': 0}
+                'result': {'created': 0, 'updated': 0, 'errors': 0, 'total': 0},
             }
         
         # Filter to only missing timestamps before saving
@@ -606,6 +611,7 @@ def fetch_ohlcv_data_task(
             
             # If all fetched data already exists, skip saving
             if not ohlcv_data:
+                OHLCVService.finalize_symbol_after_fetch(symbol)
                 connections.close_all()
                 return {
                     'progress': 100,
@@ -713,16 +719,12 @@ def fetch_ohlcv_data_multiple_symbols_task(
         
         # Optimize for Alpaca: use bulk fetching when available (up to 200 symbols per call)
         if provider_code.upper() == 'ALPACA' and len(tickers) > 1:
-            start_dt = None
-            end_dt = None
-            if start_date:
-                start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-            if end_date:
-                end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+            start_dt, end_dt = parse_task_dates(start_date, end_date, period)
             
             try:
                 # Fetch all symbols with bulk API call (or multiple if > 200)
-                bulk_data = data_provider.get_multiple_symbols_data(
+                bulk_data = get_daily_data_bulk(
+                    provider_code=provider_code,
                     tickers=tickers,
                     start_date=start_dt,
                     end_date=end_dt,
@@ -733,7 +735,14 @@ def fetch_ohlcv_data_multiple_symbols_task(
                 # Process results for each symbol
                 for ticker in tickers:
                     try:
-                        symbol = Symbol.objects.get(ticker=ticker)
+                        try:
+                            symbol = Symbol.objects.get(ticker=ticker)
+                        except Symbol.DoesNotExist:
+                            symbol = ensure_symbol(ticker)
+                            if not symbol:
+                                results[ticker] = {'created': 0, 'updated': 0, 'errors': 1, 'total': 0, 'message': 'Symbol not found'}
+                                processed_count += 1
+                                continue
                         
                         # If broker_id is provided, verify the symbol is linked to the broker
                         if broker_id:
@@ -812,9 +821,6 @@ def fetch_ohlcv_data_multiple_symbols_task(
                             }
                         )
                         
-                    except Symbol.DoesNotExist:
-                        results[ticker] = {'created': 0, 'updated': 0, 'errors': 1, 'total': 0, 'message': 'Symbol not found'}
-                        processed_count += 1
                     except Exception as e:
                         results[ticker] = {'created': 0, 'updated': 0, 'errors': 1, 'total': 0, 'message': str(e)[:200]}
                         processed_count += 1
@@ -850,7 +856,14 @@ def fetch_ohlcv_data_multiple_symbols_task(
             """Process a single symbol and return the result"""
             nonlocal processed_count
             try:
-                symbol = Symbol.objects.get(ticker=ticker)
+                try:
+                    symbol = Symbol.objects.get(ticker=ticker)
+                except Symbol.DoesNotExist:
+                    symbol = ensure_symbol(ticker)
+                    if not symbol:
+                        with lock:
+                            processed_count += 1
+                        return (ticker, {'created': 0, 'updated': 0, 'errors': 1, 'total': 0, 'message': 'Symbol not found'})
                 
                 # If broker_id is provided, verify the symbol is linked to the broker
                 if broker_id:
@@ -870,12 +883,7 @@ def fetch_ohlcv_data_multiple_symbols_task(
                             processed_count += 1
                         return (ticker, {'created': 0, 'updated': 0, 'errors': 1, 'total': 0, 'message': 'Symbol is not linked to broker'})
                 
-                start_dt = None
-                end_dt = None
-                if start_date:
-                    start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-                if end_date:
-                    end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+                start_dt, end_dt = parse_task_dates(start_date, end_date, period)
                 
                 # Check if date range is already fully covered (only for daily timeframe with date range)
                 if not replace_existing and start_dt and end_dt and not period:
@@ -892,12 +900,13 @@ def fetch_ohlcv_data_multiple_symbols_task(
                         return (ticker, {'created': 0, 'updated': 0, 'errors': 0, 'total': 0, 'message': 'Date range already fully covered, skipped', 'skipped': True})
                 
                 # Fetch OHLCV data
-                ohlcv_data = data_provider.get_historical_data(
+                ohlcv_data = get_daily_data(
+                    provider_code=provider_code,
                     ticker=ticker,
                     start_date=start_dt,
                     end_date=end_dt,
                     period=period,
-                    interval='1d'
+                    interval='1d',
                 )
                 
                 if not ohlcv_data:
@@ -965,10 +974,6 @@ def fetch_ohlcv_data_multiple_symbols_task(
                 
                 return (ticker, result)
                     
-            except Symbol.DoesNotExist:
-                with lock:
-                    processed_count += 1
-                return (ticker, {'created': 0, 'updated': 0, 'errors': 1, 'total': 0, 'message': 'Symbol not found'})
             except Exception as e:
                 with lock:
                     processed_count += 1
@@ -1138,16 +1143,12 @@ def fetch_ohlcv_data_by_broker_task(
                 # Optimize for Alpaca: use bulk fetching when available (up to 200 symbols per call)
                 if provider_code.upper() == 'ALPACA' and len(batch_tickers) > 1:
                     # Alpaca supports bulk fetching - use get_multiple_symbols_data for the entire batch
-                    start_dt = None
-                    end_dt = None
-                    if start_date:
-                        start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-                    if end_date:
-                        end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+                    start_dt, end_dt = parse_task_dates(start_date, end_date, period)
                     
                     try:
                         # Fetch all symbols in batch with a single API call (or multiple if batch > 200)
-                        bulk_data = data_provider.get_multiple_symbols_data(
+                        bulk_data = get_daily_data_bulk(
+                            provider_code=provider_code,
                             tickers=batch_tickers,
                             start_date=start_dt,
                             end_date=end_dt,
@@ -1234,14 +1235,16 @@ def fetch_ohlcv_data_by_broker_task(
                     """Process a single symbol in the batch"""
                     nonlocal batch_processed
                     try:
-                        symbol = Symbol.objects.get(ticker=ticker)
+                        try:
+                            symbol = Symbol.objects.get(ticker=ticker)
+                        except Symbol.DoesNotExist:
+                            symbol = ensure_symbol(ticker)
+                            if not symbol:
+                                with batch_lock:
+                                    batch_processed += 1
+                                return (ticker, {'created': 0, 'updated': 0, 'errors': 1, 'total': 0, 'message': 'Symbol not found'})
                         
-                        start_dt = None
-                        end_dt = None
-                        if start_date:
-                            start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-                        if end_date:
-                            end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+                        start_dt, end_dt = parse_task_dates(start_date, end_date, period)
                         
                         # Check if date range is already fully covered (only for daily timeframe with date range)
                         if not replace_existing and start_dt and end_dt and not period:
@@ -1259,12 +1262,13 @@ def fetch_ohlcv_data_by_broker_task(
                         
                         # Add timeout handling for individual requests
                         try:
-                            ohlcv_data = data_provider.get_historical_data(
+                            ohlcv_data = get_daily_data(
+                                provider_code=provider_code,
                                 ticker=ticker,
                                 start_date=start_dt,
                                 end_date=end_dt,
                                 period=period,
-                                interval='1d'
+                                interval='1d',
                             )
                         except Exception as api_error:
                             # Handle network/API errors gracefully
@@ -1484,16 +1488,24 @@ def fetch_ohlcv_data_by_exchange_task(
             }
         )
         
-        # Get exchange and symbols
-        try:
-            exchange = Exchange.objects.get(code=exchange_code)
-        except Exchange.DoesNotExist:
+        # Ensure exchange exists and symbols are imported from EOD if needed
+        exchange = ensure_exchange(exchange_code)
+        if not exchange:
             return {
                 'progress': 0,
                 'message': f'Exchange {exchange_code} not found',
-                'status': 'failed'
+                'status': 'failed',
             }
-        
+
+        self.update_state(
+            state='RUNNING',
+            meta={
+                'progress': 5,
+                'message': f'Ensuring symbols exist for {exchange_code}...',
+            },
+        )
+        ensure_exchange_symbols(exchange_code)
+
         symbols = Symbol.objects.filter(exchange=exchange)
         
         # If broker_id is provided, filter symbols by broker linkage
@@ -1575,14 +1587,14 @@ def fetch_ohlcv_data_by_exchange_task(
             def process_batch_symbol(ticker):
                 """Process a single symbol in the batch"""
                 try:
-                    symbol = Symbol.objects.get(ticker=ticker)
+                    try:
+                        symbol = Symbol.objects.get(ticker=ticker)
+                    except Symbol.DoesNotExist:
+                        symbol = ensure_symbol(ticker)
+                        if not symbol:
+                            return (ticker, {'created': 0, 'updated': 0, 'errors': 1, 'total': 0, 'message': 'Symbol not found'})
                     
-                    start_dt = None
-                    end_dt = None
-                    if start_date:
-                        start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-                    if end_date:
-                        end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+                    start_dt, end_dt = parse_task_dates(start_date, end_date, period)
                     
                     # Check if date range is already fully covered (only for daily timeframe with date range)
                     if not replace_existing and start_dt and end_dt and not period:
@@ -1596,12 +1608,13 @@ def fetch_ohlcv_data_by_exchange_task(
                             # Date range is already covered, skip API call
                             return (ticker, {'created': 0, 'updated': 0, 'errors': 0, 'total': 0, 'message': 'Date range already fully covered, skipped', 'skipped': True})
                     
-                    ohlcv_data = data_provider.get_historical_data(
+                    ohlcv_data = get_daily_data(
+                        provider_code=provider_code,
                         ticker=ticker,
                         start_date=start_dt,
                         end_date=end_dt,
                         period=period,
-                        interval='1d'
+                        interval='1d',
                     )
                     
                     if not ohlcv_data:
@@ -1939,16 +1952,14 @@ def delete_all_ohlcv_data_task(self):
         # Delete all OHLCV data
         deleted_count, _ = OHLCV.objects.all().delete()
         
-        # Clear provider and disable all symbols after OHLCV data deletion
+        # Disable all symbols
         Symbol.objects.all().update(
-            provider=None,
             status='disabled',
             validation_status='invalid',
             validation_reason='OHLCV data has been deleted'
         )
         
         connections.close_all()
-        
         return {
             'progress': 100,
             'message': f'Successfully deleted {deleted_count} OHLCV records for {symbol_count} symbols and disabled all symbols',
@@ -1971,5 +1982,184 @@ def delete_all_ohlcv_data_task(self):
             'message': f'Error deleting all OHLCV data: {str(e)}',
             'status': 'failed',
             'deleted_count': 0
+        }
+
+
+@shared_task(bind=True)
+def delete_ohlcv_data_by_broker_task(self, broker_id: int):
+    """Delete OHLCV data for all symbols linked to a broker."""
+    from live_trading.models import SymbolBrokerAssociation
+
+    try:
+        self.update_state(
+            state='RUNNING',
+            meta={'progress': 0, 'message': f'Starting OHLCV deletion for broker {broker_id}'},
+        )
+        symbol_ids = list(
+            SymbolBrokerAssociation.objects.filter(broker_id=broker_id).values_list('symbol_id', flat=True)
+        )
+        if not symbol_ids:
+            return {
+                'progress': 100,
+                'message': f'No symbols linked to broker {broker_id}',
+                'status': 'completed',
+                'deleted_count': 0,
+            }
+
+        deleted_count, _ = OHLCV.objects.filter(symbol_id__in=symbol_ids).delete()
+        Symbol.objects.filter(pk__in=symbol_ids).update(
+            status='disabled',
+            validation_status='invalid',
+            validation_reason='OHLCV data has been deleted',
+        )
+        connections.close_all()
+        return {
+            'progress': 100,
+            'message': f'Deleted {deleted_count} OHLCV records for broker {broker_id}',
+            'status': 'completed',
+            'deleted_count': deleted_count,
+        }
+    except Exception as exc:
+        connections.close_all()
+        return {
+            'progress': 0,
+            'message': f'Error deleting OHLCV for broker {broker_id}: {exc}',
+            'status': 'failed',
+            'deleted_count': 0,
+        }
+
+
+@shared_task(bind=True, time_limit=24 * 60 * 60, soft_time_limit=24 * 60 * 60)
+def update_all_symbols_ohlcv_task(
+    self,
+    exchange_code: Optional[str] = None,
+    broker_id: Optional[int] = None,
+):
+    """
+    Incrementally update OHLCV for all symbols (or filtered by exchange/broker)
+    with missing daily bars up to today.
+    """
+    from .services.ohlcv_service import OHLCVService, symbols_queryset_for_scope
+
+    try:
+        symbols = list(
+            symbols_queryset_for_scope(
+                exchange_code=exchange_code,
+                broker_id=broker_id,
+            ).select_related('provider').filter(provider__isnull=False)
+        )
+        total = len(symbols)
+        updated = 0
+        skipped = 0
+        errors = []
+
+        self.update_state(
+            state='RUNNING',
+            meta={'progress': 0, 'message': f'Updating OHLCV for {total} symbols…'},
+        )
+
+        for index, symbol in enumerate(symbols):
+            plan = OHLCVService.plan_incremental_ohlcv_update(symbol)
+            if plan is None:
+                skipped += 1
+            elif plan.get('error'):
+                errors.append(plan['error'])
+            else:
+                try:
+                    result = fetch_ohlcv_data_task.run(
+                        ticker=symbol.ticker,
+                        start_date=plan['start_date'],
+                        end_date=plan['end_date'],
+                        period=None,
+                        replace_existing=False,
+                        broker_id=None,
+                        provider_code=plan['provider_code'],
+                    )
+                    if result.get('status') == 'failed':
+                        errors.append(f"{symbol.ticker}: {result.get('message', 'update failed')}")
+                    else:
+                        updated += 1
+                except Exception as exc:
+                    errors.append(f'{symbol.ticker}: {exc}')
+
+            progress = int(((index + 1) / max(total, 1)) * 100)
+            self.update_state(
+                state='RUNNING',
+                meta={
+                    'progress': progress,
+                    'message': f'Processed {index + 1}/{total} symbols ({updated} updated, {skipped} up to date)',
+                },
+            )
+
+        connections.close_all()
+        return {
+            'progress': 100,
+            'message': f'Bulk update finished: {updated} updated, {skipped} already current, {len(errors)} errors',
+            'status': 'completed',
+            'result': {
+                'total': total,
+                'updated': updated,
+                'skipped': skipped,
+                'errors': errors[:50],
+                'error_count': len(errors),
+            },
+        }
+    except Exception as exc:
+        connections.close_all()
+        return {
+            'progress': 0,
+            'message': f'Bulk update failed: {exc}',
+            'status': 'failed',
+        }
+
+
+@shared_task(bind=True)
+def delete_symbols_bulk_task(
+    self,
+    delete_all: bool = False,
+    exchange_code: Optional[str] = None,
+    broker_id: Optional[int] = None,
+    tickers: Optional[List[str]] = None,
+    ticker: Optional[str] = None,
+):
+    """Delete Symbol rows (OHLCV removed via CASCADE)."""
+    from .services.ohlcv_service import symbols_queryset_for_scope
+
+    try:
+        qs = symbols_queryset_for_scope(
+            delete_all=delete_all,
+            exchange_code=exchange_code,
+            broker_id=broker_id,
+            tickers=tickers,
+            ticker=ticker,
+        )
+        count = qs.count()
+        if count == 0:
+            return {
+                'progress': 100,
+                'message': 'No symbols matched the delete criteria',
+                'status': 'completed',
+                'deleted_count': 0,
+            }
+
+        self.update_state(
+            state='RUNNING',
+            meta={'progress': 50, 'message': f'Deleting {count} symbol(s)…'},
+        )
+        deleted_total, _ = qs.delete()
+        connections.close_all()
+        return {
+            'progress': 100,
+            'message': f'Successfully deleted {count} symbol(s)',
+            'status': 'completed',
+            'deleted_count': deleted_total,
+        }
+    except Exception as exc:
+        connections.close_all()
+        return {
+            'progress': 0,
+            'message': f'Bulk symbol delete failed: {exc}',
+            'status': 'failed',
+            'deleted_count': 0,
         }
 

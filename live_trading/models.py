@@ -545,7 +545,9 @@ class LiveTrade(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        ordering = ['-entry_timestamp']
+        # Operational default: dashboards/admin care about syncs/closes surfacing recently.
+        # API list uses annotate `activity_ts` + OrderingFilter `-activity_ts` for finer control.
+        ordering = ['-updated_at', '-id']
         indexes = [
             models.Index(fields=['deployment', 'symbol']),
             models.Index(fields=['deployment', 'status']),

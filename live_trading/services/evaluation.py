@@ -51,7 +51,6 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Optional
 
-from django.db.models import Sum
 from django.utils import timezone
 
 from ..models import LiveTrade, StrategyDeployment
@@ -107,21 +106,29 @@ def _safe_float(value) -> Optional[float]:
     return out
 
 
+def _coalesce_trade_pnl(t: LiveTrade) -> Decimal:
+    return t.pnl if t.pnl is not None else Decimal('0')
+
+
+def _is_main_live_trade_row(t: LiveTrade) -> bool:
+    meta = t.metadata or {}
+    return not bool(meta.get('is_hedge_leg'))
+
+
 def compute_deployment_metrics(deployment: StrategyDeployment) -> dict[str, Any]:
     """Aggregate trade-level statistics from the deployment's `LiveTrade`s."""
 
     trades = list(deployment.live_trades.all())
-    closed = [t for t in trades if t.status == 'closed' and t.pnl is not None]
-    winners = [t for t in closed if (t.pnl or Decimal('0')) > 0]
+    closed_all = [t for t in trades if t.status == 'closed']
+    closed_main = [t for t in closed_all if _is_main_live_trade_row(t)]
 
-    total_pnl = float(
-        deployment.live_trades.filter(status='closed').aggregate(
-            total=Sum('pnl'),
-        )['total'] or 0,
-    )
+    winners = [t for t in closed_main if _coalesce_trade_pnl(t) > Decimal('0')]
 
-    win_rate = (len(winners) / len(closed)) if closed else None
-    pnl_list = [float(t.pnl) for t in closed]
+    total_pnl_main = sum((_coalesce_trade_pnl(t) for t in closed_main), Decimal('0'))
+    total_pnl_including_hedges = sum((_coalesce_trade_pnl(t) for t in closed_all), Decimal('0'))
+
+    win_rate = (len(winners) / len(closed_main)) if closed_main else None
+    pnl_list = [float(_coalesce_trade_pnl(t)) for t in closed_main]
     sharpe = _trade_sharpe(pnl_list) if len(pnl_list) >= 2 else None
     max_dd = _max_drawdown(pnl_list) if pnl_list else None
 
@@ -134,12 +141,14 @@ def compute_deployment_metrics(deployment: StrategyDeployment) -> dict[str, Any]
     open_count = sum(1 for t in trades if t.status == 'open')
 
     return {
-        'trades_count': len(closed),
+        'trades_count': len(closed_main),
+        'trades_closed_all': len(closed_all),
         'open_trades_count': open_count,
         'winning_trades': len(winners),
-        'losing_trades': len(closed) - len(winners),
+        'losing_trades': len(closed_main) - len(winners),
         'win_rate': win_rate,
-        'total_pnl': total_pnl,
+        'total_pnl': float(total_pnl_main),
+        'total_pnl_including_hedges': float(total_pnl_including_hedges),
         'sharpe_ratio': sharpe,
         'max_drawdown': max_dd,
         'runtime_days': runtime_days,

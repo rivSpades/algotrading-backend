@@ -41,13 +41,21 @@ class ExchangeViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class ProviderViewSet(viewsets.ReadOnlyModelViewSet):
-    """ViewSet for Provider model"""
+    """ViewSet for OHLCV provider catalog (hardcoded + DB credential state)."""
     queryset = Provider.objects.filter(is_active=True)
     serializer_class = ProviderSerializer
     filter_backends = [SearchFilter, OrderingFilter]
     search_fields = ['name', 'code']
     ordering_fields = ['name', 'code']
     ordering = ['name']
+
+    def list(self, request, *args, **kwargs):
+        from .providers.registry import get_ohlcv_provider_catalog
+        catalog = get_ohlcv_provider_catalog()
+        return Response({
+            'results': catalog,
+            'count': len(catalog),
+        })
 
 
 class SymbolViewSet(viewsets.ModelViewSet):
@@ -493,78 +501,32 @@ class SymbolViewSet(viewsets.ModelViewSet):
         """Trigger background task to update symbol OHLCV data (incremental update from latest timestamp)"""
         from .tasks import fetch_ohlcv_data_task
         from .services.ohlcv_service import OHLCVService
-        from datetime import timedelta
         
         symbol = self.get_object()
         
-        # Get the symbol's provider - required for update
-        if not symbol.provider:
+        plan = OHLCVService.plan_incremental_ohlcv_update(symbol)
+        if plan is None:
+            latest_timestamp = OHLCVService.get_latest_timestamp(symbol, timeframe='daily')
+            latest_date = latest_timestamp.date() if isinstance(latest_timestamp, timezone.datetime) else latest_timestamp
             return Response({
-                'error': f'Symbol {symbol.ticker} does not have a data provider configured. Please fetch data first.'
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        provider_code = symbol.provider.code
-        
-        # Get the latest timestamp in the database
-        latest_timestamp = OHLCVService.get_latest_timestamp(symbol, timeframe='daily')
-        
-        if latest_timestamp is None:
-            return Response({
-                'error': f'No OHLCV data found for {symbol.ticker}. Please use "Fetch Data" to fetch initial data first.'
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        # Normalize latest_timestamp to date if it's a datetime
-        if isinstance(latest_timestamp, timezone.datetime):
-            latest_date = latest_timestamp.date()
-        else:
-            latest_date = latest_timestamp
-        
-        # Get current time and today's date
-        now = timezone.now()
-        today = now.date()
-        
-        # Calculate days since latest data
-        days_diff = (today - latest_date).days
-        
-        # If data is already up to date (latest is today or yesterday), check if update is needed
-        # End date logic: after 10pm UTC use today, before 10pm UTC use yesterday
-        current_hour_utc = now.hour
-        if current_hour_utc >= 22:  # 10pm UTC (22:00)
-            end_date = today
-        else:
-            end_date = today - timedelta(days=1)
-        
-        # If latest_date is already >= end_date, no update needed
-        if latest_date >= end_date:
-            return Response({
-                'message': f'Data is already up to date. Latest data point: {latest_date}, End date: {end_date}',
+                'message': f'Data is already up to date. Latest data point: {latest_date}',
                 'symbol': symbol.ticker,
-                'latest_timestamp': latest_date.isoformat(),
-                'end_date': end_date.isoformat()
+                'latest_timestamp': latest_date.isoformat() if latest_date else None,
             }, status=status.HTTP_200_OK)
-        
-        # For incremental updates with Alpaca provider, fetch from 1 year before latest_date
-        # This ensures we have a large enough historical range that works properly with Alpaca's API
-        # The filtering logic in fetch_ohlcv_data_task will automatically skip dates we already have
-        # Using 1 year back ensures proper chunking and avoids 403 errors with small recent date ranges
-        start_date = latest_date - timedelta(days=365)  # 1 year back from latest_date
-        
-        # Ensure start_date is not before 2016-01-01 (Alpaca data starts from 2016)
-        min_start_date = timezone.datetime(2016, 1, 1).date()
-        if start_date < min_start_date:
-            start_date = min_start_date
-        
-        # Convert to ISO format strings
-        start_date_str = start_date.strftime('%Y-%m-%d')
-        end_date_str = end_date.strftime('%Y-%m-%d')
+        if plan.get('error'):
+            return Response({'error': plan['error']}, status=status.HTTP_400_BAD_REQUEST)
+
+        provider_code = plan['provider_code']
+        start_date_str = plan['start_date']
+        end_date_str = plan['end_date']
         
         # Trigger Celery task with symbol's provider and incremental update using date range
         task = fetch_ohlcv_data_task.delay(
             ticker=symbol.ticker,
             start_date=start_date_str,
             end_date=end_date_str,
-            period=None,  # Use date range, not period
-            replace_existing=False,  # Don't replace, only add new data
+            period=None,
+            replace_existing=False,
             broker_id=None,
             provider_code=provider_code
         )
@@ -576,6 +538,57 @@ class SymbolViewSet(viewsets.ModelViewSet):
             'provider': provider_code,
             'start_date': start_date_str,
             'end_date': end_date_str
+        }, status=status.HTTP_202_ACCEPTED)
+    
+    @action(detail=False, methods=['post'], url_path='update-all-data', url_name='update-all-data')
+    def update_all_data(self, request):
+        """Incrementally update OHLCV for all symbols (optional exchange/broker filter)."""
+        from .tasks import update_all_symbols_ohlcv_task
+
+        exchange_code = request.data.get('exchange_code')
+        broker_id = request.data.get('broker_id')
+        task = update_all_symbols_ohlcv_task.delay(
+            exchange_code=exchange_code,
+            broker_id=broker_id,
+        )
+        scope = 'all symbols'
+        if exchange_code:
+            scope = f'exchange {exchange_code}'
+        elif broker_id:
+            scope = f'broker {broker_id}'
+        return Response({
+            'message': f'Bulk OHLCV update started for {scope}',
+            'task_id': task.id,
+            'exchange_code': exchange_code,
+            'broker_id': broker_id,
+        }, status=status.HTTP_202_ACCEPTED)
+
+    @action(detail=False, methods=['post'], url_path='delete-symbols-bulk', url_name='delete-symbols-bulk')
+    def delete_symbols_bulk(self, request):
+        """Delete symbols in bulk (all, exchange, broker, single, or multiple)."""
+        from .tasks import delete_symbols_bulk_task
+
+        delete_all = request.data.get('delete_all', False)
+        exchange_code = request.data.get('exchange_code')
+        broker_id = request.data.get('broker_id')
+        ticker = request.data.get('ticker')
+        tickers = request.data.get('tickers', [])
+
+        if not any([delete_all, exchange_code, broker_id, ticker, tickers]):
+            return Response({
+                'error': 'Must provide delete_all, exchange_code, broker_id, ticker, or tickers',
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        task = delete_symbols_bulk_task.delay(
+            delete_all=delete_all,
+            exchange_code=exchange_code,
+            broker_id=broker_id,
+            ticker=ticker,
+            tickers=tickers,
+        )
+        return Response({
+            'message': 'Bulk symbol deletion task started',
+            'task_id': task.id,
         }, status=status.HTTP_202_ACCEPTED)
     
     @action(detail=True, methods=['post'], url_path='refetch-data', url_name='refetch-data')
@@ -684,6 +697,53 @@ class SymbolViewSet(viewsets.ModelViewSet):
                 'count': 0
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    @action(detail=False, methods=['post'], url_path='resolve-symbol', url_name='resolve-symbol')
+    def resolve_symbol(self, request):
+        """Resolve ticker via EOD search; create symbol when unambiguous."""
+        from .services.symbol_resolution import resolve_symbol as resolve_symbol_service
+
+        ticker = request.data.get('ticker')
+        exchange_code = request.data.get('exchange_code')
+
+        if exchange_code and ticker:
+            from .services.symbol_resolution import ensure_symbol
+            symbol = ensure_symbol(ticker, exchange_code=exchange_code)
+            if not symbol:
+                return Response({
+                    'status': 'not_found',
+                    'message': f'Could not create symbol {ticker} for exchange {exchange_code}',
+                }, status=status.HTTP_404_NOT_FOUND)
+            return Response({
+                'status': 'resolved',
+                'symbol': {
+                    'ticker': symbol.ticker,
+                    'exchange_code': symbol.exchange.code if symbol.exchange else None,
+                    'name': symbol.name,
+                    'status': symbol.status,
+                },
+            })
+
+        result = resolve_symbol_service(ticker)
+        http_status = status.HTTP_200_OK
+        if result.get('status') == 'not_found':
+            http_status = status.HTTP_404_NOT_FOUND
+        return Response(result, status=http_status)
+
+    @action(detail=True, methods=['post'], url_path='check-data-quality', url_name='check-data-quality')
+    def check_data_quality(self, request, pk=None):
+        """Run reusable OHLCV data quality check for a symbol."""
+        from .services.data_validation import check_data_quality as run_check
+
+        symbol = self.get_object()
+        start_date = request.data.get('start_date')
+        end_date = request.data.get('end_date')
+
+        from .services.market_data_service import parse_task_dates
+        start_dt, end_dt = parse_task_dates(start_date, end_date)
+
+        result = run_check(symbol, start_date=start_dt, end_date=end_dt, update_symbol=True)
+        return Response(result.to_dict())
+
     @action(detail=False, methods=['post'])
     def fetch_symbols(self, request):
         """Trigger background task to fetch symbols from exchanges"""
@@ -748,6 +808,11 @@ class SymbolViewSet(viewsets.ModelViewSet):
         period = request.data.get('period')
         replace_existing = request.data.get('replace_existing', False)
         provider_code = request.data.get('provider_code', 'YAHOO')  # Default to YAHOO for backward compatibility
+
+        from .services.market_data_service import parse_task_dates
+        norm_start, norm_end = parse_task_dates(start_date, end_date, period)
+        start_date = norm_start.isoformat() if norm_start else start_date
+        end_date = norm_end.isoformat() if norm_end else end_date
         
         # If only broker_id is provided (without exchange_code, ticker, or tickers), fetch for all broker symbols
         if broker_id and not exchange_code and not ticker and (not tickers or len(tickers) == 0):
@@ -808,7 +873,8 @@ class SymbolViewSet(viewsets.ModelViewSet):
                 end_date=end_date,
                 period=period,
                 replace_existing=replace_existing,
-                provider_code=provider_code
+                provider_code=provider_code,
+                exchange_code=exchange_code,
             )
             return Response({
                 'message': f'OHLCV data fetch task started for {ticker}' + (f' (broker {broker_id})' if broker_id else ''),
@@ -835,6 +901,7 @@ class SymbolViewSet(viewsets.ModelViewSet):
         ticker = request.data.get('ticker')
         tickers = request.data.get('tickers', [])
         exchange_code = request.data.get('exchange_code')
+        broker_id = request.data.get('broker_id')
         
         if delete_all:
             # Delete all OHLCV data
@@ -851,6 +918,14 @@ class SymbolViewSet(viewsets.ModelViewSet):
                 'message': f'OHLCV data deletion task started for exchange {exchange_code}',
                 'task_id': task.id,
                 'exchange_code': exchange_code
+            }, status=status.HTTP_202_ACCEPTED)
+        elif broker_id:
+            from .tasks import delete_ohlcv_data_by_broker_task
+            task = delete_ohlcv_data_by_broker_task.delay(broker_id=broker_id)
+            return Response({
+                'message': f'OHLCV data deletion task started for broker {broker_id}',
+                'task_id': task.id,
+                'broker_id': broker_id,
             }, status=status.HTTP_202_ACCEPTED)
         elif tickers and len(tickers) > 0:
             # Delete for multiple symbols
@@ -870,7 +945,7 @@ class SymbolViewSet(viewsets.ModelViewSet):
             }, status=status.HTTP_202_ACCEPTED)
         else:
             return Response({
-                'error': 'Must provide either delete_all=true, ticker, tickers (list), or exchange_code'
+                'error': 'Must provide delete_all=true, ticker, tickers (list), exchange_code, or broker_id'
             }, status=status.HTTP_400_BAD_REQUEST)
 
 

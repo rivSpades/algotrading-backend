@@ -21,9 +21,24 @@ class ProviderSerializer(serializers.ModelSerializer):
 
 
 class OHLCVSerializer(serializers.ModelSerializer):
+    change_percent = serializers.SerializerMethodField()
+
     class Meta:
         model = OHLCV
-        fields = ['timestamp', 'timeframe', 'open', 'high', 'low', 'close', 'volume']
+        fields = [
+            'timestamp', 'timeframe', 'open', 'high', 'low', 'close', 'volume',
+            'change_percent',
+        ]
+
+    def get_change_percent(self, obj):
+        try:
+            open_p = float(obj.open)
+            close_p = float(obj.close)
+            if open_p == 0:
+                return None
+            return round((close_p - open_p) / open_p * 100, 2)
+        except (TypeError, ValueError):
+            return None
 
 
 class SymbolSerializer(serializers.ModelSerializer):

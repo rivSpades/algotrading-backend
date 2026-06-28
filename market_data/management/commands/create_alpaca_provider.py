@@ -1,6 +1,9 @@
 """
 Management command to create Alpaca provider
 Usage: python manage.py create_alpaca_provider --api-key <KEY> --api-secret <SECRET> [--base-url <URL>]
+
+Prefer setting ALPACA_API_KEY, ALPACA_API_SECRET, and ALPACA_DATA_BASE_URL in .env instead.
+This command updates the optional Provider DB fallback row.
 """
 
 from django.core.management.base import BaseCommand

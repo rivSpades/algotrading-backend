@@ -46,6 +46,7 @@ from .services import (
     reconcile_deployment_symbols,
     update_open_trades,
 )
+from .services.order_service import entry_phase_bankroll_exhausted
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,8 @@ logger = logging.getLogger(__name__)
 # engine evaluation (yfinance / Alpaca can otherwise block the worker for many minutes).
 OHLCV_REFRESH_BUDGET_SEC = int(8 * 60)
 HEDGE_BENCH_OHLCV_BUDGET_SEC = int(5 * 60)
+# Refresh window is re-downloaded so existing bars in-range are replaced (fixes stale „today”).
+LIVE_REFRESH_REPLACE_EXISTING = True
 
 
 @shared_task(bind=True, name='live_trading.link_broker_symbols')
@@ -372,6 +375,255 @@ def reverify_broker_symbol_associations_task(self, broker_id):
 # ---------------------------------------------------------------------------
 
 
+def _open_main_trade_deployment_symbol_ids(deployment_id: int) -> set[int]:
+    """`DeploymentSymbol` ids that have an open main (non-hedge) `LiveTrade`."""
+    qs = LiveTrade.objects.filter(
+        deployment_id=deployment_id,
+        status='open',
+    ).exclude(
+        metadata__contains={'is_hedge_leg': True},
+    ).values_list('deployment_symbol_id', flat=True).distinct()
+    return {int(pk) for pk in qs if pk is not None}
+
+
+def _run_deployment_market_evaluation(
+    task_self,
+    *,
+    deployment: StrategyDeployment,
+    deployment_id: int,
+    open_group_key: str,
+    deployment_symbols: list,
+    actor_id: str,
+    chunk_size: int,
+    refresh_ohlcv: bool,
+    entry_phase_only: bool,
+    phase_tag: str,
+    symbol_chunk: bool,
+    total_available: int | None,
+) -> dict:
+    """OHLCV refresh, engine evaluate loop, summaries (exit + entry phases share this)."""
+    log_event(
+        deployment,
+        event_type='task_tick',
+        actor_type='task',
+        actor_id=actor_id,
+        message=(
+            f"{phase_tag}: {deployment.strategy.name} "
+            f"({len(deployment_symbols)} symbol(s))"
+        ),
+        context={
+            'open_group_key': open_group_key,
+            'phase': phase_tag,
+            'entry_phase_only': entry_phase_only,
+            'symbol_count': len(deployment_symbols),
+            'symbol_count_universe': total_available,
+            'symbol_chunk': symbol_chunk,
+            'symbols_per_task': chunk_size,
+            'tickers': [ds.symbol.ticker for ds in deployment_symbols],
+        },
+    )
+
+    if not deployment_symbols:
+        return {
+            'status': 'success',
+            'deployment_id': deployment_id,
+            'open_group_key': open_group_key,
+            'phase': phase_tag,
+            'symbol_count': 0,
+            'evaluations': [],
+        }
+
+    if refresh_ohlcv:
+        _refresh_ohlcv_for_symbols(deployment, deployment_symbols, actor_id=actor_id)
+
+    broker_adapter = get_adapter_for_deployment(deployment)
+    if broker_adapter is None:
+        log_event(
+            deployment,
+            event_type='error',
+            actor_type='task',
+            actor_id=actor_id,
+            level='warning',
+            message=(
+                f"No broker adapter for {deployment.broker.code}; "
+                f"running engine in dry-run (no orders will be placed)."
+            ),
+            context={'open_group_key': open_group_key, 'phase': phase_tag},
+        )
+
+    try:
+        engine = get_engine_instance(deployment, broker_adapter=broker_adapter)
+    except EngineNotRegistered as exc:
+        log_event(
+            deployment,
+            event_type='error',
+            actor_type='task',
+            actor_id=actor_id,
+            level='error',
+            message=str(exc),
+            error=exc,
+            context={'open_group_key': open_group_key, 'phase': phase_tag},
+        )
+        return {
+            'status': 'error',
+            'error': str(exc),
+            'deployment_id': deployment_id,
+            'phase': phase_tag,
+        }
+
+    fire_at = timezone.now()
+    evaluations: list[dict] = []
+    actionable_count = 0
+    n_sym = len(deployment_symbols)
+    bankroll_halt_logged = False
+    try:
+        for i, ds in enumerate(deployment_symbols):
+            if (
+                entry_phase_only
+                and broker_adapter is not None
+                and entry_phase_bankroll_exhausted(deployment, broker_adapter)
+            ):
+                if not bankroll_halt_logged:
+                    bankroll_halt_logged = True
+                    log_event(
+                        deployment,
+                        event_type='task_tick',
+                        actor_type='task',
+                        actor_id=actor_id,
+                        level='warning',
+                        message=(
+                            'Entry-phase scan stopped: deployable bankroll below '
+                            'minimum entry notional.'
+                        ),
+                        context={
+                            'open_group_key': open_group_key,
+                            'phase': phase_tag,
+                            'processed': i,
+                            'total': n_sym,
+                        },
+                    )
+                break
+
+            if i and (i % 5 == 0):
+                task_self.update_state(
+                    state='PROGRESS',
+                    meta={
+                        'deployment_id': deployment_id,
+                        'open_group_key': open_group_key,
+                        'phase': phase_tag,
+                        'processed': i,
+                        'total': n_sym,
+                        'last_ticker': deployment_symbols[i - 1].symbol.ticker,
+                    },
+                )
+                log_event(
+                    deployment,
+                    event_type='task_tick',
+                    actor_type='task',
+                    actor_id=actor_id,
+                    message=f"{phase_tag} progress {i}/{n_sym}",
+                    context={
+                        'open_group_key': open_group_key,
+                        'processed': i,
+                        'total': n_sym,
+                        'last_ticker': deployment_symbols[i - 1].symbol.ticker,
+                    },
+                )
+
+            try:
+                evaluation = evaluate_deployment_symbol(
+                    ds,
+                    fire_at=fire_at,
+                    actor_type='task',
+                    actor_id=actor_id,
+                    engine=engine,
+                    broker_adapter=broker_adapter,
+                    place_orders=broker_adapter is not None,
+                )
+            except Exception:
+                continue
+            try:
+                evaluations.append(evaluation.to_dict())
+            except Exception as exc:  # pragma: no cover
+                logger.exception(
+                    '%s: evaluation.to_dict failed for %s',
+                    phase_tag,
+                    ds.symbol.ticker,
+                )
+                evaluations.append(
+                    {
+                        'deployment_symbol_id': evaluation.deployment_symbol_id,
+                        'ticker': evaluation.ticker,
+                        'error': f'to_dict failed: {exc}',
+                    },
+                )
+            if evaluation.signal and evaluation.signal.is_actionable:
+                actionable_count += 1
+
+        task_self.update_state(
+            state='PROGRESS',
+            meta={
+                'deployment_id': deployment_id,
+                'open_group_key': open_group_key,
+                'processed': n_sym,
+                'total': n_sym,
+                'phase': f'{phase_tag}_complete',
+                'bankroll_halted': bankroll_halt_logged,
+            },
+        )
+        log_event(
+            deployment,
+            event_type='task_tick',
+            actor_type='task',
+            actor_id=actor_id,
+            message=(
+                f"{phase_tag} evaluation complete ({n_sym} symbols, "
+                f"{actionable_count} actionable)"
+            ),
+            context={
+                'open_group_key': open_group_key,
+                'phase': phase_tag,
+                'total': n_sym,
+                'actionable_count': actionable_count,
+                'bankroll_halted': bankroll_halt_logged,
+            },
+        )
+    except SoftTimeLimitExceeded:
+        log_event(
+            deployment,
+            event_type='task_tick',
+            actor_type='task',
+            actor_id=actor_id,
+            level='warning',
+            message=f'{phase_tag}: soft time limit hit; returning partial results',
+            context={
+                'open_group_key': open_group_key,
+                'phase': phase_tag,
+                'processed': len(evaluations),
+                'total': n_sym,
+            },
+        )
+
+    try:
+        close_old_connections()
+    except Exception:  # pragma: no cover
+        logger.exception('close_old_connections after %s', phase_tag)
+
+    return {
+        'status': 'success',
+        'deployment_id': deployment_id,
+        'open_group_key': open_group_key,
+        'phase': phase_tag,
+        'symbol_count': len(deployment_symbols),
+        'evaluation_count': len(evaluations),
+        'actionable_count': actionable_count,
+        'fired_at': fire_at.isoformat(),
+        'partial': len(evaluations) < len(deployment_symbols),
+        'bankroll_halted': bankroll_halt_logged,
+        'evaluations': evaluations,
+    }
+
+
 @shared_task(
     bind=True,
     name='live_trading.market_open_fanout',
@@ -382,10 +634,10 @@ def market_open_fanout_task(self, open_group_key: str) -> dict:
     """Fan-out task fired once per `ExchangeSchedule.open_group_key`.
 
     Refreshes SPY, VIXM, VIXY, and ^VIX (once per run, always) so dashboard /
-    model series are fresh, then looks up every active deployment that has at
-    least one active `DeploymentSymbol` whose exchange matches the open group
-    and dispatches `deployment_market_open_task` in symbol-ID chunks so the full
-    ordered universe is covered (see `LIVE_TRADING_MARKET_OPEN_SYMBOLS_PER_TASK`).
+    model series are fresh, then for each deployment queues **exit phase first**
+    (symbols with open main positions), then **entry chunks** via Celery link —
+    see `deployment_market_exit_phase_task` and
+    `deployment_market_dispatch_entry_chunks_task`.
     """
 
     actor_id = self.request.id or 'manual'
@@ -422,7 +674,8 @@ def market_open_fanout_task(self, open_group_key: str) -> dict:
     # independent of per-deployment `hedge_enabled`, then per-deployment symbols.
     _refresh_hedge_bench_ohlcv(open_group_key=open_group_key, actor_id=actor_id)
 
-    chunk_tasks_dispatched = 0
+    exit_pipelines = 0
+    approx_entry_chunks = 0
     for dep in deployments:
         id_list = list(
             deployment_symbols_for_open_group(
@@ -431,20 +684,20 @@ def market_open_fanout_task(self, open_group_key: str) -> dict:
         )
         if not id_list:
             continue
-        for i in range(0, len(id_list), chunk_size):
-            chunk = id_list[i : i + chunk_size]
-            try:
-                deployment_market_open_task.delay(
-                    dep.id,
-                    open_group_key,
-                    only_symbol_ids=chunk,
-                )
-                chunk_tasks_dispatched += 1
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.error(
-                    'Failed to dispatch deployment_market_open chunk for deployment=%s: %s',
-                    dep.id, exc,
-                )
+        approx_entry_chunks += (len(id_list) + chunk_size - 1) // chunk_size
+        try:
+            deployment_market_exit_phase_task.apply_async(
+                args=(dep.id, open_group_key),
+                link=deployment_market_dispatch_entry_chunks_task.s(
+                    dep.id, open_group_key, id_list,
+                ),
+            )
+            exit_pipelines += 1
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error(
+                'Failed to dispatch exit-phase pipeline for deployment=%s: %s',
+                dep.id, exc,
+            )
 
     connections.close_all()
     return {
@@ -452,9 +705,8 @@ def market_open_fanout_task(self, open_group_key: str) -> dict:
         'open_group_key': open_group_key,
         'exchanges': exchange_codes,
         'deployment_count': len(deployment_ids),
-        'chunk_tasks_dispatched': chunk_tasks_dispatched,
-        # Same count as `chunk_tasks_dispatched` (was one task per deployment).
-        'dispatched': chunk_tasks_dispatched,
+        'exit_phase_pipelines_dispatched': exit_pipelines,
+        'approx_entry_chunk_tasks': approx_entry_chunks,
         'symbols_per_task': chunk_size,
     }
 
@@ -474,6 +726,7 @@ def deployment_market_open_task(
     *,
     refresh_ohlcv: bool = True,
     only_symbol_ids=None,
+    entry_phase_only: bool = False,
 ) -> dict:
     """Per-deployment market-open tick (one Celery run = one symbol chunk or full run).
 
@@ -576,6 +829,7 @@ def deployment_market_open_task(
                         deployment_id,
                         open_group_key,
                         only_symbol_ids=sub,
+                        entry_phase_only=False,
                     )
                     n_chunks += 1
                 except Exception as exc:  # pragma: no cover - defensive
@@ -617,188 +871,151 @@ def deployment_market_open_task(
         total_available = None
     deployment_symbols = list(qs)
 
-    log_event(
-        deployment,
-        event_type='task_tick',
-        actor_type='task',
-        actor_id=actor_id,
-        message=(
-            f"deployment_market_open for {deployment.strategy.name} "
-            f"({len(deployment_symbols)} symbol(s))"
-        ),
-        context={
-            'open_group_key': open_group_key,
-            'symbol_count': len(deployment_symbols),
-            'symbol_count_universe': total_available,
-            'symbol_chunk': bool(only_symbol_ids),
-            'symbols_per_task': chunk_size,
-            'tickers': [ds.symbol.ticker for ds in deployment_symbols],
-        },
+
+    phase_tag = (
+        'deployment_market_open_entries'
+        if entry_phase_only
+        else 'deployment_market_open'
     )
+    out = _run_deployment_market_evaluation(
+        self,
+        deployment=deployment,
+        deployment_id=deployment_id,
+        open_group_key=open_group_key,
+        deployment_symbols=deployment_symbols,
+        actor_id=actor_id,
+        chunk_size=chunk_size,
+        refresh_ohlcv=refresh_ohlcv,
+        entry_phase_only=entry_phase_only,
+        phase_tag=phase_tag,
+        symbol_chunk=bool(only_symbol_ids),
+        total_available=total_available,
+    )
+    out.pop('evaluations', None)
+    return out
 
-    if not deployment_symbols:
-        return {
-            'status': 'success',
-            'deployment_id': deployment_id,
-            'open_group_key': open_group_key,
-            'symbol_count': 0,
-            'evaluations': [],
-        }
 
-    if refresh_ohlcv:
-        _refresh_ohlcv_for_symbols(deployment, deployment_symbols, actor_id=actor_id)
+@shared_task(
+    bind=True,
+    name='live_trading.deployment_market_exit_phase',
+    soft_time_limit=15 * 60,
+    time_limit=18 * 60,
+)
+def deployment_market_exit_phase_task(self, deployment_id: int, open_group_key: str) -> dict:
+    """Evaluate only symbols that already have an open main `LiveTrade` (exit signals first)."""
 
-    broker_adapter = get_adapter_for_deployment(deployment)
-    if broker_adapter is None:
-        log_event(
-            deployment,
-            event_type='error',
-            actor_type='task',
-            actor_id=actor_id,
-            level='warning',
-            message=(
-                f"No broker adapter for {deployment.broker.code}; "
-                f"running engine in dry-run (no orders will be placed)."
-            ),
-            context={'open_group_key': open_group_key},
+    actor_id = self.request.id or 'manual'
+    chunk_size = int(
+        getattr(
+            settings,
+            'LIVE_TRADING_MARKET_OPEN_SYMBOLS_PER_TASK',
+            250,
         )
+    )
+    if chunk_size < 1:
+        chunk_size = 1
 
     try:
-        engine = get_engine_instance(deployment, broker_adapter=broker_adapter)
-    except EngineNotRegistered as exc:
-        log_event(
-            deployment,
-            event_type='error',
-            actor_type='task',
-            actor_id=actor_id,
-            level='error',
-            message=str(exc),
-            error=exc,
-            context={'open_group_key': open_group_key},
-        )
+        deployment = StrategyDeployment.objects.select_related(
+            'strategy', 'broker', 'parameter_set',
+        ).get(id=deployment_id)
+    except StrategyDeployment.DoesNotExist:
         return {
             'status': 'error',
-            'error': str(exc),
+            'error': f'Deployment {deployment_id} not found',
             'deployment_id': deployment_id,
+            'phase': 'exit',
         }
 
-    fire_at = timezone.now()
-    evaluations: list[dict] = []
-    actionable_count = 0
-    n_sym = len(deployment_symbols)
+    if deployment.status not in ('active', 'evaluating'):
+        return {
+            'status': 'skipped',
+            'reason': f"deployment status '{deployment.status}'",
+            'deployment_id': deployment_id,
+            'phase': 'exit',
+        }
+
+    base_qs = deployment_symbols_for_open_group(deployment, open_group_key)
+    open_syms = _open_main_trade_deployment_symbol_ids(deployment_id)
+    allowed = set(base_qs.values_list('id', flat=True))
+    exit_ids = sorted(open_syms & allowed)
+    deployment_symbols = list(base_qs.filter(id__in=exit_ids))
     try:
-        for i, ds in enumerate(deployment_symbols):
-            # Heartbeat every 5 symbols so long stretches without logs are rarer
-            # (the last 4 symbols of each block used to have no log → looked "hung").
-            if i and (i % 5 == 0):
-                self.update_state(
-                    state='PROGRESS',
-                    meta={
-                        'deployment_id': deployment_id,
-                        'open_group_key': open_group_key,
-                        'processed': i,
-                        'total': n_sym,
-                        'last_ticker': deployment_symbols[i - 1].symbol.ticker,
-                    },
-                )
-                log_event(
-                    deployment,
-                    event_type='task_tick',
-                    actor_type='task',
-                    actor_id=actor_id,
-                    message=f"deployment_market_open progress {i}/{n_sym}",
-                    context={
-                        'open_group_key': open_group_key,
-                        'processed': i,
-                        'total': n_sym,
-                        'last_ticker': deployment_symbols[i - 1].symbol.ticker,
-                    },
-                )
-
-            try:
-                evaluation = evaluate_deployment_symbol(
-                    ds,
-                    fire_at=fire_at,
-                    actor_type='task',
-                    actor_id=actor_id,
-                    engine=engine,
-                    broker_adapter=broker_adapter,
-                    place_orders=broker_adapter is not None,
-                )
-            except Exception:
-                # Logged inside evaluate_deployment_symbol; keep going so one
-                # bad symbol doesn't cancel the whole tick.
-                continue
-            try:
-                evaluations.append(evaluation.to_dict())
-            except Exception as exc:  # pragma: no cover - bad context types
-                logger.exception(
-                    'deployment_market_open: evaluation.to_dict() failed for %s',
-                    ds.symbol.ticker,
-                )
-                evaluations.append(
-                    {
-                        'deployment_symbol_id': evaluation.deployment_symbol_id,
-                        'ticker': evaluation.ticker,
-                        'error': f'to_dict failed: {exc}',
-                    }
-                )
-            if evaluation.signal and evaluation.signal.is_actionable:
-                actionable_count += 1
-
-        # After last symbol: explicit phase marker (vs silent gap before DB close / return).
-        self.update_state(
-            state='PROGRESS',
-            meta={
-                'deployment_id': deployment_id,
-                'open_group_key': open_group_key,
-                'processed': n_sym,
-                'total': n_sym,
-                'phase': 'evaluation_complete',
-            },
-        )
-        log_event(
-            deployment,
-            event_type='task_tick',
-            actor_type='task',
-            actor_id=actor_id,
-            message=f"deployment_market_open evaluation complete ({n_sym} symbols, {actionable_count} actionable)",
-            context={
-                'open_group_key': open_group_key,
-                'total': n_sym,
-                'actionable_count': actionable_count,
-            },
-        )
-    except SoftTimeLimitExceeded:
-        log_event(
-            deployment,
-            event_type='task_tick',
-            actor_type='task',
-            actor_id=actor_id,
-            level='warning',
-            message='deployment_market_open soft time limit hit; returning partial results',
-            context={
-                'open_group_key': open_group_key,
-                'processed': len(evaluations),
-                'total': n_sym,
-            },
-        )
-
-    try:
-        close_old_connections()
+        total_available = base_qs.count()
     except Exception:  # pragma: no cover
-        logger.exception('close_old_connections after deployment_market_open')
+        total_available = None
 
+    out = _run_deployment_market_evaluation(
+        self,
+        deployment=deployment,
+        deployment_id=deployment_id,
+        open_group_key=open_group_key,
+        deployment_symbols=deployment_symbols,
+        actor_id=actor_id,
+        chunk_size=chunk_size,
+        refresh_ohlcv=True,
+        entry_phase_only=False,
+        phase_tag='deployment_market_exit_phase',
+        symbol_chunk=False,
+        total_available=total_available,
+    )
+    out.pop('evaluations', None)
+    return out
+
+
+@shared_task(
+    bind=True,
+    name='live_trading.deployment_market_dispatch_entry_chunks',
+    soft_time_limit=60,
+    time_limit=90,
+)
+def deployment_market_dispatch_entry_chunks_task(
+    self,
+    prev_result,
+    deployment_id: int,
+    open_group_key: str,
+    id_list: list,
+) -> dict:
+    """Linked after exit phase: enqueue entry-only `deployment_market_open` chunks."""
+
+    _ = prev_result
+    chunk_size = int(
+        getattr(
+            settings,
+            'LIVE_TRADING_MARKET_OPEN_SYMBOLS_PER_TASK',
+            250,
+        )
+    )
+    if chunk_size < 1:
+        chunk_size = 1
+    if not id_list:
+        return {'status': 'noop', 'deployment_id': deployment_id, 'chunks': 0}
+    n = 0
+    for i in range(0, len(id_list), chunk_size):
+        chunk = id_list[i : i + chunk_size]
+        try:
+            deployment_market_open_task.delay(
+                deployment_id,
+                open_group_key,
+                only_symbol_ids=chunk,
+                entry_phase_only=True,
+            )
+            n += 1
+        except Exception as exc:  # pragma: no cover
+            logger.error(
+                'dispatch_entry_chunks: failed deployment=%s chunk=%s: %s',
+                deployment_id,
+                chunk[:5],
+                exc,
+            )
     return {
         'status': 'success',
         'deployment_id': deployment_id,
         'open_group_key': open_group_key,
-        'symbol_count': len(deployment_symbols),
-        'evaluation_count': len(evaluations),
-        'actionable_count': actionable_count,
-        'fired_at': fire_at.isoformat(),
-        'partial': len(evaluations) < len(deployment_symbols),
+        'entry_chunks_dispatched': n,
     }
+
+
 
 
 @shared_task(bind=True, name='live_trading.update_positions')
@@ -928,7 +1145,7 @@ def _refresh_hedge_bench_ohlcv(*, open_group_key: str, actor_id: str) -> None:
     individual deployment work.
     """
     from backtest_engine.services.hybrid_vix_hedge import HEDGE_TICKERS
-    from market_data.tasks import fetch_ohlcv_data_task
+    from market_data.services.ohlcv_sync import fetch_ohlcv_single_sync
 
     today = timezone.now().date().isoformat()
     bench_t0 = time.monotonic()
@@ -956,16 +1173,12 @@ def _refresh_hedge_bench_ohlcv(*, open_group_key: str, actor_id: str) -> None:
             )
             break
         try:
-            result = fetch_ohlcv_data_task.apply(
-                kwargs={
-                    'ticker': ticker,
-                    'period': '1mo',
-                    'replace_existing': False,
-                    # Hedge bench tickers are treated as Yahoo-backed reference series.
-                    'provider_code': 'YAHOO',
-                },
+            value = fetch_ohlcv_single_sync(
+                ticker=ticker,
+                period='1mo',
+                replace_existing=LIVE_REFRESH_REPLACE_EXISTING,
+                provider_code='YAHOO',
             )
-            value = result.result if hasattr(result, 'result') else result
             if isinstance(value, dict) and value.get('status') == 'failed':
                 log_event(
                     None,
@@ -1019,7 +1232,11 @@ def _refresh_ohlcv_for_symbols(deployment, deployment_symbols, *, actor_id: str)
     Uses `apply()` so each refresh runs in-process; failures are captured in
     the audit log but never abort the surrounding tick.
     """
-    from market_data.tasks import fetch_ohlcv_data_multiple_symbols_task, fetch_ohlcv_data_task
+    from market_data.services.ohlcv_sync import (
+        bulk_per_ticker_results,
+        fetch_ohlcv_bulk_symbols_sync,
+        fetch_ohlcv_single_sync,
+    )
 
     # Gap-Up/Gap-Down needs enough daily history to compute RollingSTD_{std_period}.
     # Refresh more than 1mo so we don't end up with mostly-null STD and "invalid_std" holds.
@@ -1064,16 +1281,13 @@ def _refresh_ohlcv_for_symbols(deployment, deployment_symbols, *, actor_id: str)
             and not _refresh_over_budget()
         ):
             try:
-                result = fetch_ohlcv_data_multiple_symbols_task.apply(
-                    kwargs={
-                        'tickers': tickers,
-                        'period': refresh_period,
-                        'replace_existing': False,
-                        'provider_code': provider_code,
-                    }
+                value = fetch_ohlcv_bulk_symbols_sync(
+                    tickers=tickers,
+                    period=refresh_period,
+                    replace_existing=LIVE_REFRESH_REPLACE_EXISTING,
+                    provider_code=provider_code,
                 )
-                value = result.result if hasattr(result, 'result') else result
-                per = (value or {}).get('result') if isinstance(value, dict) else None
+                per = bulk_per_ticker_results(value)
                 if isinstance(per, dict):
                     for ds in dss:
                         t = ds.symbol.ticker
@@ -1124,15 +1338,12 @@ def _refresh_ohlcv_for_symbols(deployment, deployment_symbols, *, actor_id: str)
                 return
             ticker = ds.symbol.ticker
             try:
-                result = fetch_ohlcv_data_task.apply(
-                    kwargs={
-                        'ticker': ticker,
-                        'period': refresh_period,
-                        'replace_existing': False,
-                        'provider_code': provider_code,
-                    },
+                value = fetch_ohlcv_single_sync(
+                    ticker=ticker,
+                    period=refresh_period,
+                    replace_existing=LIVE_REFRESH_REPLACE_EXISTING,
+                    provider_code=provider_code,
                 )
-                value = result.result if hasattr(result, 'result') else result
                 if isinstance(value, dict) and value.get('status') == 'failed':
                     log_event(
                         deployment,

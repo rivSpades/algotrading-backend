@@ -8,11 +8,28 @@ from datetime import datetime, date, timedelta
 from django.utils import timezone
 from django.db import transaction
 from ..models import Symbol, OHLCV, Provider
-from .data_validation import validate_ohlcv_data
+from .data_validation import validate_ohlcv_data, check_data_quality
 
 
 class OHLCVService:
     """Service for managing OHLCV data"""
+    
+    @staticmethod
+    def mark_fetch_failed(symbol: Symbol, reason: str, provider: Optional[Provider] = None) -> None:
+        """Update symbol when provider returned no usable OHLCV data."""
+        update_fields = ['validation_status', 'validation_reason', 'status']
+        symbol.validation_status = 'invalid'
+        symbol.validation_reason = reason
+        symbol.status = 'disabled'
+        if provider is not None:
+            symbol.provider = provider
+            update_fields.append('provider')
+        symbol.save(update_fields=update_fields)
+    
+    @staticmethod
+    def finalize_symbol_after_fetch(symbol: Symbol, timeframe: str = 'daily') -> None:
+        """Re-validate full DB series and set active/valid when quality passes."""
+        check_data_quality(symbol, update_symbol=True)
     
     @staticmethod
     def get_or_create_yahoo_provider() -> Provider:
@@ -242,35 +259,27 @@ class OHLCVService:
                 'total': int
             }
         """
-        # Validate data before saving
-        is_valid, validation_reason = validate_ohlcv_data(ohlcv_data)
-        
         if not ohlcv_data:
-            # Mark as invalid if no data
-            symbol.validation_status = 'invalid'
-            symbol.validation_reason = 'No data provided'
-            symbol.status = 'disabled'
-            symbol.save(update_fields=['validation_status', 'validation_reason', 'status'])
+            if OHLCV.objects.filter(symbol=symbol, timeframe=timeframe).exists():
+                quality = check_data_quality(symbol, update_symbol=True)
+                return {
+                    'created': 0,
+                    'updated': 0,
+                    'errors': 0,
+                    'total': 0,
+                    'skipped': True,
+                    'validation_passed': quality.is_valid,
+                    'validation_reason': quality.reason,
+                }
+            quality = check_data_quality(symbol, ohlcv_data=[], update_symbol=True)
             return {
-                'created': 0, 
-                'updated': 0, 
-                'errors': 0, 
+                'created': 0,
+                'updated': 0,
+                'errors': 0,
                 'total': 0,
-                'validation_passed': False,
-                'validation_reason': 'No data provided'
+                'validation_passed': quality.is_valid,
+                'validation_reason': quality.reason,
             }
-        
-        # Update symbol validation status
-        symbol.validation_status = 'valid' if is_valid else 'invalid'
-        symbol.validation_reason = validation_reason if not is_valid else ''
-        
-        # Set symbol status based on validation
-        if is_valid:
-            symbol.status = 'active'
-        else:
-            symbol.status = 'disabled'
-        
-        symbol.save(update_fields=['validation_status', 'validation_reason', 'status'])
         
         # Get or set provider
         if provider is None:
@@ -367,15 +376,87 @@ class OHLCVService:
                     print(f"Error saving OHLCV data for {symbol.ticker} at {data.get('timestamp')}: {str(e)}")
                     error_count += 1
         
+        # Auto-validate full saved series and activate symbol when quality passes
+        symbol.refresh_from_db()
+        quality = check_data_quality(symbol, update_symbol=True)
+        is_valid = quality.is_valid
+        validation_reason = quality.reason
+        
         return {
             'created': created_count,
             'updated': updated_count,
             'errors': error_count,
             'total': len(ohlcv_data),
             'validation_passed': is_valid,
-            'validation_reason': validation_reason
+            'validation_reason': validation_reason,
+        }
+
+    @staticmethod
+    def plan_incremental_ohlcv_update(symbol: Symbol) -> Optional[Dict[str, str]]:
+        """
+        Compute date range for an incremental OHLCV update up to today.
+
+        Returns dict with start_date, end_date, provider_code (ISO date strings),
+        or None when data is already current. Returns {'error': msg} when update
+        cannot run (no provider or no existing OHLCV).
+        """
+        if not symbol.provider:
+            return {'error': f'{symbol.ticker}: no data provider configured'}
+
+        latest_timestamp = OHLCVService.get_latest_timestamp(symbol, timeframe='daily')
+        if latest_timestamp is None:
+            return {'error': f'{symbol.ticker}: no OHLCV data — fetch initial data first'}
+
+        if isinstance(latest_timestamp, datetime):
+            latest_date = latest_timestamp.date()
+        else:
+            latest_date = latest_timestamp
+
+        now = timezone.now()
+        today = now.date()
+        current_hour_utc = now.hour
+        end_date = today if current_hour_utc >= 22 else today - timedelta(days=1)
+
+        if latest_date >= end_date:
+            return None
+
+        start_date = latest_date - timedelta(days=365)
+        min_start_date = timezone.datetime(2016, 1, 1).date()
+        if start_date < min_start_date:
+            start_date = min_start_date
+
+        return {
+            'start_date': start_date.strftime('%Y-%m-%d'),
+            'end_date': end_date.strftime('%Y-%m-%d'),
+            'provider_code': symbol.provider.code,
         }
 
 
+def symbols_queryset_for_scope(
+    *,
+    delete_all: bool = False,
+    exchange_code: Optional[str] = None,
+    broker_id: Optional[int] = None,
+    tickers: Optional[List[str]] = None,
+    ticker: Optional[str] = None,
+):
+    """Resolve Symbol queryset for bulk manage actions."""
+    if delete_all:
+        return Symbol.objects.all()
 
+    qs = Symbol.objects.all()
+    if exchange_code:
+        return qs.filter(exchange__code=exchange_code.upper())
+    if broker_id:
+        from live_trading.models import SymbolBrokerAssociation
+        symbol_ids = SymbolBrokerAssociation.objects.filter(
+            broker_id=broker_id,
+        ).values_list('symbol_id', flat=True)
+        return qs.filter(pk__in=symbol_ids)
+    if tickers:
+        normalized = [t.strip().upper() for t in tickers if t and str(t).strip()]
+        return qs.filter(ticker__in=normalized)
+    if ticker:
+        return qs.filter(ticker=ticker.strip().upper())
+    return Symbol.objects.none()
 
