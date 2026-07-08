@@ -1,0 +1,12 @@
+---
+description: Market data architecture — provider blackboxes and reusable service functions
+globs: market_data/**/*
+alwaysApply: false
+---
+# Market Data
+
+> Full policy in `.ai/context/market-data.md`.
+
+- Provider files under `market_data/providers/` are API blackboxes — no Celery/views imports.
+- Orchestration goes through `market_data/services/` (`get_daily_data`, symbol resolution, validation).
+- Never call provider blackboxes from views/tasks directly.

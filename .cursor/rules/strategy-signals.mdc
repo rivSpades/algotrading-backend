@@ -1,0 +1,15 @@
+---
+description: Strategy signal blackbox — shared rules between backtest and live
+globs:
+  - strategies/signals/**/*
+  - backtest_engine/services/backtest_executor.py
+  - live_trading/engines/**
+alwaysApply: false
+---
+# Strategy signals
+
+> Full policy in `.ai/context/strategy-signals.md`.
+
+- Public API: `strategies.signals.check_strategy_signal(strategy_name, ctx)`
+- Backtest and live must use the same signal path — no duplicated classification.
+- New strategies: rule + handler + thin engine wrappers + parity tests.

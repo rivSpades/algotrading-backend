@@ -1,0 +1,15 @@
+---
+alwaysApply: true
+---
+# Backend — agent rules
+
+> Canonical context is in `AGENTS.md`. Read it first.
+
+- Stack, commands, conventions, Don'ts → `AGENTS.md`
+- Product domain → `.ai/context/product-domain.md`
+- Market data → `.ai/context/market-data.md`
+- Strategy signals → `.ai/context/strategy-signals.md`
+- Database → `.ai/context/database-schema.md`
+- Docker → `.ai/context/docker-ops.md`
+
+Conda env: `conda activate trading`. No business logic in the frontend.
