@@ -10,7 +10,7 @@ REDIS_PORT="${REDIS_PORT:-6379}"
 /app/docker/wait-for-it.sh "${REDIS_HOST}:${REDIS_PORT}" -t 60
 
 if [[ "${RUN_MIGRATIONS:-false}" == "true" ]]; then
-    echo "Running migrations..."
+    echo "Running migrations (RUN_MIGRATIONS=true)..."
     python manage.py migrate --noinput
 
     echo "Bootstrapping market schedules..."

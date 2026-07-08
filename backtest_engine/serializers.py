@@ -11,6 +11,8 @@ from .models import (
     SymbolBacktestRun,
     SymbolBacktestTrade,
     SymbolBacktestStatistics,
+    PortfolioMonteCarloSimulation,
+    PortfolioMonteCarloPath,
 )
 from .position_modes import normalize_position_modes
 from strategies.serializers import StrategyDefinitionSerializer
@@ -434,11 +436,14 @@ class BacktestListSerializer(serializers.ModelSerializer):
     """Lightweight serializer for Backtest list views - excludes nested objects"""
     strategy_name = serializers.CharField(source='strategy.name', read_only=True)
     symbols_count = serializers.SerializerMethodField()
+    parameter_set_signature = serializers.CharField(source='parameter_set_id', read_only=True, allow_null=True)
     
     class Meta:
         model = Backtest
         fields = [
             'id', 'name', 'strategy', 'strategy_name', 'strategy_assignment',
+            'parameter_set', 'parameter_set_signature', 'symbol_priority_order',
+            'monte_carlo_num_paths',
             'start_date', 'end_date', 'split_ratio',
             'initial_capital', 'bet_size_percentage', 'strategy_parameters',
             'hedge_enabled', 'run_strategy_only_baseline', 'hedge_config', 'position_modes',
@@ -466,18 +471,38 @@ class BacktestDetailSerializer(serializers.ModelSerializer):
     This dramatically improves performance for backtests with thousands of symbols.
     """
     strategy_name = serializers.CharField(source='strategy.name', read_only=True)
+    parameter_set_signature = serializers.CharField(source='parameter_set_id', read_only=True, allow_null=True)
+    parameter_set_label = serializers.SerializerMethodField()
+    monte_carlo_summary = serializers.SerializerMethodField()
     
     class Meta:
         model = Backtest
         fields = [
             'id', 'name', 'strategy', 'strategy_name', 'strategy_assignment', 'broker',
+            'parameter_set', 'parameter_set_signature', 'parameter_set_label',
+            'symbol_priority_order', 'monte_carlo_num_paths',
             'start_date', 'end_date', 'split_ratio',
             'initial_capital', 'bet_size_percentage', 'strategy_parameters',
             'hedge_enabled', 'run_strategy_only_baseline', 'hedge_config', 'position_modes',
             'status', 'error_message',
             'created_at', 'updated_at', 'completed_at',
+            'monte_carlo_summary',
         ]
         read_only_fields = ['created_at', 'updated_at', 'completed_at', 'status', 'error_message']
+
+    def get_parameter_set_label(self, obj):
+        ps = getattr(obj, 'parameter_set', None)
+        return (ps.label or '') if ps else ''
+
+    def get_monte_carlo_summary(self, obj):
+        sim = (
+            PortfolioMonteCarloSimulation.objects.filter(backtest=obj, status='completed')
+            .order_by('-created_at')
+            .first()
+        )
+        if not sim:
+            return None
+        return PortfolioMonteCarloSimulationSerializer(sim).data
 
 
 class BacktestSerializer(serializers.ModelSerializer):
@@ -550,6 +575,61 @@ class BacktestCreateSerializer(serializers.Serializer):
         data['position_modes'] = normalize_position_modes(data.get('position_modes'))
 
         return data
+
+
+class PortfolioMonteCarloPathSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PortfolioMonteCarloPath
+        fields = [
+            'id', 'path_index', 'symbol_order', 'final_equity', 'profit', 'blew_up',
+            'is_reference', 'equity_curve', 'performance_metrics',
+        ]
+
+
+class PortfolioMonteCarloSimulationSerializer(serializers.ModelSerializer):
+    variant_path_count = serializers.SerializerMethodField()
+    max_unique_permutations = serializers.SerializerMethodField()
+    total_permutations = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PortfolioMonteCarloSimulation
+        fields = [
+            'id', 'backtest', 'num_paths', 'status', 'error_message',
+            'reference_symbol_order', 'reference_profit', 'prob_broke', 'prob_profit_positive',
+            'mean_profit', 'median_profit', 'percentile_5', 'percentile_95',
+            'profit_histogram', 'reference_equity_curve', 'confidence_bands',
+            'sample_equity_curves', 'best_path', 'worst_path', 'sample_paths',
+            'mean_performance_metrics',
+            'variant_path_count', 'max_unique_permutations', 'total_permutations',
+            'created_at', 'updated_at', 'completed_at',
+        ]
+        read_only_fields = fields
+
+    def get_variant_path_count(self, obj):
+        return int(obj.num_paths or 0)
+
+    def _symbol_count(self, obj):
+        order = obj.reference_symbol_order or []
+        if order:
+            return len(order)
+        if obj.backtest_id:
+            return obj.backtest.symbols.count()
+        return 0
+
+    def get_total_permutations(self, obj):
+        from backtest_engine.services.order_permutations import permutation_count
+        return permutation_count(self._symbol_count(obj))
+
+    def get_max_unique_permutations(self, obj):
+        from backtest_engine.services.order_permutations import max_variant_runs
+        return max_variant_runs(self._symbol_count(obj))
+
+
+class PortfolioMonteCarloCreateSerializer(serializers.Serializer):
+    num_paths = serializers.IntegerField(required=False, default=500, min_value=1, max_value=2000)
+
+    def validate_num_paths(self, value):
+        return max(1, min(int(value), 2000))
 
 
 class HedgePreviewSerializer(serializers.Serializer):

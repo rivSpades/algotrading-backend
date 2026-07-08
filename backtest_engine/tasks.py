@@ -13,6 +13,7 @@ from .models import (
     SymbolBacktestRun,
     SymbolBacktestTrade,
     SymbolBacktestStatistics,
+    PortfolioMonteCarloSimulation,
 )
 from .position_modes import normalize_position_modes
 from .services.backtest_executor import BacktestExecutor
@@ -959,6 +960,9 @@ def run_backtest_task(self, backtest_id):
         backtest.completed_at = timezone.now()
         backtest.save()
 
+        from backtest_engine.services.monte_carlo_enqueue import maybe_enqueue_monte_carlo_for_backtest
+        maybe_enqueue_monte_carlo_for_backtest(backtest)
+
         logger.info(f"Backtest {backtest_id} completed successfully")
         
         # Calculate total trades count from all modes
@@ -1412,4 +1416,28 @@ def bulk_symbol_runs_queue_task(self, strategy_id: int, tickers: list, run_body:
         'total_failed': failed,
         'parameter_set': ps.signature,
     }
+
+
+@shared_task(bind=True, name='backtest_engine.run_portfolio_monte_carlo', time_limit=4 * 60 * 60, soft_time_limit=4 * 60 * 60)
+def run_portfolio_monte_carlo_task(self, simulation_id):
+    """Run Monte Carlo symbol-order permutations for a portfolio backtest."""
+    from backtest_engine.services.portfolio_monte_carlo import run_monte_carlo_simulation
+
+    def progress_callback(progress, message):
+        self.update_state(
+            state='PROGRESS',
+            meta={'progress': progress, 'message': message},
+        )
+
+    try:
+        simulation = run_monte_carlo_simulation(simulation_id, progress_callback=progress_callback)
+        return {
+            'simulation_id': simulation.id,
+            'status': simulation.status,
+            'prob_broke': simulation.prob_broke,
+            'mean_profit': str(simulation.mean_profit) if simulation.mean_profit is not None else None,
+        }
+    except Exception as exc:
+        logger.exception('Monte Carlo task failed for simulation %s', simulation_id)
+        return {'simulation_id': simulation_id, 'status': 'failed', 'error': str(exc)}
 

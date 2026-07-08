@@ -12,19 +12,21 @@ from .models import (
     SymbolBacktestTrade,
     SymbolBacktestStatistics,
     SymbolBacktestParameterSet,
+    PortfolioMonteCarloSimulation,
+    PortfolioMonteCarloPath,
 )
 
 
 @admin.register(Backtest)
 class BacktestAdmin(admin.ModelAdmin):
-    list_display = ['id', 'name', 'strategy', 'status', 'initial_capital', 'created_at', 'completed_at']
+    list_display = ['id', 'name', 'strategy', 'parameter_set', 'status', 'initial_capital', 'created_at', 'completed_at']
     list_filter = ['status', 'strategy', 'created_at', 'completed_at']
     search_fields = ['name', 'strategy__name', 'error_message']
     readonly_fields = ['created_at', 'updated_at', 'completed_at']
     filter_horizontal = ['symbols']  # Better UI for many-to-many relationships
     fieldsets = (
         ('Basic Information', {
-            'fields': ('name', 'strategy', 'strategy_assignment', 'symbols')
+            'fields': ('name', 'strategy', 'strategy_assignment', 'parameter_set', 'symbols', 'symbol_priority_order')
         }),
         ('Backtest Configuration', {
             'fields': (
@@ -189,3 +191,18 @@ class SymbolBacktestStatisticsAdmin(admin.ModelAdmin):
         ('Timestamps', {'fields': ('created_at', 'updated_at'), 'classes': ('collapse',)}),
     )
     date_hierarchy = 'created_at'
+
+
+@admin.register(PortfolioMonteCarloSimulation)
+class PortfolioMonteCarloSimulationAdmin(admin.ModelAdmin):
+    list_display = ['id', 'backtest', 'num_paths', 'status', 'prob_broke', 'mean_profit', 'created_at']
+    list_filter = ['status', 'created_at']
+    search_fields = ['backtest__name', 'backtest__strategy__name']
+    readonly_fields = ['created_at', 'updated_at', 'completed_at']
+
+
+@admin.register(PortfolioMonteCarloPath)
+class PortfolioMonteCarloPathAdmin(admin.ModelAdmin):
+    list_display = ['id', 'simulation', 'path_index', 'profit', 'blew_up', 'final_equity']
+    list_filter = ['blew_up', 'simulation']
+    search_fields = ['simulation__backtest__name']

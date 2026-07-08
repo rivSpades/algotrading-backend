@@ -9,11 +9,12 @@ from rest_framework.filters import SearchFilter, OrderingFilter
 from rest_framework.pagination import PageNumberPagination
 from django.shortcuts import get_object_or_404
 from django.db.models import Q
-from .models import Backtest, Trade, BacktestStatistics, SymbolBacktestRun, SymbolBacktestTrade, SymbolBacktestStatistics
+from .models import Backtest, Trade, BacktestStatistics, SymbolBacktestRun, SymbolBacktestTrade, SymbolBacktestStatistics, PortfolioMonteCarloSimulation, PortfolioMonteCarloPath
 from .serializers import (
     BacktestSerializer, BacktestListSerializer, BacktestDetailSerializer, BacktestCreateSerializer,
     TradeSerializer, BacktestStatisticsSerializer, HedgePreviewSerializer, HedgeLabSettingsWriteSerializer,
     SymbolBacktestTradeSerializer, SymbolBacktestStatisticsSerializer, SymbolBacktestRunSerializer,
+    PortfolioMonteCarloSimulationSerializer, PortfolioMonteCarloPathSerializer, PortfolioMonteCarloCreateSerializer,
 )
 from .services.hybrid_vix_hedge import (
     simulate_hybrid_vix_hedge,
@@ -413,6 +414,86 @@ class BacktestViewSet(viewsets.ModelViewSet):
                 {'error': f'Symbol {ticker} not found'},
                 status=status.HTTP_404_NOT_FOUND
             )
+
+    @action(detail=True, methods=['get', 'post'], url_path='monte-carlo')
+    def monte_carlo(self, request, pk=None):
+        """GET latest simulation; POST start new Monte Carlo over symbol priority orders."""
+        backtest = self.get_object()
+
+        if request.method == 'GET':
+            sim = (
+                PortfolioMonteCarloSimulation.objects.filter(backtest=backtest)
+                .order_by('-created_at')
+                .first()
+            )
+            if not sim:
+                return Response({'simulation': None})
+            return Response({'simulation': PortfolioMonteCarloSimulationSerializer(sim).data})
+
+        if backtest.status != 'completed':
+            return Response(
+                {'error': 'Backtest must be completed before Monte Carlo'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not backtest.parameter_set_id:
+            return Response(
+                {'error': 'Monte Carlo requires a portfolio backtest linked to a global test'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        running = PortfolioMonteCarloSimulation.objects.filter(
+            backtest=backtest,
+            status__in=['pending', 'running'],
+        ).exists()
+        if running:
+            return Response(
+                {'error': 'A Monte Carlo simulation is already running for this backtest'},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        ser = PortfolioMonteCarloCreateSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        from backtest_engine.services.order_permutations import cap_variant_request
+        from backtest_engine.tasks import run_portfolio_monte_carlo_task
+
+        tickers = list(backtest.symbol_priority_order or [])
+        if not tickers:
+            tickers = sorted(backtest.symbols.values_list('ticker', flat=True))
+        capped_paths, max_unique = cap_variant_request(len(tickers), ser.validated_data['num_paths'])
+
+        simulation = PortfolioMonteCarloSimulation.objects.create(
+            backtest=backtest,
+            num_paths=capped_paths,
+            reference_symbol_order=tickers,
+            status='pending',
+        )
+        task = run_portfolio_monte_carlo_task.delay(simulation.id)
+        data = PortfolioMonteCarloSimulationSerializer(simulation).data
+        data['task_id'] = task.id
+        data['max_unique_permutations'] = max_unique
+        return Response({'simulation': data}, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['get'], url_path='monte-carlo/paths')
+    def monte_carlo_paths(self, request, pk=None):
+        """Paginated Monte Carlo path outcomes for the latest simulation."""
+        backtest = self.get_object()
+        sim = (
+            PortfolioMonteCarloSimulation.objects.filter(backtest=backtest)
+            .order_by('-created_at')
+            .first()
+        )
+        if not sim:
+            return Response({'results': [], 'count': 0})
+
+        paths = sim.paths.all().order_by('path_index')
+        total = paths.count()
+        if total <= 200:
+            serializer = PortfolioMonteCarloPathSerializer(paths, many=True)
+            return Response({'results': serializer.data, 'count': total, 'next': None, 'previous': None})
+
+        paginator = TradePagination()
+        page = paginator.paginate_queryset(paths, request)
+        serializer = PortfolioMonteCarloPathSerializer(page, many=True)
+        return paginator.get_paginated_response(serializer.data)
 
 
 class SymbolBacktestRunViewSet(viewsets.ModelViewSet):

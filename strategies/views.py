@@ -22,7 +22,11 @@ from backtest_engine.models import (
     SymbolBacktestParameterSet,
 )
 from backtest_engine.position_modes import normalize_position_modes
-from backtest_engine.services.create_backtest import create_backtest_from_validated_data
+from backtest_engine.services.create_portfolio_from_parameter_set import (
+    create_portfolio_from_parameter_set,
+    get_latest_portfolio_for_parameter_set,
+)
+from backtest_engine.serializers import BacktestListSerializer
 from backtest_engine.tasks import run_symbol_backtest_run_task, bulk_symbol_runs_queue_task
 from backtest_engine.parameter_sets import build_symbol_run_parameter_payload, signature_for_payload
 from backtest_engine.position_modes import normalize_position_modes
@@ -546,6 +550,55 @@ class StrategyDefinitionViewSet(viewsets.ModelViewSet):
                 'label': ps.label or '',
                 'cells': cells,
             }
+        )
+
+    @action(
+        detail=True,
+        methods=['get', 'post'],
+        url_path=r'symbol-run-parameter-sets/(?P<signature>[0-9a-f]{64})/portfolio-backtest',
+    )
+    def parameter_set_portfolio_backtest(self, request, pk=None, signature=None):
+        """GET latest portfolio for a global test; POST create locked portfolio from completed singles."""
+        strategy = self.get_object()
+        try:
+            ps = SymbolBacktestParameterSet.objects.get(signature=signature, strategy=strategy)
+        except SymbolBacktestParameterSet.DoesNotExist:
+            return Response({'error': 'Parameter set not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        if request.method == 'GET':
+            bt = get_latest_portfolio_for_parameter_set(strategy, ps)
+            if not bt:
+                return Response({'portfolio_backtest': None})
+            return Response({
+                'portfolio_backtest': BacktestListSerializer(bt).data,
+                'parameter_set': ps.signature,
+                'parameter_set_label': ps.label or '',
+            })
+
+        name = (request.data.get('name') or '').strip()
+        try:
+            num_mc = int(request.data.get('num_monte_carlo_paths', 500))
+        except (TypeError, ValueError):
+            num_mc = 500
+        try:
+            backtest, task_id = create_portfolio_from_parameter_set(
+                strategy,
+                ps,
+                name=name,
+                num_monte_carlo_paths=num_mc,
+            )
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        data = BacktestListSerializer(backtest).data
+        data['task_id'] = task_id
+        return Response(
+            {
+                'portfolio_backtest': data,
+                'parameter_set': ps.signature,
+                'parameter_set_label': ps.label or '',
+            },
+            status=status.HTTP_201_CREATED,
         )
 
     @action(detail=True, methods=['delete'], url_path='symbol-runs')

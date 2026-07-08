@@ -6,6 +6,7 @@
 |---------|------|------|
 | `db` | PostgreSQL 16 | internal |
 | `redis` | Celery broker + Channels | internal |
+| `migrate` | One-shot migrations on startup | — |
 | `web` | Daphne ASGI (Django) | 8000 |
 | `celery_worker` | Background tasks | — |
 | `celery_beat` | Scheduled tasks | — |
@@ -17,7 +18,9 @@ cp .env.example .env   # configure DB, API keys
 docker compose up --build
 ```
 
-`web` runs migrations when `RUN_MIGRATIONS=true`.
+On every `docker compose up`, the **`migrate`** service runs first (`migrate --noinput` + `bootstrap_market_schedules`), then `web` and Celery start. No manual `migrate` step needed.
+
+Optional: set `RUN_MIGRATIONS=true` on a service to run migrations via `entrypoint.sh` instead (not used by default compose).
 
 ## Environment
 

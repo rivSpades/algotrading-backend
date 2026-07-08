@@ -80,6 +80,23 @@ class Backtest(models.Model):
         default=default_position_modes_list,
         help_text="Which directions to simulate: include 'long' and/or 'short' (at least one)",
     )
+    parameter_set = models.ForeignKey(
+        'backtest_engine.SymbolBacktestParameterSet',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='portfolio_backtests',
+        help_text="Parent global test (parameter set) when portfolio was created from single-symbol snapshots",
+    )
+    symbol_priority_order = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Symbol tickers in priority order for same-timestamp portfolio execution (lower index runs first)",
+    )
+    monte_carlo_num_paths = models.PositiveIntegerField(
+        default=500,
+        help_text="Order-variance Monte Carlo paths to run after portfolio completes (0 = skip)",
+    )
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
     error_message = models.TextField(blank=True, help_text="Error message if backtest failed")
     created_at = models.DateTimeField(auto_now_add=True)
@@ -536,3 +553,120 @@ class SymbolBacktestStatistics(models.Model):
     def __str__(self):
         symbol_str = self.symbol.ticker if self.symbol else "Run"
         return f"{self.run.strategy.name} - {symbol_str} Stats"
+
+
+class PortfolioMonteCarloSimulation(models.Model):
+    """Monte Carlo simulation over symbol priority order permutations for a portfolio backtest."""
+
+    STATUS_CHOICES = Backtest.STATUS_CHOICES
+
+    backtest = models.ForeignKey(
+        Backtest,
+        on_delete=models.CASCADE,
+        related_name='monte_carlo_simulations',
+    )
+    num_paths = models.PositiveIntegerField(default=500)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    error_message = models.TextField(blank=True)
+    reference_symbol_order = models.JSONField(default=list, blank=True)
+    reference_profit = models.DecimalField(
+        max_digits=20,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text='Profit from the saved portfolio backtest (matches Results tab)',
+    )
+    prob_broke = models.FloatField(null=True, blank=True, help_text="Fraction of paths with equity <= 0")
+    prob_profit_positive = models.FloatField(
+        null=True,
+        blank=True,
+        help_text="Fraction of paths with profit > 0",
+    )
+    mean_profit = models.DecimalField(max_digits=20, decimal_places=2, null=True, blank=True)
+    median_profit = models.DecimalField(max_digits=20, decimal_places=2, null=True, blank=True)
+    percentile_5 = models.DecimalField(max_digits=20, decimal_places=2, null=True, blank=True)
+    percentile_95 = models.DecimalField(max_digits=20, decimal_places=2, null=True, blank=True)
+    profit_histogram = models.JSONField(default=list, blank=True)
+    reference_equity_curve = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Portfolio backtest reference equity curve [{timestamp, equity}]",
+    )
+    confidence_bands = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Per-timestamp bands [{timestamp, p5, p25, p50, p75, p95}]",
+    )
+    sample_equity_curves = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Up to 20 sample path equity curves [{path_index, points:[{timestamp, equity}]}]",
+    )
+    best_path = models.JSONField(default=dict, blank=True)
+    worst_path = models.JSONField(default=dict, blank=True)
+    sample_paths = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Up to 10 sample paths for sparklines: [{path_index, symbol_order, profit, blew_up}]",
+    )
+    mean_performance_metrics = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text='Mean of performance_metrics across variant paths (excludes Run 0)',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['backtest', '-created_at']),
+            models.Index(fields=['status']),
+        ]
+        verbose_name = 'Portfolio Monte Carlo simulation'
+        verbose_name_plural = 'Portfolio Monte Carlo simulations'
+
+    def __str__(self):
+        return f'MC simulation #{self.id} for backtest {self.backtest_id} ({self.status})'
+
+
+class PortfolioMonteCarloPath(models.Model):
+    """Single Monte Carlo path outcome."""
+
+    simulation = models.ForeignKey(
+        PortfolioMonteCarloSimulation,
+        on_delete=models.CASCADE,
+        related_name='paths',
+    )
+    path_index = models.PositiveIntegerField()
+    symbol_order = models.JSONField(default=list, blank=True)
+    final_equity = models.DecimalField(max_digits=20, decimal_places=2)
+    profit = models.DecimalField(max_digits=20, decimal_places=2)
+    blew_up = models.BooleanField(default=False)
+    is_reference = models.BooleanField(
+        default=False,
+        help_text='True for path 0 — saved portfolio run (Results tab), not re-simulated',
+    )
+    equity_curve = models.JSONField(
+        default=list,
+        blank=True,
+        help_text='Subsampled equity curve [{timestamp, equity}]',
+    )
+    performance_metrics = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text='Portfolio performance metrics for this path (same keys as Results tab)',
+    )
+
+    class Meta:
+        ordering = ['path_index']
+        indexes = [
+            models.Index(fields=['simulation', 'path_index']),
+        ]
+        unique_together = [('simulation', 'path_index')]
+        verbose_name = 'Portfolio Monte Carlo path'
+        verbose_name_plural = 'Portfolio Monte Carlo paths'
+
+    def __str__(self):
+        return f'Path {self.path_index} (simulation {self.simulation_id})'

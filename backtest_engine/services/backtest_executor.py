@@ -32,7 +32,7 @@ _CASH_EPS = 1e-9
 class BacktestExecutor:
     """Executes backtests for trading strategies"""
     
-    def __init__(self, backtest, position_mode='long', preprocessed_data=None, hedge_overlay=None):
+    def __init__(self, backtest, position_mode='long', preprocessed_data=None, hedge_overlay=None, symbol_priority_order_override=None):
         """
         Initialize backtest executor
         
@@ -41,6 +41,7 @@ class BacktestExecutor:
             position_mode: 'long' (only long positions) or 'short' (only short positions)
             preprocessed_data: Optional dict of pre-processed symbol data from Phase 1 {symbol: {'df': DataFrame, 'indicators': dict, 'test_df': DataFrame, 'price_cache': dict}}
             hedge_overlay: Optional dict from compute_trade_hedge_overlay — splits each entry bet between strategy and VIX sleeve
+            symbol_priority_order_override: Optional list of tickers for same-timestamp priority (Monte Carlo paths)
         """
         self.backtest = backtest
         self.strategy = backtest.strategy
@@ -51,6 +52,8 @@ class BacktestExecutor:
         self.split_ratio = backtest.split_ratio
         self.position_mode = position_mode  # 'long' or 'short'
         self.preprocessed_data = preprocessed_data  # Pre-processed data from Phase 1
+        self._symbol_priority_order_override = symbol_priority_order_override
+        self.portfolio_blew_up = False
         
         # Determine symbols for this run.
         # Portfolio Backtest uses ManyToMany `symbols`; SymbolBacktestRun uses a single FK `symbol`.
@@ -566,6 +569,25 @@ class BacktestExecutor:
             return 0
         return 2
     
+    def _symbol_priority_rank(self) -> Dict[str, int]:
+        """Ticker -> priority index (lower runs first within same timestamp batch)."""
+        order = self._symbol_priority_order_override
+        if not order:
+            order = getattr(self.backtest, 'symbol_priority_order', None) or []
+        if not order:
+            order = sorted(s.ticker for s in self.symbols)
+        return {ticker: idx for idx, ticker in enumerate(order)}
+    
+    def get_portfolio_final_equity(self) -> float:
+        """Final portfolio equity after multi-symbol execution (shared capital)."""
+        if not self.equity_curves:
+            return float(self.backtest.initial_capital)
+        # All symbols share the same portfolio curve in multi-symbol mode
+        curve = next(iter(self.equity_curves.values()), [])
+        if not curve:
+            return float(self.backtest.initial_capital)
+        return float(curve[-1][1])
+    
     def _execute_strategy_multi_symbol(self):
         """Execute strategy for multiple symbols with shared portfolio capital
         
@@ -681,6 +703,8 @@ class BacktestExecutor:
             f"chronologically across {len(symbol_data)} symbols with shared capital"
         )
         
+        symbol_rank = self._symbol_priority_rank()
+        
         # OPTIMIZATION: Binary search for price lookup (O(log n) instead of O(n))
         def get_price_at_timestamp(symbol, timestamp):
             """Get price for symbol at timestamp using binary search (O(log n))"""
@@ -758,7 +782,7 @@ class BacktestExecutor:
                 signal = self._generate_signal(row, indicator_values, position, prev_indicator_values, symbol)
                 priority = self._same_timestamp_portfolio_priority(signal, position)
                 phase1.append((priority, symbol.ticker, _ts, symbol, idx, price, signal, indicator_values))
-            phase1.sort(key=lambda x: (x[0], x[1]))
+            phase1.sort(key=lambda x: (x[0], symbol_rank.get(x[1], 999), x[1]))
             for _, _, _ts, symbol, idx, price, signal, indicator_values in phase1:
                 position = positions[symbol]
                 indicators = symbol_data[symbol]['indicators']
@@ -767,6 +791,7 @@ class BacktestExecutor:
                 current_portfolio_equity = portfolio_cash_available + portfolio_cash_invested
                 if current_portfolio_equity <= 0:
                     logger.info(f"[{self.position_mode.upper()}] Portfolio equity ({current_portfolio_equity:.2f}) <= 0. Stopping execution (account blown up). Individual symbol stats will still be calculated independently.")
+                    self.portfolio_blew_up = True
                     for sym, pos in positions.items():
                         if pos is not None:
                             if sym == symbol:
