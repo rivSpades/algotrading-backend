@@ -14,8 +14,9 @@ import numpy as np
 import pandas as pd
 from django.utils import timezone
 
-from market_data.models import Exchange, OHLCV, Symbol
+from market_data.models import OHLCV, Symbol
 from market_data.providers.yahoo_finance import YahooFinanceProvider
+from market_data.services.benchmark_symbols import get_or_create_benchmark_symbol
 from market_data.services.ohlcv_service import OHLCVService
 
 logger = logging.getLogger(__name__)
@@ -26,7 +27,6 @@ HEDGE_TICKERS = ("SPY", "VIXM", "VIXY", "^VIX")
 HEDGE_VOL_ETF_TICKERS = frozenset({"VIXM", "VIXY"})
 # Minimum daily bars to trust DB-only; below this we try Yahoo in-memory (no DB write).
 _MIN_DAILY_BARS = 20
-BENCHMARK_EXCHANGE_CODE = "BENCHMARK"
 
 DEFAULT_HEDGE_CONFIG: Dict[str, Any] = {
     "z_threshold": 1.5,
@@ -112,26 +112,7 @@ def _ts_to_utc_midnight(dt) -> pd.Timestamp:
 
 
 def _get_or_create_hedge_symbol(ticker: str) -> Symbol:
-    exchange, _ = Exchange.objects.get_or_create(
-        code=BENCHMARK_EXCHANGE_CODE,
-        defaults={
-            "name": "Benchmark indices",
-            "country": "US",
-            "timezone": "America/New_York",
-        },
-    )
-    provider = OHLCVService.get_or_create_yahoo_provider()
-    sym, _ = Symbol.objects.get_or_create(
-        ticker=ticker,
-        defaults={
-            "exchange": exchange,
-            "provider": provider,
-            "type": "etf",
-            "name": ticker,
-            "status": "active",
-        },
-    )
-    return sym
+    return get_or_create_benchmark_symbol(ticker)
 
 
 def _yahoo_may_persist(symbol: Symbol) -> bool:

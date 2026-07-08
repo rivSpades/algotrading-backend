@@ -1,19 +1,18 @@
-"""
-Signals for automatically creating/updating strategy definitions
-"""
+"""Django lifecycle hooks for the strategies app (post_migrate, etc.)."""
 
 from django.db.models.signals import post_migrate
 from django.dispatch import receiver
-from .models import StrategyDefinition
+
 from .config import STRATEGY_DEFINITIONS
+from .models import StrategyDefinition
 
 
 @receiver(post_migrate)
 def create_strategy_definitions(sender, **kwargs):
-    """Create or update strategy definitions after migrations"""
+    """Create or update strategy definitions after migrations."""
     if sender.name != 'strategies':
         return
-    
+
     for strategy_data in STRATEGY_DEFINITIONS:
         strategy, created = StrategyDefinition.objects.update_or_create(
             name=strategy_data['name'],
@@ -25,10 +24,9 @@ def create_strategy_definitions(sender, **kwargs):
                 'required_tool_configs': strategy_data.get('required_tool_configs', []),
                 'example_code': strategy_data.get('example_code', ''),
                 'globally_enabled': strategy_data.get('globally_enabled', False),
-            }
+            },
         )
         if created:
-            print(f"Created strategy definition: {strategy.name}")
+            print(f'Created strategy definition: {strategy.name}')
         else:
-            print(f"Updated strategy definition: {strategy.name}")
-
+            print(f'Updated strategy definition: {strategy.name}')

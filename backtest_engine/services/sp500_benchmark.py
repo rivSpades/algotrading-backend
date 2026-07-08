@@ -12,14 +12,14 @@ from typing import Any, Dict, List, Tuple
 import pandas as pd
 from django.utils import timezone
 
-from market_data.models import Exchange, OHLCV, Symbol
+from market_data.models import OHLCV, Symbol
 from market_data.providers.yahoo_finance import YahooFinanceProvider
+from market_data.services.benchmark_symbols import get_or_create_benchmark_symbol
 from market_data.services.ohlcv_service import OHLCVService
 
 logger = logging.getLogger(__name__)
 
 BENCHMARK_TICKER = "^GSPC"
-BENCHMARK_EXCHANGE_CODE = "BENCHMARK"
 
 
 def _normalize_ts(ts) -> datetime:
@@ -36,28 +36,13 @@ def _normalize_ts(ts) -> datetime:
     return ts
 
 
-def get_or_create_benchmark_symbol() -> Symbol:
+def get_or_create_sp500_benchmark_symbol() -> Symbol:
     """Ensure ^GSPC exists for OHLCV storage."""
-    exchange, _ = Exchange.objects.get_or_create(
-        code=BENCHMARK_EXCHANGE_CODE,
-        defaults={
-            "name": "Benchmark indices",
-            "country": "US",
-            "timezone": "America/New_York",
-        },
+    return get_or_create_benchmark_symbol(
+        BENCHMARK_TICKER,
+        name="S&P 500",
+        symbol_type="etf",
     )
-    provider = OHLCVService.get_or_create_yahoo_provider()
-    sym, _ = Symbol.objects.get_or_create(
-        ticker=BENCHMARK_TICKER,
-        defaults={
-            "exchange": exchange,
-            "provider": provider,
-            "type": "etf",
-            "name": "S&P 500",
-            "status": "active",
-        },
-    )
-    return sym
 
 
 def _load_db_bars(symbol: Symbol, start: datetime, end: datetime) -> List[Tuple[datetime, float]]:
@@ -100,7 +85,7 @@ def compute_sp500_buy_hold_curve(
     end_query = t1 + timedelta(days=5)
     initial_capital = float(initial_capital)
 
-    symbol = get_or_create_benchmark_symbol()
+    symbol = get_or_create_sp500_benchmark_symbol()
     bars = _load_db_bars(symbol, start_query, end_query)
 
     covered, _ = OHLCVService.check_date_range_coverage(

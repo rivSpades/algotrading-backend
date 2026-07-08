@@ -268,6 +268,34 @@ class BacktestViewSet(viewsets.ModelViewSet):
         )
         return Response(result)
 
+    @action(detail=False, methods=['get', 'put'], url_path='hedge-lab-settings')
+    def hedge_lab_settings(self, request):
+        """GET: saved overrides + full effective defaults. PUT: save lab overrides."""
+        if request.method == 'GET':
+            saved = get_hedge_lab_saved_overrides()
+            effective = merge_defaults_into_hedge_config(saved)
+            return Response(
+                {
+                    'hedge_config': saved,
+                    'effective_config': effective,
+                }
+            )
+        ser = HedgeLabSettingsWriteSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        from .models import HedgeLabSettings
+
+        row = HedgeLabSettings.get_solo()
+        row.hedge_config = ser.validated_data['hedge_config']
+        row.save(update_fields=['hedge_config', 'updated_at'])
+        saved = get_hedge_lab_saved_overrides()
+        effective = merge_defaults_into_hedge_config(saved)
+        return Response(
+            {
+                'hedge_config': saved,
+                'effective_config': effective,
+            }
+        )
+
     @action(detail=True, methods=['get'])
     def statistics(self, request, pk=None):
         """Get all statistics for a backtest"""
@@ -475,34 +503,6 @@ class SymbolBacktestRunViewSet(viewsets.ModelViewSet):
                 'equity_curve_y': serializer.data.get('equity_curve_y', []),
             })
         return Response(result)
-
-    @action(detail=False, methods=['get', 'put'], url_path='hedge-lab-settings')
-    def hedge_lab_settings(self, request):
-        """GET: saved overrides + full effective defaults. PUT: save lab overrides."""
-        if request.method == 'GET':
-            saved = get_hedge_lab_saved_overrides()
-            effective = merge_defaults_into_hedge_config(saved)
-            return Response(
-                {
-                    'hedge_config': saved,
-                    'effective_config': effective,
-                }
-            )
-        ser = HedgeLabSettingsWriteSerializer(data=request.data)
-        ser.is_valid(raise_exception=True)
-        from .models import HedgeLabSettings
-
-        row = HedgeLabSettings.get_solo()
-        row.hedge_config = ser.validated_data['hedge_config']
-        row.save(update_fields=['hedge_config', 'updated_at'])
-        saved = get_hedge_lab_saved_overrides()
-        effective = merge_defaults_into_hedge_config(saved)
-        return Response(
-            {
-                'hedge_config': saved,
-                'effective_config': effective,
-            }
-        )
 
 
 class TradeViewSet(viewsets.ReadOnlyModelViewSet):

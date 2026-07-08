@@ -7,5 +7,6 @@ class StrategiesConfig(AppConfig):
 
     def ready(self):
         """Initialize strategy definitions on app startup"""
-        from . import signals  # noqa
+        from . import lifecycle  # noqa: F401 — post_migrate hook
+        from . import signals  # noqa: F401 — register signal handlers package
 

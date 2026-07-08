@@ -21,14 +21,9 @@ from backtest_engine.services.hybrid_vix_hedge import HEDGE_VOL_ETF_TICKERS
 from market_data.models import OHLCV
 from market_data.models import ExchangeSchedule
 
-from ..models import LiveTrade, SymbolBrokerAssociation
-from ._rules import gap_up_gap_down_decision
+from ..models import LiveTrade
 from .base import (
-    SIGNAL_EXIT_LONG,
-    SIGNAL_EXIT_SHORT,
     SIGNAL_HOLD,
-    SIGNAL_LONG,
-    SIGNAL_SHORT,
     BaseLiveTradingEngine,
     EngineEvaluation,
     LiveSignal,
@@ -262,22 +257,42 @@ class GapUpGapDownLiveEngine(BaseLiveTradingEngine):
         # Today's gap return uses broker session open vs DB previous close.
         returns_value = (today_open - prev_close) / prev_close
 
-        decision = gap_up_gap_down_decision(
-            returns=returns_value,
-            std=std_value,
-            threshold=threshold,
+        from strategies.signals import (
+            GAP_STRATEGY_NAME,
+            StrategySignalContext,
+            check_strategy_signal,
+            position_state_from_live,
+            resolve_broker_side_capabilities,
+            to_live_action,
         )
 
-        long_allowed, short_allowed = self._broker_side_capabilities(deployment_symbol)
+        long_allowed, short_allowed = resolve_broker_side_capabilities(
+            deployment_symbol.symbol,
+            self.deployment.broker,
+        )
         position = self._latest_open_position(deployment_symbol)
-
-        action, reason = self._classify_action(
-            deployment_symbol=deployment_symbol,
-            decision=decision,
-            long_allowed=long_allowed,
-            short_allowed=short_allowed,
-            position=position,
+        pos_state = (
+            position_state_from_live(position.position_mode)
+            if position is not None
+            else position_state_from_live(None)
         )
+
+        signal_result = check_strategy_signal(
+            GAP_STRATEGY_NAME,
+            StrategySignalContext(
+                returns=returns_value,
+                std=std_value,
+                threshold=threshold,
+                position_mode=deployment_symbol.position_mode,
+                position_state=pos_state,
+                long_allowed=long_allowed,
+                short_allowed=short_allowed,
+                parameters=dict(self.parameters or {}),
+            ),
+        )
+        action = to_live_action(signal_result)
+        reason = signal_result.reason
+        decision = signal_result.decision
 
         signal = LiveSignal(
             action=action,
@@ -305,6 +320,7 @@ class GapUpGapDownLiveEngine(BaseLiveTradingEngine):
                 'position_side': position.position_mode if position else None,
                 'reason': reason,
                 'rule_context': decision.context,
+                **signal_result.context,
             },
         )
 
@@ -321,70 +337,6 @@ class GapUpGapDownLiveEngine(BaseLiveTradingEngine):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-
-    def _classify_action(
-        self,
-        *,
-        deployment_symbol,
-        decision,
-        long_allowed: bool,
-        short_allowed: bool,
-        position: Optional[LiveTrade],
-    ) -> tuple[str, str]:
-        """Translate a `GapDecision` + position state into a `LiveSignal.action`.
-
-        The caller (Phase 5 task) decides whether to actually place an order;
-        this only describes *what* should happen.
-        """
-
-        mode = deployment_symbol.position_mode
-
-        # Exit takes priority over entry.
-        if position is not None:
-            if position.position_mode == 'long':
-                if mode == 'short':
-                    return SIGNAL_EXIT_LONG, 'mode_disallows_long'
-                if mode == 'long' and decision.short_signal:
-                    return SIGNAL_EXIT_LONG, 'opposite_signal_long'
-            elif position.position_mode == 'short':
-                if mode == 'long':
-                    return SIGNAL_EXIT_SHORT, 'mode_disallows_short'
-                if mode == 'short' and decision.long_signal:
-                    return SIGNAL_EXIT_SHORT, 'opposite_signal_short'
-            return SIGNAL_HOLD, 'in_position_no_exit'
-
-        # No position: check entries.
-        if decision.direction is None:
-            return SIGNAL_HOLD, decision.context.get('reason', 'no_signal')
-
-        if decision.direction == 'long' and mode in ('long', 'all') and long_allowed:
-            return SIGNAL_LONG, 'long_entry'
-        if decision.direction == 'short' and mode in ('short', 'all') and short_allowed:
-            return SIGNAL_SHORT, 'short_entry'
-
-        if decision.direction == 'long' and mode == 'short':
-            return SIGNAL_HOLD, 'long_signal_but_short_only'
-        if decision.direction == 'short' and mode == 'long':
-            return SIGNAL_HOLD, 'short_signal_but_long_only'
-        if decision.direction == 'long' and not long_allowed:
-            return SIGNAL_HOLD, 'long_disabled_by_broker'
-        if decision.direction == 'short' and not short_allowed:
-            return SIGNAL_HOLD, 'short_disabled_by_broker'
-
-        return SIGNAL_HOLD, 'no_actionable_path'
-
-    def _broker_side_capabilities(self, deployment_symbol) -> tuple[bool, bool]:
-        """Return (long_allowed, short_allowed) per the broker association."""
-        try:
-            assoc = SymbolBrokerAssociation.objects.get(
-                broker=self.deployment.broker,
-                symbol=deployment_symbol.symbol,
-            )
-        except SymbolBrokerAssociation.DoesNotExist:
-            # No explicit association = unrestricted from a capability angle.
-            # The deployment's `position_mode` still constrains entries.
-            return True, True
-        return bool(assoc.long_active), bool(assoc.short_active)
 
     def _latest_open_position(self, deployment_symbol) -> Optional[LiveTrade]:
         return (
