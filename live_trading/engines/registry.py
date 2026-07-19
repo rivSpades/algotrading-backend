@@ -34,19 +34,6 @@ class LiveEngineRegistry:
     def get(cls, strategy_name: str) -> Optional[Type[BaseLiveTradingEngine]]:
         return cls._engines.get(strategy_name)
 
-    @classmethod
-    def has(cls, strategy_name: str) -> bool:
-        return strategy_name in cls._engines
-
-    @classmethod
-    def names(cls) -> list[str]:
-        return sorted(cls._engines.keys())
-
-    @classmethod
-    def clear(cls) -> None:
-        """Wipe the registry. Tests use this for isolated runs."""
-        cls._engines.clear()
-
 
 def register_live_engine(strategy_name: str):
     """Decorator that registers `engine_class` for `strategy_name`."""
@@ -55,11 +42,6 @@ def register_live_engine(strategy_name: str):
         return LiveEngineRegistry.register(strategy_name, engine_class)
 
     return decorator
-
-
-def get_live_engine(strategy_name: str) -> Optional[Type[BaseLiveTradingEngine]]:
-    """Return the engine class registered for `strategy_name` (or None)."""
-    return LiveEngineRegistry.get(strategy_name)
 
 
 def get_live_engine_for_deployment(deployment) -> Optional[Type[BaseLiveTradingEngine]]:

@@ -245,40 +245,6 @@ class StrategyDeploymentCoreSerializer(serializers.ModelSerializer):
         return obj.deployment_symbols.filter(status='active').count()
 
 
-class StrategyDeploymentDetailSerializer(serializers.ModelSerializer):
-    """Full deployment with nested symbols (e.g. internal or explicit include)."""
-
-    strategy_name = serializers.CharField(source='strategy.name', read_only=True)
-    broker_name = serializers.CharField(source='broker.name', read_only=True)
-    parameter_set_label = serializers.CharField(source='parameter_set.label', read_only=True)
-    deployment_symbols = DeploymentSymbolSerializer(many=True, read_only=True)
-
-    class Meta:
-        model = StrategyDeployment
-        fields = [
-            'id', 'name', 'strategy', 'strategy_name',
-            'parameter_set', 'parameter_set_label',
-            'broker', 'broker_name',
-            'position_mode', 'deployment_type', 'status',
-            'initial_capital', 'bet_size_percentage', 'strategy_parameters',
-            'hedge_enabled', 'hedge_config',
-            'evaluation_criteria', 'evaluation_results',
-            'parent_deployment',
-            'deployment_symbols',
-            'last_signal_at', 'last_error',
-            'started_at', 'activated_at', 'evaluated_at',
-            'created_at', 'updated_at',
-        ]
-        read_only_fields = [
-            'strategy_name', 'broker_name', 'parameter_set_label',
-            'deployment_symbols',
-            'last_signal_at', 'last_error',
-            'started_at', 'activated_at', 'evaluated_at',
-            'created_at', 'updated_at',
-            'evaluation_results',
-        ]
-
-
 class SymbolOverrideSerializer(serializers.Serializer):
     """One symbol override entry sent in deployment create."""
 

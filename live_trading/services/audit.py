@@ -9,7 +9,7 @@ dashboard and trace what task / user performed each step.
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -19,19 +19,37 @@ LEVEL_TO_LOGGING = {
     'error': logging.ERROR,
 }
 
+# Literal aliases mirroring `DeploymentEvent` choices. Importing the model at
+# module import time is heavy (Django apps not ready), so we derive the literal
+# sets from the choice tuples lazily via the model when needed; for typing we
+# declare the closed sets explicitly here.
+EventType = Literal[
+    'deploy_created', 'deploy_activated', 'deploy_paused', 'deploy_stopped',
+    'deploy_failed', 'promote_to_real',
+    'symbol_added', 'symbol_disabled', 'symbol_flagged', 'symbol_enabled',
+    'symbol_pending_enable', 'color_changed',
+    'task_tick', 'signal_evaluated', 'order_placed', 'order_filled',
+    'order_failed', 'trade_opened', 'trade_closed', 'positions_synced',
+    'recalc_started', 'recalc_finished',
+    'evaluation_passed', 'evaluation_failed',
+    'error', 'info',
+]
+ActorType = Literal['user', 'task', 'system', 'broker']
+LogLevel = Literal['info', 'warning', 'error']
+
 
 def log_event(
-    deployment=None,
+    deployment: Optional[Any] = None,
     *,
-    event_type: str,
-    actor_type: str = 'system',
+    event_type: EventType,
+    actor_type: ActorType = 'system',
     actor_id: Optional[str] = None,
-    deployment_symbol=None,
-    level: str = 'info',
+    deployment_symbol: Optional[Any] = None,
+    level: LogLevel = 'info',
     message: str = '',
     context: Optional[dict[str, Any]] = None,
     error: Optional[BaseException | str] = None,
-):
+) -> Optional[Any]:
     """Persist a `DeploymentEvent` row and mirror it into the python logger.
 
     Args:

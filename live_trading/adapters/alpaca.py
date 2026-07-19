@@ -10,8 +10,27 @@ from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, timezone as dt_tz
 from django.utils import timezone
 
-from .base import BaseBrokerAdapter, OrderResult, PositionInfo
+from .base import (
+    BaseBrokerAdapter,
+    OrderResult,
+    OrderSide,
+    OrderType,
+    PositionInfo,
+    PositionSide,
+)
 from ..models import Broker
+
+
+def _normalize_side(side) -> OrderSide:
+    if isinstance(side, OrderSide):
+        return side
+    return OrderSide(str(side).lower())
+
+
+def _normalize_order_type(order_type) -> OrderType:
+    if isinstance(order_type, OrderType):
+        return order_type
+    return OrderType(str(order_type).lower())
 
 logger = logging.getLogger(__name__)
 
@@ -269,48 +288,50 @@ class AlpacaBrokerAdapter(BaseBrokerAdapter):
     def place_order(
         self,
         symbol: str,
-        side: str,  # 'buy' or 'sell'
+        side,  # OrderSide | str ('buy'/'sell')
         quantity: Decimal,
-        order_type: str = 'market',
+        order_type='market',  # OrderType | str
         limit_price: Optional[Decimal] = None,
         stop_price: Optional[Decimal] = None
     ) -> OrderResult:
         """
         Place an order
-        
+
         Args:
             symbol: Symbol ticker
-            side: 'buy' or 'sell'
+            side: `OrderSide` (or 'buy'/'sell')
             quantity: Number of shares
-            order_type: Order type (default: 'market')
+            order_type: `OrderType` (or 'market'/'limit'/'stop'/'stop_limit')
             limit_price: Limit price (for limit orders)
             stop_price: Stop price (for stop orders)
-        
+
         Returns:
             OrderResult: Order execution result
         """
         try:
+            side_enum = _normalize_side(side)
+            otype_enum = _normalize_order_type(order_type)
             qty_str = format(quantity, 'f')
             order_data = {
                 'symbol': symbol,
                 'qty': qty_str,
-                'side': side,
-                'type': order_type,
+                'side': side_enum.value,
+                'type': otype_enum.value,
                 'time_in_force': 'day',
             }
-            
+
             if limit_price:
                 order_data['limit_price'] = str(limit_price)
             if stop_price:
                 order_data['stop_price'] = str(stop_price)
-            
+
             response = requests.post(
                 f'{self.base_url}/v2/orders',
                 headers=self.headers,
                 json=order_data,
                 timeout=10
             )
-            
+
             if response.status_code == 200 or response.status_code == 201:
                 order = response.json()
                 # Alpaca sometimes returns '' for these fields until filled.
@@ -320,7 +341,7 @@ class AlpacaBrokerAdapter(BaseBrokerAdapter):
                 return OrderResult(
                     order_id=str(order.get('id', '')),
                     symbol=symbol,
-                    side=side,
+                    side=side_enum,
                     quantity=quantity,
                     filled_quantity=filled_qty,
                     price=filled_price if filled_qty > 0 else Decimal('0'),
@@ -342,7 +363,7 @@ class AlpacaBrokerAdapter(BaseBrokerAdapter):
                 return OrderResult(
                     order_id='',
                     symbol=symbol,
-                    side=side,
+                    side=side_enum,
                     quantity=quantity,
                     filled_quantity=Decimal('0'),
                     price=Decimal('0'),
@@ -354,7 +375,7 @@ class AlpacaBrokerAdapter(BaseBrokerAdapter):
             return OrderResult(
                 order_id='',
                 symbol=symbol,
-                side=side,
+                side=_normalize_side(side),
                 quantity=quantity,
                 filled_quantity=Decimal('0'),
                 price=Decimal('0'),

@@ -29,10 +29,9 @@ from .base import (
     LiveSignal,
 )
 from .registry import register_live_engine
+from strategies.signals import GAP_STRATEGY_NAME as STRATEGY_NAME
 
 logger = logging.getLogger(__name__)
-
-STRATEGY_NAME = 'Gap-Up and Gap-Down'
 
 #: Buffer added on top of `std_period` so the rolling indicators have settled.
 DEFAULT_BAR_BUFFER = 5
@@ -160,14 +159,15 @@ class GapUpGapDownLiveEngine(BaseLiveTradingEngine):
         )
 
         # Fetch today's session open from the broker adapter (minute bars).
-        today_open = None
+        # Keep as Decimal to avoid Decimal -> float -> Decimal round-trips on
+        # the `price` field; convert to float only for the returns ratio math.
+        today_open: Optional[Decimal] = None
         if self.broker_adapter is not None and hasattr(self.broker_adapter, 'get_session_open_price'):
-            today_open_dec = self.broker_adapter.get_session_open_price(
+            today_open = self.broker_adapter.get_session_open_price(
                 ticker,
                 session_open=session_open,
                 window_minutes=6,
             )
-            today_open = float(today_open_dec) if today_open_dec is not None else None
 
         if today_open is None or not (today_open > 0 and prev_close > 0):
             return EngineEvaluation(
@@ -182,7 +182,7 @@ class GapUpGapDownLiveEngine(BaseLiveTradingEngine):
                     bar_date=session_date,
                     context={
                         'reason': 'missing_open_or_prev_close',
-                        'today_open': today_open,
+                        'today_open': float(today_open) if today_open is not None else None,
                         'prev_close': prev_close,
                         'prev_close_timestamp': prev_bar.timestamp.isoformat() if prev_bar.timestamp else None,
                         'session_open_utc': session_open.isoformat(),
@@ -255,7 +255,7 @@ class GapUpGapDownLiveEngine(BaseLiveTradingEngine):
             )
 
         # Today's gap return uses broker session open vs DB previous close.
-        returns_value = (today_open - prev_close) / prev_close
+        returns_value = (float(today_open) - prev_close) / prev_close
 
         from strategies.signals import (
             GAP_STRATEGY_NAME,
@@ -297,7 +297,7 @@ class GapUpGapDownLiveEngine(BaseLiveTradingEngine):
         signal = LiveSignal(
             action=action,
             confidence=_decision_confidence(decision),
-            price=Decimal(str(today_open)),
+            price=today_open,
             bar_timestamp=session_open,
             bar_date=session_date,
             context={
@@ -309,7 +309,7 @@ class GapUpGapDownLiveEngine(BaseLiveTradingEngine):
                 'long_signal': decision.long_signal,
                 'short_signal': decision.short_signal,
                 'raw_direction': decision.direction,
-                'today_open': today_open,
+                'today_open': float(today_open),
                 'prev_close': prev_close,
                 'prev_close_timestamp': prev_bar.timestamp.isoformat() if prev_bar.timestamp else None,
                 'session_open_utc': session_open.isoformat(),

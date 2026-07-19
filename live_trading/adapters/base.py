@@ -4,10 +4,48 @@ Defines the interface that all broker adapters must implement
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 from decimal import Decimal
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
+
+if TYPE_CHECKING:
+    from ..models import Broker
+
+
+class OrderSide(str, Enum):
+    """Canonical broker order side. `str, Enum` so it compares equal to its value."""
+    BUY = 'buy'
+    SELL = 'sell'
+
+
+class OrderStatus(str, Enum):
+    """Canonical broker order status (normalized across vendors)."""
+    NEW = 'new'
+    PENDING = 'pending'
+    ACCEPTED = 'accepted'
+    PARTIAL = 'partial'
+    FILLED = 'filled'
+    REJECTED = 'rejected'
+    CANCELED = 'canceled'
+    CANCELLED = 'cancelled'
+    EXPIRED = 'expired'
+    DONE = 'done'
+
+
+class OrderType(str, Enum):
+    """Canonical broker order type."""
+    MARKET = 'market'
+    LIMIT = 'limit'
+    STOP = 'stop'
+    STOP_LIMIT = 'stop_limit'
+
+
+class PositionSide(str, Enum):
+    """Canonical broker position side."""
+    LONG = 'long'
+    SHORT = 'short'
 
 
 @dataclass
@@ -15,11 +53,11 @@ class OrderResult:
     """Result of an order execution"""
     order_id: str
     symbol: str
-    side: str  # 'buy' or 'sell'
+    side: Union[OrderSide, str]
     quantity: Decimal
     filled_quantity: Decimal
     price: Decimal
-    status: str  # 'filled', 'partial', 'rejected', 'pending'
+    status: Union[OrderStatus, str]
     timestamp: datetime
     broker_order_id: Optional[str] = None
     fees: Optional[Decimal] = None
@@ -34,7 +72,7 @@ class PositionInfo:
     average_price: Decimal
     current_price: Decimal
     unrealized_pnl: Decimal
-    position_type: str  # 'long' or 'short'
+    position_type: Union[PositionSide, str]
     timestamp: datetime
 
 
@@ -46,10 +84,10 @@ class BaseBrokerAdapter(ABC):
     to provide a unified API for trade execution.
     """
     
-    def __init__(self, broker, paper_trading: bool = True):
+    def __init__(self, broker: 'Broker', paper_trading: bool = True):
         """
         Initialize the broker adapter
-        
+
         Args:
             broker: Broker model instance
             paper_trading: Whether to use paper trading credentials (True) or real money (False)
@@ -101,23 +139,23 @@ class BaseBrokerAdapter(ABC):
     def place_order(
         self,
         symbol: str,
-        side: str,
+        side: Union[OrderSide, str],
         quantity: Decimal,
-        order_type: str = 'market',
+        order_type: Union[OrderType, str] = OrderType.MARKET,
         limit_price: Optional[Decimal] = None,
         stop_price: Optional[Decimal] = None
     ) -> OrderResult:
         """
         Place an order
-        
+
         Args:
             symbol: Symbol ticker
-            side: 'buy' or 'sell'
+            side: `OrderSide` (or 'buy'/'sell')
             quantity: Quantity to trade
-            order_type: 'market', 'limit', 'stop', 'stop_limit'
+            order_type: `OrderType` (or 'market'/'limit'/'stop'/'stop_limit')
             limit_price: Limit price (required for limit orders)
             stop_price: Stop price (required for stop orders)
-        
+
         Returns:
             OrderResult instance
         """

@@ -13,14 +13,28 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
+
+from strategies.signals.types import (
+    LIVE_SIGNAL_EXIT_LONG,
+    LIVE_SIGNAL_EXIT_SHORT,
+    LIVE_SIGNAL_HOLD,
+    LIVE_SIGNAL_LONG,
+    LIVE_SIGNAL_SHORT,
+)
+
+if TYPE_CHECKING:
+    from ..adapters.base import BaseBrokerAdapter
+    from ..models import DeploymentSymbol, StrategyDeployment
 
 
-SIGNAL_LONG = 'long'
-SIGNAL_SHORT = 'short'
-SIGNAL_EXIT_LONG = 'exit_long'
-SIGNAL_EXIT_SHORT = 'exit_short'
-SIGNAL_HOLD = 'hold'
+# Backward-compatible aliases — the canonical source is
+# `strategies.signals.types` (single source of truth for backtest + live).
+SIGNAL_LONG = LIVE_SIGNAL_LONG
+SIGNAL_SHORT = LIVE_SIGNAL_SHORT
+SIGNAL_EXIT_LONG = LIVE_SIGNAL_EXIT_LONG
+SIGNAL_EXIT_SHORT = LIVE_SIGNAL_EXIT_SHORT
+SIGNAL_HOLD = LIVE_SIGNAL_HOLD
 
 VALID_SIGNALS = {
     SIGNAL_LONG,
@@ -133,10 +147,10 @@ class BaseLiveTradingEngine(ABC):
 
     def __init__(
         self,
-        deployment,
+        deployment: 'StrategyDeployment',
         *,
-        broker_adapter=None,
-        clock=None,
+        broker_adapter: Optional['BaseBrokerAdapter'] = None,
+        clock: Optional[Callable[[], datetime]] = None,
     ) -> None:
         self.deployment = deployment
         self.strategy = deployment.strategy
@@ -149,22 +163,22 @@ class BaseLiveTradingEngine(ABC):
     # ------------------------------------------------------------------
 
     @abstractmethod
-    def evaluate(self, deployment_symbol, fire_at: datetime) -> EngineEvaluation:
+    def evaluate(self, deployment_symbol: 'DeploymentSymbol', fire_at: datetime) -> EngineEvaluation:
         """Evaluate the engine for a single deployment symbol at `fire_at`."""
 
     # ------------------------------------------------------------------
     # Optional hooks
     # ------------------------------------------------------------------
 
-    def on_market_open(self, deployment_symbol, fire_at: datetime) -> EngineEvaluation:
+    def on_market_open(self, deployment_symbol: 'DeploymentSymbol', fire_at: datetime) -> EngineEvaluation:
         """Default market-open hook delegates to `evaluate`."""
         return self.evaluate(deployment_symbol, fire_at)
 
-    def on_market_close(self, deployment_symbol, fire_at: datetime) -> Optional[EngineEvaluation]:
+    def on_market_close(self, deployment_symbol: 'DeploymentSymbol', fire_at: datetime) -> Optional[EngineEvaluation]:
         """Default close-hook is a no-op; override when the strategy needs it."""
         return None
 
-    def on_weekend_recalc_done(self, deployment_symbol) -> None:
+    def on_weekend_recalc_done(self, deployment_symbol: 'DeploymentSymbol') -> None:
         """Hook fired after the weekend snapshot recalc settles."""
         return None
 

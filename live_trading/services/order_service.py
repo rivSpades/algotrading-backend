@@ -39,7 +39,8 @@ import logging
 from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
-from typing import Any, Optional
+from enum import Enum
+from typing import Any, Optional, Union
 
 from django.db import transaction
 from django.utils import timezone
@@ -56,6 +57,7 @@ from ..engines.base import (
     LiveSignal,
 )
 from ..models import DeploymentSymbol, LiveTrade, StrategyDeployment
+from strategies.signals import action_to_side
 from .audit import log_event
 from .trade_metadata import (
     enrich_flat_entry_metadata,
@@ -182,7 +184,7 @@ def _manual_close_side_and_qty(
 
     try:
         if hasattr(broker_adapter, 'get_position_resolved'):
-            pos: Optional[PositionInfo] = broker_adapter.get_position_resolved(  # type: ignore[union-attr]
+            pos: Optional[PositionInfo] = broker_adapter.get_position_resolved(
                 (trade.symbol.ticker or '').strip(),
             )
         else:  # pragma: no cover
@@ -224,11 +226,19 @@ def _manual_close_side_and_qty(
     return closing_side, close_qty, None, ctx
 
 
+class OrderOutcomeStatus(str, Enum):
+    """Internal outcome of an order attempt (distinct from broker OrderStatus)."""
+    PLACED = 'placed'
+    FILLED = 'filled'
+    FAILED = 'failed'
+    SKIPPED = 'skipped'
+
+
 @dataclass
 class OrderOutcome:
     """Result of an order attempt, returned to the caller for the audit feed."""
 
-    status: str  # 'placed' / 'filled' / 'failed' / 'skipped'
+    status: Union[OrderOutcomeStatus, str]  # OrderOutcomeStatus (or its string value)
     reason: str = ''
     order_result: Optional[OrderResult] = None
     live_trade_id: Optional[int] = None
@@ -999,7 +1009,7 @@ def _place_entry_order(
     deployment = deployment_symbol.deployment
     ticker = deployment_symbol.symbol.ticker
     position_mode = SIGNAL_LONG if signal.action == SIGNAL_LONG else SIGNAL_SHORT
-    side = 'buy' if position_mode == SIGNAL_LONG else 'sell'
+    side = action_to_side(signal.action)
 
     # Global idempotency: if the symbol already has an open *main* trade anywhere,
     # don't enter again (hedge legs are excluded and may accumulate).
@@ -1665,7 +1675,7 @@ def _place_exit_order(
     deployment = deployment_symbol.deployment
     ticker = deployment_symbol.symbol.ticker
     position_mode = SIGNAL_LONG if signal.action == SIGNAL_EXIT_LONG else SIGNAL_SHORT
-    closing_side = 'sell' if position_mode == SIGNAL_LONG else 'buy'
+    closing_side = action_to_side(signal.action)
 
     open_trade = (
         deployment_symbol.live_trades.filter(
@@ -2526,28 +2536,6 @@ def update_open_trades(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _find_open_trade_for_today(
-    deployment_symbol: DeploymentSymbol,
-    position_mode: str,
-    fire_at: datetime,
-) -> Optional[LiveTrade]:
-    """Deprecated helper (kept temporarily for compatibility).
-
-    Global idempotency is now enforced in `_place_entry_order` by symbol across
-    deployments; this remains for any older callers.
-    """
-    today = fire_at.date()
-    return (
-        deployment_symbol.live_trades.filter(
-            status='open',
-            position_mode=position_mode,
-            entry_timestamp__date=today,
-        )
-        .order_by('-entry_timestamp')
-        .first()
-    )
 
 
 def _resolve_reference_price(

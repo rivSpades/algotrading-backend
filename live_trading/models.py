@@ -103,12 +103,6 @@ class Broker(models.Model):
             and self.real_money_endpoint_url
         )
 
-    def has_credentials(self, deployment_type='paper'):
-        """Return True if credentials for the given deployment type are configured."""
-        if deployment_type == 'real_money':
-            return self.has_real_money_credentials()
-        return self.has_paper_trading_credentials()
-
     def is_active_for_deployment_type(self, deployment_type: str) -> bool:
         if deployment_type == 'paper':
             return self.paper_trading_active and self.has_paper_trading_credentials()
@@ -154,18 +148,6 @@ class SymbolBrokerAssociation(models.Model):
             capabilities.append('SHORT')
         caps_str = '/'.join(capabilities) if capabilities else 'NONE'
         return f"{self.symbol.ticker} @ {self.broker.name} ({caps_str})"
-
-    def supports_all_modes(self):
-        return self.long_active and self.short_active
-
-    def supports_mode(self, mode):
-        if mode == 'all':
-            return self.supports_all_modes()
-        if mode == 'long':
-            return self.long_active
-        if mode == 'short':
-            return self.short_active
-        return False
 
 
 # ---------------------------------------------------------------------------
@@ -302,9 +284,6 @@ class StrategyDeployment(models.Model):
             self.deployment_type == 'paper'
             and self.broker.has_real_money_credentials()
         )
-
-    def has_evaluation_passed(self):
-        return bool(self.evaluation_results and self.evaluation_results.get('passed'))
 
 
 class DeploymentSymbol(models.Model):
