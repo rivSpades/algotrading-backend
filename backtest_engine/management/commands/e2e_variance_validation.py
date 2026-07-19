@@ -168,7 +168,7 @@ class Command(BaseCommand):
         variants = PortfolioMonteCarloPath.objects.filter(simulation=sim, is_reference=False)
 
         self.stdout.write(f'  reference_profit (sim)={sim.reference_profit}')
-        self.stdout.write(f'  mean_profit (variants only)={sim.mean_profit}')
+        self.stdout.write(f'  mean_profit (all runs)={sim.mean_profit}')
         self.stdout.write(f'  Run 0 profit={run0.profit if run0 else None} is_reference={run0.is_reference if run0 else None}')
         self.stdout.write(f'  Variant count={variants.count()}')
 
@@ -182,11 +182,14 @@ class Command(BaseCommand):
         self.stdout.write(f'  reference_profit == Results PnL: {"PASS" if ok_ref else "FAIL"}')
         self.stdout.write(f'  Trade sum == Results PnL: {"PASS" if ok_trades else "FAIL"}')
 
-        if variants.exists():
-            vprofits = [float(v.profit) for v in variants]
+        if run0 or variants.exists():
+            all_profits = []
+            if run0:
+                all_profits.append(float(run0.profit))
+            all_profits.extend(float(v.profit) for v in variants)
             import statistics
-            calc_mean = statistics.mean(vprofits)
-            self.stdout.write(f'  Mean variant profit (recalc)={calc_mean:.2f} vs stored={sim.mean_profit}')
+            calc_mean = statistics.mean(all_profits)
+            self.stdout.write(f'  Mean all-runs profit (recalc)={calc_mean:.2f} vs stored={sim.mean_profit}')
 
         if ok_run0 and ok_ref and ok_trades:
             self.stdout.write(self.style.SUCCESS('ALL CHECKS PASSED'))

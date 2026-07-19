@@ -612,7 +612,7 @@ class PortfolioMonteCarloSimulation(models.Model):
     mean_performance_metrics = models.JSONField(
         default=dict,
         blank=True,
-        help_text='Mean of performance_metrics across variant paths (excludes Run 0)',
+        help_text='Mean of performance_metrics across all runs (Run 0 + order variants)',
     )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

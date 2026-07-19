@@ -88,8 +88,12 @@ def _load_reference_performance_metrics(backtest: Backtest, position_mode: str) 
 
 
 def _mean_performance_metrics(paths: List[Dict[str, Any]]) -> Dict[str, Any]:
-    variants = [p for p in paths if not p.get('is_reference')]
-    metrics_list = [p.get('performance_metrics') or {} for p in variants if p.get('performance_metrics')]
+    """Average performance metrics across all runs (Run 0 + order variants)."""
+    metrics_list = [
+        p.get('performance_metrics') or {}
+        for p in paths
+        if p.get('performance_metrics')
+    ]
     if not metrics_list:
         return {}
     out: Dict[str, Any] = {}
@@ -388,10 +392,11 @@ def run_monte_carlo_simulation(
                 progress_callback(pct, f'Order variant {i}/{len(variant_orders)}')
 
         variant_results = [p for p in path_results if not p.get('is_reference')]
-        profits = [p['profit'] for p in variant_results]
-        blew_count = sum(1 for p in variant_results if p['blew_up'])
-        profit_positive = sum(1 for p in variant_results if p['profit'] > 0)
-        arr = np.array(profits, dtype=float) if profits else np.array([0.0])
+        # Aggregate profits / metrics over ALL runs (Run 0 + variants)
+        all_profits = [p['profit'] for p in path_results]
+        blew_count = sum(1 for p in path_results if p['blew_up'])
+        profit_positive = sum(1 for p in path_results if p['profit'] > 0)
+        arr = np.array(all_profits, dtype=float) if all_profits else np.array([0.0])
 
         ref_ts = _reference_timestamps(reference_curve)
         variant_curves = [p['equity_curve'] for p in variant_results]
@@ -407,21 +412,21 @@ def run_monte_carlo_simulation(
             for p in path_results
         ]
 
-        best = max(variant_results, key=lambda p: p['profit']) if variant_results else path_results[0]
-        worst = min(variant_results, key=lambda p: p['profit']) if variant_results else path_results[0]
-        variant_n = len(variant_results)
+        best = max(path_results, key=lambda p: p['profit']) if path_results else None
+        worst = min(path_results, key=lambda p: p['profit']) if path_results else None
+        all_n = len(path_results)
 
-        simulation.prob_broke = blew_count / variant_n if variant_n else 0
-        simulation.prob_profit_positive = profit_positive / variant_n if variant_n else 0
+        simulation.prob_broke = blew_count / all_n if all_n else 0
+        simulation.prob_profit_positive = profit_positive / all_n if all_n else 0
         simulation.mean_profit = Decimal(str(round(float(np.mean(arr)), 2)))
         simulation.median_profit = Decimal(str(round(float(np.median(arr)), 2)))
-        simulation.percentile_5 = Decimal(str(round(float(np.percentile(arr, 5)), 2))) if variant_n else Decimal('0')
-        simulation.percentile_95 = Decimal(str(round(float(np.percentile(arr, 95)), 2))) if variant_n else Decimal('0')
-        simulation.profit_histogram = _profit_histogram(profits)
+        simulation.percentile_5 = Decimal(str(round(float(np.percentile(arr, 5)), 2))) if all_n else Decimal('0')
+        simulation.percentile_95 = Decimal(str(round(float(np.percentile(arr, 95)), 2))) if all_n else Decimal('0')
+        simulation.profit_histogram = _profit_histogram(all_profits)
         simulation.confidence_bands = confidence_bands
         simulation.sample_equity_curves = sample_equity_curves
-        simulation.best_path = _path_summary(best)
-        simulation.worst_path = _path_summary(worst)
+        simulation.best_path = _path_summary(best) if best else {}
+        simulation.worst_path = _path_summary(worst) if worst else {}
         simulation.sample_paths = [_path_summary(p) for p in path_results[:15]]
         simulation.mean_performance_metrics = _mean_performance_metrics(path_results)
         simulation.status = 'completed'
