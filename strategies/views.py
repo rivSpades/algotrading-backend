@@ -15,7 +15,6 @@ from .serializers import StrategyDefinitionSerializer, StrategyAssignmentSeriali
 from market_data.models import Symbol
 from market_data.serializers import SymbolListSerializer
 from backtest_engine.models import (
-    Backtest,
     SymbolBacktestRun,
     SymbolBacktestTrade,
     SymbolBacktestStatistics,
@@ -29,12 +28,47 @@ from backtest_engine.services.create_portfolio_from_parameter_set import (
 from backtest_engine.serializers import BacktestListSerializer
 from backtest_engine.tasks import run_symbol_backtest_run_task, bulk_symbol_runs_queue_task
 from backtest_engine.parameter_sets import build_symbol_run_parameter_payload, signature_for_payload
-from backtest_engine.position_modes import normalize_position_modes
 from live_trading.models import SymbolBrokerAssociation, Broker
 
 
-def _snapshot_item(_snap_row):
-    raise NotImplementedError("Legacy Backtest snapshot items removed; use SymbolBacktestRun endpoints.")
+def _broker_assoc_supports_modes(assoc, position_modes):
+    """True if association enables at least one of the requested position modes."""
+    pmodes = normalize_position_modes(position_modes)
+    has_long = 'long' in pmodes
+    has_short = 'short' in pmodes
+    if has_long and has_short:
+        return bool(assoc.long_active or assoc.short_active)
+    if has_long:
+        return bool(assoc.long_active)
+    if has_short:
+        return bool(assoc.short_active)
+    return False
+
+
+def _validate_ticker_linked_to_broker(broker, ticker, position_modes):
+    """
+    Return None if ticker is linked to broker for at least one requested mode.
+    Otherwise return an error message string suitable for a 400 response.
+    """
+    try:
+        assoc = SymbolBrokerAssociation.objects.select_related('symbol').get(
+            broker=broker,
+            symbol__ticker=ticker,
+            symbol__status='active',
+        )
+    except SymbolBrokerAssociation.DoesNotExist:
+        return (
+            f'{ticker} is not linked to {broker.name} (or is not active). '
+            f'Link it on the broker page first.'
+        )
+    if not _broker_assoc_supports_modes(assoc, position_modes):
+        pmodes = normalize_position_modes(position_modes)
+        modes_label = '/'.join(pmodes)
+        return (
+            f'{ticker} is linked to {broker.name} but not enabled for {modes_label}. '
+            f'Update long/short capabilities on the broker page, or change position modes.'
+        )
+    return None
 
 
 class StrategyDefinitionViewSet(viewsets.ModelViewSet):
@@ -143,11 +177,18 @@ class StrategyDefinitionViewSet(viewsets.ModelViewSet):
 
         broker = None
         broker_id = body.get('broker_id')
+        position_modes = normalize_position_modes(body.get('position_modes'))
         if broker_id:
             try:
                 broker = Broker.objects.get(id=int(broker_id))
-            except Exception:
-                broker = None
+            except (Broker.DoesNotExist, TypeError, ValueError):
+                return Response(
+                    {'error': f'Broker with id {broker_id} not found'},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            link_err = _validate_ticker_linked_to_broker(broker, sym.ticker, position_modes)
+            if link_err:
+                return Response({'error': link_err}, status=status.HTTP_400_BAD_REQUEST)
 
         run = SymbolBacktestRun.objects.create(
             name=name,
@@ -164,7 +205,7 @@ class StrategyDefinitionViewSet(viewsets.ModelViewSet):
             hedge_enabled=bool(body.get('hedge_enabled', False)),
             run_strategy_only_baseline=bool(body.get('run_strategy_only_baseline', True)),
             hedge_config=body.get('hedge_config') or {},
-            position_modes=normalize_position_modes(body.get('position_modes')),
+            position_modes=position_modes,
             status='pending',
         )
         payload = build_symbol_run_parameter_payload(
@@ -294,12 +335,21 @@ class StrategyDefinitionViewSet(viewsets.ModelViewSet):
         exchange_code = body.get('exchange_code', '') or ''
 
         tickers = []
+        broker = None
+        position_modes = normalize_position_modes(body.get('position_modes'))
+        if broker_id:
+            try:
+                broker = Broker.objects.get(id=int(broker_id))
+            except (Broker.DoesNotExist, TypeError, ValueError):
+                return Response(
+                    {'error': f'Broker with id {broker_id} not found'},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
         if select_all_linked:
             if not broker_id:
                 return Response({'error': 'broker_id is required when select_all_linked=true'}, status=status.HTTP_400_BAD_REQUEST)
-            try:
-                broker = Broker.objects.get(id=broker_id)
-            except Broker.DoesNotExist:
+            if broker is None:
                 return Response({'error': f'Broker with id {broker_id} not found'}, status=status.HTTP_404_NOT_FOUND)
 
             qs = SymbolBrokerAssociation.objects.filter(
@@ -307,9 +357,8 @@ class StrategyDefinitionViewSet(viewsets.ModelViewSet):
                 symbol__status='active',
             ).filter(Q(long_active=True) | Q(short_active=True))
 
-            pmodes = body.get('position_modes') or ['long', 'short']
-            has_long = 'long' in pmodes
-            has_short = 'short' in pmodes
+            has_long = 'long' in position_modes
+            has_short = 'short' in position_modes
             if has_long and not has_short:
                 qs = qs.filter(long_active=True)
             elif has_short and not has_long:
@@ -319,10 +368,34 @@ class StrategyDefinitionViewSet(viewsets.ModelViewSet):
                 qs = qs.filter(symbol__exchange__code__iexact=exchange_code)
 
             tickers = list(qs.values_list('symbol__ticker', flat=True).order_by('symbol__ticker'))
+            if not tickers:
+                exchange_text = f' on exchange {exchange_code}' if exchange_code else ''
+                return Response(
+                    {
+                        'error': (
+                            f'No active symbols linked to {broker.name}{exchange_text} '
+                            f'for the selected position modes. '
+                            f'Link symbols on the broker page first.'
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
         else:
             if symbol_tickers is None:
                 return Response({'error': "Provide symbol_tickers or set select_all_linked=true"}, status=status.HTTP_400_BAD_REQUEST)
             tickers = [str(t).strip().upper() for t in (symbol_tickers or []) if str(t).strip()]
+
+            if broker is not None and tickers:
+                missing = []
+                for t in tickers:
+                    err = _validate_ticker_linked_to_broker(broker, t, position_modes)
+                    if err:
+                        missing.append(err)
+                if missing:
+                    return Response(
+                        {'error': missing[0] if len(missing) == 1 else ' '.join(missing)},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
 
         if not tickers:
             return Response({'error': 'No tickers to run'}, status=status.HTTP_400_BAD_REQUEST)

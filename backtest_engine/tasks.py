@@ -1062,6 +1062,7 @@ def run_symbol_backtest_run_task(self, run_id: int):
         all_trades_by_mode = {}
         mode_stats_results = {}
         all_baseline_stats_by_mode = {}
+        modes_with_symbols = []
 
         for idx, position_mode in enumerate(position_modes_to_run):
             baseline_full_stats = None
@@ -1072,8 +1073,9 @@ def run_symbol_backtest_run_task(self, run_id: int):
                     preprocessed_data=None,
                     hedge_overlay=None,
                 )
-                ex_base.execute_strategy()
-                baseline_full_stats = ex_base.calculate_statistics()
+                if ex_base.symbols:
+                    ex_base.execute_strategy()
+                    baseline_full_stats = ex_base.calculate_statistics()
 
             mode_executor = BacktestExecutor(
                 run,
@@ -1081,13 +1083,22 @@ def run_symbol_backtest_run_task(self, run_id: int):
                 preprocessed_data=None,
                 hedge_overlay=hedge_overlay,
             )
-            mode_executor.execute_strategy()
-            mode_stats = mode_executor.calculate_statistics()
-
-            all_trades_by_mode[position_mode] = mode_executor.trades
-            mode_stats_results[position_mode] = mode_stats
-            if baseline_full_stats:
-                all_baseline_stats_by_mode[position_mode] = baseline_full_stats
+            if not mode_executor.symbols:
+                logger.warning(
+                    "Symbol run %s: skipping position_mode=%s (no eligible symbols for broker filter)",
+                    run_id,
+                    position_mode,
+                )
+                all_trades_by_mode[position_mode] = []
+                mode_stats_results[position_mode] = {}
+            else:
+                modes_with_symbols.append(position_mode)
+                mode_executor.execute_strategy()
+                mode_stats = mode_executor.calculate_statistics()
+                all_trades_by_mode[position_mode] = mode_executor.trades
+                mode_stats_results[position_mode] = mode_stats
+                if baseline_full_stats:
+                    all_baseline_stats_by_mode[position_mode] = baseline_full_stats
 
             progress = 20 + int(((idx + 1) / max(len(position_modes_to_run), 1)) * 40)
             self.update_state(
@@ -1097,6 +1108,15 @@ def run_symbol_backtest_run_task(self, run_id: int):
                     'message': f'Completed {idx + 1}/{len(position_modes_to_run)} position modes...',
                 },
             )
+
+        if not modes_with_symbols:
+            broker_name = run.broker.name if run.broker else 'none'
+            msg = (
+                f'No eligible symbols for any requested position mode '
+                f'({mode_label}) with broker={broker_name}. '
+                f'Check broker–symbol associations vs position_modes, or symbol status.'
+            )
+            raise ValueError(msg)
 
         self.update_state(state='PROGRESS', meta={'progress': 70, 'message': 'Saving trades...'})
         for position_mode, trades in all_trades_by_mode.items():
