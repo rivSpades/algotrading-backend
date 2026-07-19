@@ -13,8 +13,8 @@ import pandas as pd
 from django.utils import timezone
 
 from market_data.models import OHLCV, Symbol
-from market_data.providers.yahoo_finance import YahooFinanceProvider
 from market_data.services.benchmark_symbols import get_or_create_benchmark_symbol
+from market_data.services.market_data_service import get_daily_data
 from market_data.services.ohlcv_service import OHLCVService
 
 logger = logging.getLogger(__name__)
@@ -94,7 +94,8 @@ def compute_sp500_buy_hold_curve(
 
     if not covered or len(bars) < 2:
         try:
-            yahoo_rows = YahooFinanceProvider.get_historical_data(
+            yahoo_rows = get_daily_data(
+                'YAHOO',
                 BENCHMARK_TICKER,
                 start_date=start_query,
                 end_date=end_query,

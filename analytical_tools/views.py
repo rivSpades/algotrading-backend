@@ -12,11 +12,9 @@ from .serializers import (
     ToolAssignmentSerializer,
     IndicatorValueSerializer
 )
-from market_data.models import Symbol, OHLCV
+from market_data.models import Symbol
 from .config import get_all_indicator_definitions, get_indicator_definition
-import pandas as pd
-from datetime import datetime
-from rest_framework.views import APIView
+from .services import compute_indicator_sync
 
 
 class ToolDefinitionViewSet(viewsets.ViewSet):

@@ -11,21 +11,7 @@ from ..providers.eod_api import EODAPIProvider
 
 class SymbolService:
     """Service for managing symbols"""
-    
-    @staticmethod
-    def get_or_create_eod_provider() -> Provider:
-        """Get or create EOD Historical Data provider"""
-        provider, created = Provider.objects.get_or_create(
-            code='EOD',
-            defaults={
-                'name': 'EOD Historical Data',
-                'api_key': EODAPIProvider.API_KEY,
-                'base_url': EODAPIProvider.BASE_URL,
-                'is_active': True
-            }
-        )
-        return provider
-    
+
     @staticmethod
     def get_or_create_exchange(exchange_data: Dict) -> Exchange:
         """Get or create exchange from EOD API data"""
@@ -155,27 +141,4 @@ class SymbolService:
             'errors': error_count,
             'exchange_stats': exchange_stats
         }
-    
-    @classmethod
-    def import_symbols_from_multiple_exchanges(cls, exchange_codes: List[str]) -> Dict:
-        """
-        Import symbols from multiple exchanges
-        Returns:
-            Dictionary with import statistics for each exchange
-        """
-        results = {}
-        for exchange_code in exchange_codes:
-            results[exchange_code] = cls.import_symbols_from_exchange(exchange_code)
-        return results
-    
-    @classmethod
-    def import_symbols_from_all_exchanges(cls) -> Dict:
-        """
-        Import symbols from all available exchanges
-        Returns:
-            Dictionary with import statistics
-        """
-        exchanges = EODAPIProvider.get_exchanges_list()
-        exchange_codes = [ex.get('Code', '') for ex in exchanges if ex.get('Code')]
-        return cls.import_symbols_from_multiple_exchanges(exchange_codes)
 

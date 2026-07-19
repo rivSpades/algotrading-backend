@@ -171,10 +171,12 @@ REST_FRAMEWORK = {
     ],
 }
 
-# CORS configuration
+# CORS configuration (3001 = default when sharing host with another stack on 3000)
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3001",
 ]
 
 CORS_ALLOW_CREDENTIALS = True
@@ -198,6 +200,12 @@ CELERY_TASK_SOFT_TIME_LIMIT = 2 * 60 * 60  # 2 hours soft limit
 LIVE_TRADING_MARKET_OPEN_SYMBOLS_PER_TASK = int(
     os.environ.get('LIVE_TRADING_MARKET_OPEN_SYMBOLS_PER_TASK', '250')
 )
+
+# OHLCV provider credentials (read by providers via settings/env).
+ALPACA_API_KEY = os.environ.get('ALPACA_API_KEY', '')
+ALPACA_API_SECRET = os.environ.get('ALPACA_API_SECRET', '')
+ALPHA_VANTAGE_API_KEY = os.environ.get('ALPHA_VANTAGE_API_KEY', '')
+EOD_API_KEY = os.environ.get('EOD_API_KEY', '')
 
 # Celery Beat Configuration
 CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'

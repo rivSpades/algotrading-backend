@@ -9,72 +9,12 @@ from typing import List, Optional
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
-from .models import Symbol, OHLCV, Exchange, Provider
+from .models import Symbol, OHLCV, Exchange
 from .services.symbol_service import SymbolService
 from .services.ohlcv_service import OHLCVService
-from .services.market_data_service import get_daily_data, get_daily_data_bulk, normalize_date_range, parse_task_dates
+from .services.market_data_service import get_daily_data, get_daily_data_bulk, parse_task_dates
 from .services.symbol_resolution import ensure_symbol, ensure_exchange_symbols, ensure_exchange
 from .providers.eod_api import EODAPIProvider
-from .providers.yahoo_finance import YahooFinanceProvider
-from .providers.factory import ProviderFactory
-
-
-@shared_task(bind=True)
-def update_symbol_data_task(self, ticker):
-    """
-    Background task to update symbol data
-    This is a placeholder - actual implementation will depend on provider
-    """
-    try:
-        symbol = Symbol.objects.get(ticker=ticker)
-        
-        # Update task state
-        self.update_state(
-            state='RUNNING',
-            meta={
-                'progress': 0,
-                'message': f'Starting update for {ticker}'
-            }
-        )
-
-        # TODO: Implement actual data fetching from provider
-        # This is a placeholder that simulates the update process
-        
-        # Simulate progress updates
-        for i in range(1, 101):
-            self.update_state(
-                state='RUNNING',
-                meta={
-                    'progress': i,
-                    'message': f'Processing data... {i}%'
-                }
-            )
-            # Simulate work
-            import time
-            time.sleep(0.1)
-
-        # Update symbol timestamp
-        symbol.last_updated = timezone.now()
-        symbol.save(update_fields=['last_updated'])
-
-        return {
-            'progress': 100,
-            'message': f'Successfully updated {ticker}',
-            'status': 'completed'
-        }
-
-    except Symbol.DoesNotExist:
-        return {
-            'progress': 0,
-            'message': f'Symbol {ticker} not found',
-            'status': 'failed'
-        }
-    except Exception as e:
-        return {
-            'progress': 0,
-            'message': f'Error updating {ticker}: {str(e)}',
-            'status': 'failed'
-        }
 
 
 @shared_task(bind=True)
@@ -704,10 +644,8 @@ def fetch_ohlcv_data_multiple_symbols_task(
         processed_count = 0
         lock = threading.Lock()
         
-        # Get provider instance once (thread-safe, but we'll get it per thread to be safe)
-        # Actually, let's get it once and pass it, as providers are typically stateless
+        # Resolve the provider model once (providers are typically stateless).
         try:
-            data_provider = ProviderFactory.get_provider(provider_code)
             provider_model = OHLCVService.get_provider(provider_code)
         except Exception as e:
             return {
@@ -1127,9 +1065,8 @@ def fetch_ohlcv_data_by_broker_task(
                     }
                 )
                 
-                # Get provider instance once per batch (more efficient)
+                # Resolve provider model once per batch (more efficient)
                 try:
-                    data_provider = ProviderFactory.get_provider(provider_code)
                     provider_model = OHLCVService.get_provider(provider_code)
                 except Exception as e:
                     # If provider fails, mark all tickers in batch as failed
@@ -1569,9 +1506,8 @@ def fetch_ohlcv_data_by_exchange_task(
                 }
             )
             
-            # Get provider instance once per batch (more efficient)
+            # Resolve provider model once per batch (more efficient)
             try:
-                data_provider = ProviderFactory.get_provider(provider_code)
                 provider_model = OHLCVService.get_provider(provider_code)
             except Exception as e:
                 # If provider fails, mark all tickers in batch as failed

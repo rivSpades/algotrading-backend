@@ -135,7 +135,7 @@ class PolygonProvider:
                 # Generate list of dates in range
                 current_date = start_date.date() if isinstance(start_date, datetime) else start_date
                 end_d = end_date.date() if isinstance(end_date, datetime) else end_date
-                
+
                 date_list = []
                 while current_date <= end_d:
                     date_list.append(current_date)
@@ -144,90 +144,90 @@ class PolygonProvider:
                 # If no date range, fetch most recent file(s)
                 # This logic needs to be adjusted based on actual file structure
                 date_list = [date.today()]
-            
-                # For each date, download and parse the file
-                for file_date in date_list:
-                    # Try to discover file path first, fallback to default pattern
-                    file_key = PolygonProvider._discover_file_path(file_date, interval)
-                    if not file_key:
-                        file_key = PolygonProvider._get_file_path(file_date, interval)
-                    
-                    if not file_key:
-                        print(f"Could not determine file path for date {file_date} and interval {interval}, skipping...")
-                        continue
-                    
+
+            # For each date, download and parse the file
+            for file_date in date_list:
+                # Try to discover file path first, fallback to default pattern
+                file_key = PolygonProvider._discover_file_path(file_date, interval)
+                if not file_key:
+                    file_key = PolygonProvider._get_file_path(file_date, interval)
+
+                if not file_key:
+                    print(f"Could not determine file path for date {file_date} and interval {interval}, skipping...")
+                    continue
+
+                try:
+                    # Download file from S3 using download_file to temp file then read
+                    # (Polygon's example uses download_file, which works better with their endpoint)
+                    import tempfile
+                    import os
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.gz') as tmp_file:
+                        tmp_path = tmp_file.name
+
                     try:
-                        # Download file from S3 using download_file to temp file then read
-                        # (Polygon's example uses download_file, which works better with their endpoint)
-                        import tempfile
-                        import os
-                        with tempfile.NamedTemporaryFile(delete=False, suffix='.gz') as tmp_file:
-                            tmp_path = tmp_file.name
-                        
-                        try:
-                            PolygonProvider._s3_client.download_file(
-                                Bucket=PolygonProvider._bucket_name,
-                                Key=file_key,
-                                Filename=tmp_path
-                            )
-                            # Read the downloaded file
-                            with open(tmp_path, 'rb') as f:
-                                file_content = f.read()
-                        finally:
-                            # Clean up temp file
-                            if os.path.exists(tmp_path):
-                                os.unlink(tmp_path)
-                        
-                        # Check if file is gzipped
-                        is_gzipped = file_key.endswith('.gz')
-                        
-                        # Parse file (supports JSON, CSV, gzipped files, etc.)
-                        df = PolygonProvider._parse_flat_file(file_content, file_date, is_gzipped=is_gzipped)
-                        
-                        # Normalize ticker column to uppercase for comparison
-                        if 'ticker' in df.columns:
-                            df['ticker'] = df['ticker'].astype(str).str.upper()
-                        
-                        # Filter by requested tickers and extract data
-                        requested_tickers_upper = [t.upper() for t in tickers]
-                        filtered_df = df[df['ticker'].isin(requested_tickers_upper)]
-                        
-                        # Convert to dictionary format (same as YahooFinanceProvider)
-                        for ticker in tickers:
-                            ticker_upper = ticker.upper()
-                            ticker_df = filtered_df[filtered_df['ticker'] == ticker_upper]
-                            if not ticker_df.empty:
-                                for _, row in ticker_df.iterrows():
-                                    result[ticker].append({
-                                        'timestamp': PolygonProvider._parse_timestamp(row, file_date),
-                                        'open': float(row['open']),
-                                        'high': float(row['high']),
-                                        'low': float(row['low']),
-                                        'close': float(row['close']),
-                                        'volume': int(row['volume']) if pd.notna(row.get('volume', 0)) else 0
-                                    })
-                    
-                    except PolygonProvider._s3_client.exceptions.NoSuchKey:
-                        # File doesn't exist for this date, skip
-                        print(f"File not found in S3: {file_key} for date {file_date}")
-                        continue
-                    except Exception as e:
-                        error_msg = str(e)
-                        # Check if it's an authentication/permission error
-                        if '403' in error_msg or 'Forbidden' in error_msg:
-                            print(f"⚠️ Permission denied (403) accessing {file_key}. This could mean:")
-                            print(f"  1. Incorrect S3 credentials (access_key_id, secret_access_key)")
-                            print(f"  2. The file doesn't exist at this path")
-                            print(f"  3. The bucket name is incorrect")
-                            print(f"  4. The endpoint URL is incorrect")
-                            print(f"  Please verify Polygon provider credentials in the database.")
-                        else:
-                            print(f"Error processing file {file_key}: {error_msg}")
-                        # Don't print full traceback for 403 errors, but continue trying other files
-                        if '403' not in error_msg and 'Forbidden' not in error_msg:
-                            import traceback
-                            traceback.print_exc()
-                        continue
+                        PolygonProvider._s3_client.download_file(
+                            Bucket=PolygonProvider._bucket_name,
+                            Key=file_key,
+                            Filename=tmp_path
+                        )
+                        # Read the downloaded file
+                        with open(tmp_path, 'rb') as f:
+                            file_content = f.read()
+                    finally:
+                        # Clean up temp file
+                        if os.path.exists(tmp_path):
+                            os.unlink(tmp_path)
+
+                    # Check if file is gzipped
+                    is_gzipped = file_key.endswith('.gz')
+
+                    # Parse file (supports JSON, CSV, gzipped files, etc.)
+                    df = PolygonProvider._parse_flat_file(file_content, file_date, is_gzipped=is_gzipped)
+
+                    # Normalize ticker column to uppercase for comparison
+                    if 'ticker' in df.columns:
+                        df['ticker'] = df['ticker'].astype(str).str.upper()
+
+                    # Filter by requested tickers and extract data
+                    requested_tickers_upper = [t.upper() for t in tickers]
+                    filtered_df = df[df['ticker'].isin(requested_tickers_upper)]
+
+                    # Convert to dictionary format (same as YahooFinanceProvider)
+                    for ticker in tickers:
+                        ticker_upper = ticker.upper()
+                        ticker_df = filtered_df[filtered_df['ticker'] == ticker_upper]
+                        if not ticker_df.empty:
+                            for _, row in ticker_df.iterrows():
+                                result[ticker].append({
+                                    'timestamp': PolygonProvider._parse_timestamp(row, file_date),
+                                    'open': float(row['open']),
+                                    'high': float(row['high']),
+                                    'low': float(row['low']),
+                                    'close': float(row['close']),
+                                    'volume': int(row['volume']) if pd.notna(row.get('volume', 0)) else 0
+                                })
+
+                except PolygonProvider._s3_client.exceptions.NoSuchKey:
+                    # File doesn't exist for this date, skip
+                    print(f"File not found in S3: {file_key} for date {file_date}")
+                    continue
+                except Exception as e:
+                    error_msg = str(e)
+                    # Check if it's an authentication/permission error
+                    if '403' in error_msg or 'Forbidden' in error_msg:
+                        print(f"⚠️ Permission denied (403) accessing {file_key}. This could mean:")
+                        print(f"  1. Incorrect S3 credentials (access_key_id, secret_access_key)")
+                        print(f"  2. The file doesn't exist at this path")
+                        print(f"  3. The bucket name is incorrect")
+                        print(f"  4. The endpoint URL is incorrect")
+                        print(f"  Please verify Polygon provider credentials in the database.")
+                    else:
+                        print(f"Error processing file {file_key}: {error_msg}")
+                    # Don't print full traceback for 403 errors, but continue trying other files
+                    if '403' not in error_msg and 'Forbidden' not in error_msg:
+                        import traceback
+                        traceback.print_exc()
+                    continue
             
             # Sort each ticker's data by timestamp
             for ticker in result:
@@ -510,45 +510,4 @@ class PolygonProvider:
             ts = timezone.make_aware(ts, pytz.UTC)
         
         return ts
-    
-    @staticmethod
-    def list_available_dates(start_date: Optional[date] = None, end_date: Optional[date] = None) -> List[date]:
-        """
-        List available dates in the S3 bucket
-        
-        Args:
-            start_date: Optional start date filter
-            end_date: Optional end date filter
-        
-        Returns:
-            List of available dates
-        """
-        try:
-            # List objects in bucket
-            response = PolygonProvider._s3_client.list_objects_v2(Bucket=PolygonProvider._bucket_name)
-            
-            dates = []
-            if 'Contents' in response:
-                for obj in response['Contents']:
-                    # Extract date from key (adjust pattern based on actual structure)
-                    key = obj['Key']
-                    # Example: "2024-01-15/stocks_daily.csv" -> "2024-01-15"
-                    try:
-                        date_str = key.split('/')[0]
-                        file_date = datetime.strptime(date_str, '%Y-%m-%d').date()
-                        
-                        if start_date and file_date < start_date:
-                            continue
-                        if end_date and file_date > end_date:
-                            continue
-                        
-                        dates.append(file_date)
-                    except (ValueError, IndexError):
-                        continue
-            
-            return sorted(set(dates))
-            
-        except Exception as e:
-            print(f"Error listing available dates: {str(e)}")
-            return []
 

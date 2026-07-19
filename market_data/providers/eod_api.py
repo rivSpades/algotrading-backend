@@ -10,10 +10,14 @@ from django.conf import settings
 
 class EODAPIProvider:
     """Provider for EOD Historical Data API"""
-    
+
     BASE_URL = "https://eodhistoricaldata.com/api"
-    API_KEY = "66ae1118bb93f4.94656892"
-    
+
+    @classmethod
+    def _api_key(cls) -> str:
+        """Resolve the EOD API token from settings/env (never commit a real key)."""
+        return getattr(settings, 'EOD_API_KEY', '') or ''
+
     @classmethod
     def get_exchanges_list(cls) -> List[Dict]:
         """
@@ -23,13 +27,13 @@ class EODAPIProvider:
         try:
             url = f"{cls.BASE_URL}/exchanges-list"
             params = {
-                'api_token': cls.API_KEY,
+                'api_token': cls._api_key(),
                 'fmt': 'json'
             }
             response = requests.get(url, params=params, timeout=30)
             response.raise_for_status()
             data = response.json()
-            
+
             # Validate response is a list
             if not isinstance(data, list):
                 print(f"Unexpected response format from EOD API: {type(data)}")
@@ -61,7 +65,7 @@ class EODAPIProvider:
         try:
             url = f"{cls.BASE_URL}/exchange-symbol-list/{exchange_code}"
             params = {
-                'api_token': cls.API_KEY,
+                'api_token': cls._api_key(),
                 'fmt': 'json'
             }
             response = requests.get(url, params=params, timeout=30)
@@ -86,7 +90,7 @@ class EODAPIProvider:
         try:
             url = f"{cls.BASE_URL}/search/{query}"
             params = {
-                'api_token': cls.API_KEY,
+                'api_token': cls._api_key(),
                 'fmt': 'json',
                 'limit': limit,
             }
@@ -99,30 +103,4 @@ class EODAPIProvider:
         except Exception as e:
             print(f"Error searching symbols for {query}: {str(e)}")
             return []
-
-    @classmethod
-    def get_multiple_exchange_symbols(cls, exchange_codes: List[str]) -> Dict[str, List[Dict]]:
-        """
-        Get symbols for multiple exchanges
-        Args:
-            exchange_codes: List of exchange codes
-        Returns:
-            Dictionary mapping exchange codes to their symbols
-        """
-        result = {}
-        for exchange_code in exchange_codes:
-            symbols = cls.get_exchange_symbols(exchange_code)
-            result[exchange_code] = symbols
-        return result
-    
-    @classmethod
-    def get_all_exchange_symbols(cls) -> Dict[str, List[Dict]]:
-        """
-        Get symbols for all available exchanges
-        Returns:
-            Dictionary mapping exchange codes to their symbols
-        """
-        exchanges = cls.get_exchanges_list()
-        exchange_codes = [ex.get('Code', '') for ex in exchanges if ex.get('Code')]
-        return cls.get_multiple_exchange_symbols(exchange_codes)
 

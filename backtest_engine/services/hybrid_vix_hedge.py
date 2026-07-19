@@ -8,18 +8,36 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone as datetime_timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 import numpy as np
 import pandas as pd
 from django.utils import timezone
 
 from market_data.models import OHLCV, Symbol
-from market_data.providers.yahoo_finance import YahooFinanceProvider
 from market_data.services.benchmark_symbols import get_or_create_benchmark_symbol
+from market_data.services.market_data_service import get_daily_data
 from market_data.services.ohlcv_service import OHLCVService
 
 logger = logging.getLogger(__name__)
+
+
+class HedgeConfig(TypedDict, total=False):
+    """Shape of the `hedge_config` JSON blob on `Backtest`/`StrategyDeployment`.
+
+    `total=False` because the blob is optional and partially-populated in some
+    code paths; readers coerce each field to the right type before use.
+    """
+    z_threshold: float
+    vix_floor: float
+    smooth_win: int
+    panic_spy_weight: float
+    panic_vixy_weight: float
+    normal_spy_weight: float
+    normal_spread_weight: float
+    rolling_vix_window: int
+    rolling_beta_window: int
+    min_warmup_days: int
 
 HEDGE_TICKERS = ("SPY", "VIXM", "VIXY", "^VIX")
 # VIXM/VIXY are the tradeable vol legs used in the spread (normal) or VIXY-only (panic); they must
@@ -136,8 +154,8 @@ def _ensure_ohlcv(symbol: Symbol, start: datetime, end: datetime) -> None:
     if covered and count >= 20:
         return
     try:
-        rows = YahooFinanceProvider.get_historical_data(
-            symbol.ticker, start_date=start, end_date=end, interval="1d"
+        rows = get_daily_data(
+            'YAHOO', symbol.ticker, start_date=start, end_date=end, interval="1d"
         )
         if rows:
             OHLCVService.save_ohlcv_data(
@@ -182,8 +200,8 @@ def _close_series_from_db(symbol: Symbol, start: datetime, end: datetime) -> pd.
 def _close_series_from_yahoo_memory(ticker: str, start: datetime, end: datetime) -> pd.Series:
     """Yahoo prices for simulation only — does not write to DB (avoids ALPACA/Yahoo provider conflict)."""
     try:
-        rows = YahooFinanceProvider.get_historical_data(
-            ticker, start_date=start, end_date=end, interval="1d"
+        rows = get_daily_data(
+            'YAHOO', ticker, start_date=start, end_date=end, interval="1d"
         )
     except Exception as ex:
         logger.warning("Yahoo in-memory fetch failed for %s: %s", ticker, ex)
@@ -266,7 +284,7 @@ def _overlay_row_day_ns(idx_val) -> int:
 def compute_trade_hedge_overlay(
     window_start,
     window_end,
-    hedge_config: Optional[Dict],
+    hedge_config: Optional[HedgeConfig],
     *,
     yahoo_only: bool = False,
 ) -> Optional[Dict[str, Any]]:
@@ -464,7 +482,7 @@ def _hedge_panic_daily_rows(df: pd.DataFrame, cfg: Dict[str, Any]) -> List[Dict[
 
 
 def compute_hedge_panic_snapshot(
-    hedge_config: Optional[Dict] = None,
+    hedge_config: Optional[HedgeConfig] = None,
     *,
     yahoo_only: bool = True,
     end_at: Optional[datetime] = None,
@@ -608,7 +626,7 @@ def simulate_hybrid_vix_hedge(
     start_dt: datetime,
     end_dt: datetime,
     initial_capital: float,
-    hedge_config: Optional[Dict] = None,
+    hedge_config: Optional[HedgeConfig] = None,
     *,
     yahoo_only: bool = False,
 ) -> Dict[str, Any]:
@@ -807,25 +825,9 @@ def _normalize_dt(dt) -> datetime:
     return _coerce_aware_datetime(dt)
 
 
-def run_hybrid_vix_hedge_for_backtest(
-    backtest,
-    equity_window_start,
-    equity_window_end,
-    initial_capital: float,
-) -> Dict[str, Any]:
-    """Use strategy equity window + hedge_config from Backtest model."""
-    cfg = getattr(backtest, "hedge_config", None) or {}
-    return simulate_hybrid_vix_hedge(
-        equity_window_start,
-        equity_window_end,
-        float(initial_capital),
-        cfg,
-    )
-
-
 def live_hedge_weights_at(
     fire_at,
-    hedge_config: Optional[Dict],
+    hedge_config: Optional[HedgeConfig],
     *,
     yahoo_only: bool = True,
 ) -> Tuple[float, float, Dict[str, Any]]:

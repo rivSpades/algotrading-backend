@@ -16,7 +16,6 @@ from .serializers import (
 from django_celery_beat.models import PeriodicTask, CrontabSchedule, IntervalSchedule
 import json
 from .tasks import (
-    update_symbol_data_task,
     fetch_symbols_from_exchange_task,
     fetch_symbols_from_multiple_exchanges_task,
     fetch_symbols_from_all_exchanges_task
@@ -24,8 +23,7 @@ from .tasks import (
 from .providers.eod_api import EODAPIProvider
 from algo_trading_backend.celery import app as celery_app
 from celery.result import AsyncResult
-from celery import states
-from datetime import datetime, timedelta
+from datetime import timedelta
 import redis
 from django.conf import settings
 
