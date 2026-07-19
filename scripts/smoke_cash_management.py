@@ -1,17 +1,19 @@
 """
-Test script to verify cash management system with 100 symbols linked to Alpaca broker
+Smoke script to verify cash management system with 100 symbols linked to Alpaca broker.
 Tests that:
 1. cash_available and cash_invested are tracked correctly
 2. Trades are skipped when bet_amount > cash_available
 3. Equity = cash_available + cash_invested
 4. Position exits update cash correctly
 5. skipped_trades_count is tracked and reported
+
+Run from the backend root:  python scripts/smoke_cash_management.py
 """
 import os
 import sys
 import django
 
-sys.path.insert(0, '/home/ric/Projects/Trading/algo_trading_backend')
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'algo_trading_backend.settings')
 django.setup()
 

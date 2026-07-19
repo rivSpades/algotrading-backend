@@ -1,5 +1,6 @@
 """
-Management command to create and run a test backtest with specific parameters
+Management command to create and run a smoke backtest with specific parameters
+Usage: python manage.py smoke_backtest
 """
 from django.core.management.base import BaseCommand
 from django.utils import timezone

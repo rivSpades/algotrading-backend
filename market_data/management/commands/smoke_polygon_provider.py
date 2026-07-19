@@ -1,6 +1,6 @@
 """
-Django management command to test Polygon provider setup
-Run with: python manage.py test_polygon_provider
+Django management command to smoke-test Polygon provider setup
+Run with: python manage.py smoke_polygon_provider
 """
 
 from django.core.management.base import BaseCommand

@@ -1,7 +1,7 @@
 """
 Management command to test update and refetch functionality for symbols with different providers
-Usage: python manage.py test_symbol_update_refetch --ticker AAPL --provider YAHOO
-       python manage.py test_symbol_update_refetch --ticker TSLA --provider ALPACA
+Usage: python manage.py smoke_symbol_update_refetch --ticker AAPL --provider YAHOO
+       python manage.py smoke_symbol_update_refetch --ticker TSLA --provider ALPACA
 """
 
 from django.core.management.base import BaseCommand

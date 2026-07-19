@@ -1,6 +1,6 @@
 """
-Management command to test Alpaca provider with random symbols
-Usage: python manage.py test_alpaca_provider
+Management command to smoke-test the Alpaca provider with random symbols
+Usage: python manage.py smoke_alpaca_provider
 """
 
 from django.core.management.base import BaseCommand
