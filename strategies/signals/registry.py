@@ -24,10 +24,6 @@ class StrategySignalRegistry:
         return cls._handlers.get(strategy_name)
 
     @classmethod
-    def has(cls, strategy_name: str) -> bool:
-        return strategy_name in cls._handlers
-
-    @classmethod
     def names(cls) -> list[str]:
         return sorted(cls._handlers.keys())
 

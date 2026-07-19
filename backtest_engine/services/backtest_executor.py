@@ -7,16 +7,12 @@ import pandas as pd
 import numpy as np
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timedelta
-from decimal import Decimal
 from django.utils import timezone
 from django.db import models
 from django.db import connections
 import pytz
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from market_data.models import Symbol, OHLCV
-from strategies.models import StrategyDefinition
-from analytical_tools.indicators import compute_indicator
-from market_data.services.indicator_service import compute_indicators_for_ohlcv
 import logging
 import threading
 import bisect
@@ -253,60 +249,6 @@ class BacktestExecutor:
             self.ohlcv_data[symbol] = pd.DataFrame()
             raise
     
-    def load_data(self):
-        """Load OHLCV data for all symbols in parallel - uses ALL available data for each symbol"""
-        logger.info(f"Loading OHLCV data for {len(self.symbols)} symbols in parallel (using all available data)")
-        
-        # Use ThreadPoolExecutor to load data in parallel
-        # Each symbol's data loading is independent, so parallel execution is safe
-        max_workers = min(len(self.symbols), 10)  # Limit to 10 threads to avoid overwhelming the system
-        
-        # Thread-safe dictionary to store results
-        data_lock = threading.Lock()
-        results = {}
-        
-        def process_symbol(symbol):
-            """Wrapper function to load data for a single symbol"""
-            try:
-                symbol_result, df = self._load_data_for_symbol(symbol)
-                with data_lock:
-                    if df is not None:
-                        results[symbol_result] = df
-                return symbol_result, df
-            except Exception as e:
-                logger.error(f"Failed to load data for {symbol.ticker}: {str(e)}")
-                # Close database connection in this thread
-                connections.close_all()
-                raise
-        
-        # Execute data loading in parallel
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all tasks
-            future_to_symbol = {
-                executor.submit(process_symbol, symbol): symbol 
-                for symbol in self.symbols
-            }
-            
-            # Collect results as they complete
-            for future in as_completed(future_to_symbol):
-                symbol = future_to_symbol[future]
-                try:
-                    # Result is already stored in results dict by process_symbol
-                    future.result()  # This will raise if there was an exception
-                except Exception as e:
-                    logger.error(f"Exception in data loading for {symbol.ticker}: {str(e)}")
-                    # Close database connections in case of error
-                    connections.close_all()
-                    raise
-        
-        # Assign all results to self.ohlcv_data (thread-safe since all threads have completed)
-        self.ohlcv_data = results
-        
-        # Close all database connections after parallel execution
-        connections.close_all()
-        
-        logger.info(f"Completed loading OHLCV data for {len(self.ohlcv_data)} symbols")
-    
     def _compute_indicators_for_symbol(self, symbol, df):
         """Compute indicators for a single symbol (on-demand/lazy loading)"""
         from market_data.services.indicator_service import compute_strategy_indicators_for_ohlcv
@@ -378,61 +320,7 @@ class BacktestExecutor:
             # Store empty dict to avoid recomputing
             self.indicators[symbol] = {}
             raise
-    
-    def compute_indicators(self):
-        """Compute required indicators for all symbols using strategy's required_tool_configs (parallel execution)"""
-        logger.info(f"Computing indicators for {len(self.ohlcv_data)} symbols in parallel")
-        
-        # Use ThreadPoolExecutor to compute indicators in parallel
-        # Each symbol's indicator computation is independent, so parallel execution is safe
-        max_workers = min(len(self.ohlcv_data), 10)  # Limit to 10 threads to avoid overwhelming the system
-        
-        # Thread-safe dictionary to store results
-        indicators_lock = threading.Lock()
-        results = {}
-        
-        def process_symbol(symbol, df):
-            """Wrapper function to compute indicators for a single symbol"""
-            try:
-                symbol_result, symbol_indicators = self._compute_indicators_for_symbol(symbol, df)
-                with indicators_lock:
-                    results[symbol_result] = symbol_indicators
-                logger.info(f"Computed {len(symbol_indicators)} indicators for {symbol_result.ticker}: {list(symbol_indicators.keys())[:5]}")
-                return symbol_result, symbol_indicators
-            except Exception as e:
-                logger.error(f"Failed to compute indicators for {symbol.ticker}: {str(e)}")
-                # Close database connection in this thread
-                connections.close_all()
-                raise
-        
-        # Execute indicator computation in parallel
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all tasks
-            future_to_symbol = {
-                executor.submit(process_symbol, symbol, df): symbol 
-                for symbol, df in self.ohlcv_data.items()
-            }
-            
-            # Collect results as they complete
-            for future in as_completed(future_to_symbol):
-                symbol = future_to_symbol[future]
-                try:
-                    # Result is already stored in results dict by process_symbol
-                    future.result()  # This will raise if there was an exception
-                except Exception as e:
-                    logger.error(f"Exception in indicator computation for {symbol.ticker}: {str(e)}")
-                    # Close database connections in case of error
-                    connections.close_all()
-                    raise
-        
-        # Assign all results to self.indicators (thread-safe since all threads have completed)
-        self.indicators = results
-        
-        # Close all database connections after parallel execution
-        connections.close_all()
-        
-        logger.info(f"Completed computing indicators for {len(self.indicators)} symbols")
-    
+
     def execute_strategy(self):
         """Execute strategy logic and generate trades
         
@@ -443,11 +331,15 @@ class BacktestExecutor:
 
         if not self.symbols:
             bid = getattr(self.backtest, 'id', None)
-            raise ValueError(
-                f'Backtest {bid}: no symbols to execute for position_mode={self.position_mode!r} '
-                f'(broker_id={getattr(self.broker, "id", None)}). '
-                f'Check broker–symbol associations vs position_modes, or symbol status.'
+            logger.warning(
+                'Backtest %s: no symbols to execute for position_mode=%r '
+                '(broker_id=%s). Skipping this position mode. '
+                'Check broker–symbol associations vs position_modes, or symbol status.',
+                bid,
+                self.position_mode,
+                getattr(self.broker, 'id', None),
             )
+            return
         
         # Check if this is a multi-symbol backtest
         is_multi_symbol = len(self.symbols) > 1
@@ -1214,192 +1106,22 @@ class BacktestExecutor:
         return cash_available, cash_invested
     
     def _generate_signal(self, row: pd.Series, indicators: Dict, position: Optional[Dict], prev_indicators: Optional[Dict] = None, symbol: Symbol = None) -> Optional[str]:
-        """
-        Generate trading signal based on strategy logic
-        
-        Args:
-            row: Current OHLCV row
-            indicators: Dictionary of indicator values
-            position: Current position (if any)
-            prev_indicators: Previous indicator values (for crossover detection)
-            symbol: Symbol instance (for broker capability checks when applicable)
-        
-        Returns:
-            'buy', 'sell', or None
+        """Generate trading signal based on strategy logic.
+
+        Only Gap-Up and Gap-Down is registered in `STRATEGY_DEFINITIONS`; its
+        signal is computed by the `strategies.signals` blackbox. Any other
+        strategy name is rejected.
         """
         strategy_name = self.strategy.name
-        
-        if strategy_name == 'Simple Moving Average Crossover':
-            return self._sma_crossover_signal(row, indicators, position, prev_indicators, symbol)
-        elif strategy_name == 'Moving Average Crossover':
-            return self._moving_average_crossover_signal(row, indicators, position, prev_indicators, symbol)
-        elif strategy_name == 'Gap-Up and Gap-Down':
+
+        if strategy_name == 'Gap-Up and Gap-Down':
             return self._gap_up_gap_down_signal(row, indicators, position, symbol)
-        elif strategy_name == 'RSI Mean Reversion':
-            return self._rsi_mean_reversion_signal(row, indicators)
-        elif strategy_name == 'Bollinger Bands Breakout':
-            return self._bollinger_breakout_signal(row, indicators)
-        elif strategy_name == 'MACD Crossover':
-            return self._macd_crossover_signal(row, indicators)
-        else:
-            logger.warning(f"Unknown strategy: {strategy_name}")
-            return None
-    
-    def _sma_crossover_signal(self, row: pd.Series, indicators: Dict, position: Optional[Dict], prev_indicators: Optional[Dict] = None, symbol: Symbol = None) -> Optional[str]:
-        """
-        SMA Crossover strategy signal - supports both long and short positions
-        - Long entry: fast SMA crosses above slow SMA
-        - Long exit: fast SMA crosses below slow SMA
-        - Short entry: fast SMA crosses below slow SMA
-        - Short exit: fast SMA crosses above slow SMA
-        
-        Respects position_mode: 'long' (only longs) or 'short' (only shorts)
-        """
-        fast_period = self.parameters.get('fast_period', 20)
-        slow_period = self.parameters.get('slow_period', 50)
-        
-        fast_sma_key = f'SMA_{fast_period}'
-        slow_sma_key = f'SMA_{slow_period}'
-        
-        fast_sma = indicators.get(fast_sma_key)
-        slow_sma = indicators.get(slow_sma_key)
-        
-        if fast_sma is None or slow_sma is None:
-            logger.debug(f"SMA crossover: Missing indicators. fast_sma={fast_sma}, slow_sma={slow_sma}, keys={list(indicators.keys())}")
-            return None
-        
-        # Need previous values to detect crossover
-        if prev_indicators is None:
-            logger.debug(f"SMA crossover: No previous indicators available")
-            return None
-        
-        prev_fast_sma = prev_indicators.get(fast_sma_key)
-        prev_slow_sma = prev_indicators.get(slow_sma_key)
-        
-        if prev_fast_sma is None or prev_slow_sma is None:
-            logger.debug(f"SMA crossover: Missing previous indicators. prev_fast={prev_fast_sma}, prev_slow={prev_slow_sma}, prev_keys={list(prev_indicators.keys())}")
-            return None
-        
-        # Broker flags when a broker is configured
-        long_allowed = True
-        short_allowed = True
-        if self.broker and symbol:
-            from live_trading.models import SymbolBrokerAssociation
-            try:
-                association = SymbolBrokerAssociation.objects.get(symbol=symbol, broker=self.broker)
-                long_allowed = association.long_active
-                short_allowed = association.short_active
-            except SymbolBrokerAssociation.DoesNotExist:
-                long_allowed = False
-                short_allowed = False
-        
-        # Check if we have an open position
-        has_position = position is not None
-        position_type = position['type'] if has_position else None
-        
-        # Detect crossover: fast crosses above slow (golden cross)
-        if prev_fast_sma <= prev_slow_sma and fast_sma > slow_sma:
-            if not has_position:
-                # No position: Enter LONG (only in long mode AND broker allows)
-                if self.position_mode == 'long' and long_allowed:
-                    logger.info(f"[{self.position_mode.upper()}] LONG ENTRY signal: Fast SMA ({fast_sma:.2f}) crossed above Slow SMA ({slow_sma:.2f})")
-                    return 'buy'
-                else:
-                    logger.debug(f"[{self.position_mode.upper()}] LONG ENTRY signal ignored (position_mode={self.position_mode}, long_allowed={long_allowed})")
-            elif position_type == 'sell':
-                # Short position open: Exit SHORT (close short = buy) - always allowed
-                logger.info(f"[{self.position_mode.upper()}] SHORT EXIT signal: Fast SMA ({fast_sma:.2f}) crossed above Slow SMA ({slow_sma:.2f})")
-                return 'buy'
-        
-        # Detect crossover: fast crosses below slow (death cross)
-        elif prev_fast_sma >= prev_slow_sma and fast_sma < slow_sma:
-            if not has_position:
-                # No position: Enter SHORT (only in short mode AND broker allows)
-                if self.position_mode == 'short' and short_allowed:
-                    logger.info(f"[{self.position_mode.upper()}] SHORT ENTRY signal: Fast SMA ({fast_sma:.2f}) crossed below Slow SMA ({slow_sma:.2f})")
-                    return 'sell'
-                else:
-                    logger.debug(f"[{self.position_mode.upper()}] SHORT ENTRY signal ignored (position_mode={self.position_mode}, short_allowed={short_allowed})")
-            elif position_type == 'buy':
-                # Long position open: Exit LONG (close long = sell) - always allowed
-                logger.info(f"[{self.position_mode.upper()}] LONG EXIT signal: Fast SMA ({fast_sma:.2f}) crossed below Slow SMA ({slow_sma:.2f})")
-                return 'sell'
-        
+
+        logger.warning(f"Unknown strategy: {strategy_name}")
         return None
-    
-    def _moving_average_crossover_signal(self, row: pd.Series, indicators: Dict, position: Optional[Dict], prev_indicators: Optional[Dict] = None, symbol: Symbol = None) -> Optional[str]:
-        """
-        Moving Average Crossover strategy signal — long-only or short-only runs
-        - Long entry: Short SMA crosses above Long SMA
-        - Long exit: Short SMA crosses below Long SMA
-        - Short entry: Short SMA crosses below Long SMA
-        - Short exit: Short SMA crosses above Long SMA
-        
-        Only position_mode: 'long' or 'short'
-        """
-        short_period = self.parameters.get('short_period', 20)
-        long_period = self.parameters.get('long_period', 50)
-        
-        short_key = f'SMA_{short_period}'
-        long_key = f'SMA_{long_period}'
-        
-        short_sma = indicators.get(short_key)
-        long_sma = indicators.get(long_key)
-        
-        if short_sma is None or long_sma is None:
-            logger.debug(f"Moving Average Crossover: Missing indicators. short_sma={short_sma}, long_sma={long_sma}, keys={list(indicators.keys())}")
-            return None
-        
-        # Need previous values to detect crossover
-        if prev_indicators is None:
-            logger.debug(f"Moving Average Crossover: No previous indicators available")
-            return None
-        
-        prev_short_sma = prev_indicators.get(short_key)
-        prev_long_sma = prev_indicators.get(long_key)
-        
-        if prev_short_sma is None or prev_long_sma is None:
-            logger.debug(f"Moving Average Crossover: Missing previous indicators. prev_short={prev_short_sma}, prev_long={prev_long_sma}")
-            return None
-        
-        # Check if we have an open position
-        has_position = position is not None
-        position_type = position['type'] if has_position else None
-        
-        # Bullish crossover: Short SMA crosses above Long SMA
-        if prev_short_sma <= prev_long_sma and short_sma > long_sma:
-            if not has_position:
-                # No position: Enter LONG (only if position_mode is 'long')
-                if self.position_mode == 'long':
-                    logger.info(f"[{self.position_mode.upper()}] LONG ENTRY signal: Short SMA ({short_sma:.2f}) crossed above Long SMA ({long_sma:.2f})")
-                    return 'buy'
-                else:
-                    logger.debug(f"[{self.position_mode.upper()}] LONG ENTRY signal ignored (position_mode={self.position_mode})")
-            elif position_type == 'sell':
-                # Short position open: Exit SHORT (close short = buy) - always allowed
-                logger.info(f"[{self.position_mode.upper()}] SHORT EXIT signal: Short SMA ({short_sma:.2f}) crossed above Long SMA ({long_sma:.2f})")
-                return 'buy'
-        
-        # Bearish crossover: Short SMA crosses below Long SMA
-        elif prev_short_sma >= prev_long_sma and short_sma < long_sma:
-            if not has_position:
-                # No position: Enter SHORT (only if position_mode is 'short')
-                if self.position_mode == 'short':
-                    logger.info(f"[{self.position_mode.upper()}] SHORT ENTRY signal: Short SMA ({short_sma:.2f}) crossed below Long SMA ({long_sma:.2f})")
-                    return 'sell'
-                else:
-                    logger.debug(f"[{self.position_mode.upper()}] SHORT ENTRY signal ignored (position_mode={self.position_mode})")
-            elif position_type == 'buy':
-                # Long position open: Exit LONG (close long = sell) - always allowed
-                logger.info(f"[{self.position_mode.upper()}] LONG EXIT signal: Short SMA ({short_sma:.2f}) crossed below Long SMA ({long_sma:.2f})")
-                return 'sell'
-        
-        return None
-    
+
     def _gap_up_gap_down_signal(self, row: pd.Series, indicators: Dict, position: Optional[Dict], symbol: Symbol = None) -> Optional[str]:
-        """
-        Gap-Up and Gap-Down strategy signal — delegates to strategies.signals blackbox.
-        """
+        """Gap-Up and Gap-Down strategy signal — delegates to strategies.signals blackbox."""
         from strategies.signals import (
             GAP_STRATEGY_NAME,
             StrategySignalContext,
@@ -1462,56 +1184,7 @@ class BacktestExecutor:
             )
 
         return order
-    
-    def _rsi_mean_reversion_signal(self, row: pd.Series, indicators: Dict) -> Optional[str]:
-        """RSI Mean Reversion strategy signal"""
-        rsi_period = self.parameters.get('rsi_period', 14)
-        oversold = self.parameters.get('oversold_threshold', 30)
-        overbought = self.parameters.get('overbought_threshold', 70)
-        
-        rsi_key = f'RSI_{rsi_period}'
-        rsi = indicators.get(rsi_key) or indicators.get('RSI')
-        
-        if rsi is None:
-            return None
-        
-        if rsi < oversold:
-            return 'buy'
-        elif rsi > overbought:
-            return 'sell'
-        return None
-    
-    def _bollinger_breakout_signal(self, row: pd.Series, indicators: Dict) -> Optional[str]:
-        """Bollinger Bands Breakout strategy signal"""
-        price = row['close']
-        
-        # Bollinger Bands are stored with keys like 'BollingerBands_upper', etc.
-        upper = indicators.get('BollingerBands_upper') or indicators.get('upper')
-        lower = indicators.get('BollingerBands_lower') or indicators.get('lower')
-        
-        if upper is None or lower is None:
-            return None
-        
-        if price > upper:
-            return 'buy'
-        elif price < lower:
-            return 'sell'
-        return None
-    
-    def _macd_crossover_signal(self, row: pd.Series, indicators: Dict) -> Optional[str]:
-        """MACD Crossover strategy signal"""
-        macd_line = indicators.get('MACD') or indicators.get('macd')
-        signal_line = indicators.get('MACD_signal') or indicators.get('signal')
-        
-        if macd_line is None or signal_line is None:
-            return None
-        
-        if macd_line > signal_line:
-            return 'buy'
-        elif macd_line < signal_line:
-            return 'sell'
-        return None
-    
+
     def calculate_statistics(self) -> Dict:
         """Calculate backtest statistics"""
         logger.info("Calculating backtest statistics")

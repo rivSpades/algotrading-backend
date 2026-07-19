@@ -23,6 +23,32 @@ class PositionState(str, Enum):
 
 GAP_STRATEGY_NAME = 'Gap-Up and Gap-Down'
 
+# Canonical live signal action strings (single source of truth for both the
+# signal output adapter and the live engine layer).
+LIVE_SIGNAL_LONG = SignalAction.LONG.value
+LIVE_SIGNAL_SHORT = SignalAction.SHORT.value
+LIVE_SIGNAL_EXIT_LONG = SignalAction.EXIT_LONG.value
+LIVE_SIGNAL_EXIT_SHORT = SignalAction.EXIT_SHORT.value
+LIVE_SIGNAL_HOLD = SignalAction.HOLD.value
+
+
+def action_to_side(action: 'SignalAction | str') -> str:
+    """Map a canonical signal action to the broker order side ('buy'/'sell').
+
+    Used by both backtest (via `to_backtest_order`) and live order placement so
+    the LONG->buy / SHORT->sell / EXIT_LONG->sell / EXIT_SHORT->buy mapping lives
+    in exactly one place. Accepts the `SignalAction` enum or its string value.
+    """
+    if action == SignalAction.LONG:
+        return 'buy'
+    if action == SignalAction.SHORT:
+        return 'sell'
+    if action == SignalAction.EXIT_LONG:
+        return 'sell'
+    if action == SignalAction.EXIT_SHORT:
+        return 'buy'
+    return ''
+
 
 def position_state_from_backtest(position: Optional[dict]) -> PositionState:
     """Map backtest position dict to canonical position state."""
