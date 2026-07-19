@@ -7,7 +7,7 @@
 | `db` | PostgreSQL 16 | internal |
 | `redis` | Celery broker + Channels | internal |
 | `migrate` | One-shot migrations on startup | — |
-| `web` | Daphne ASGI (Django) | 8000 |
+| `web` | Daphne ASGI (Django) | host **8001** → container 8000 |
 | `celery_worker` | Background tasks | — |
 | `celery_beat` | Scheduled tasks | — |
 
