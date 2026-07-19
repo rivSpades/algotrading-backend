@@ -1,0 +1,58 @@
+{
+  "meta": {
+    "ticker": "GAPQA",
+    "position_mode": "short",
+    "strategy": "Gap-Up and Gap-Down",
+    "parameters": {
+      "threshold": 0.25,
+      "std_period": 90
+    },
+    "split_ratio": 0.7,
+    "initial_capital": 10000.0,
+    "bet_size_percentage": 100.0,
+    "bar_count": 150
+  },
+  "trades": [
+    {
+      "ticker": "GAPQA",
+      "trade_type": "sell",
+      "entry_timestamp": "2020-06-11T00:00:00Z",
+      "exit_timestamp": "2020-06-25T00:00:00Z",
+      "entry_price": 99.844558,
+      "exit_price": 99.594946,
+      "quantity": 100.155684,
+      "pnl": 25.000061,
+      "pnl_percentage": 0.250001,
+      "is_winner": true
+    }
+  ],
+  "stats": {
+    "scalars": {
+      "total_trades": 1,
+      "winning_trades": 1,
+      "losing_trades": 0,
+      "win_rate": 100.0,
+      "total_pnl": 25.000061,
+      "total_pnl_percentage": 0.25,
+      "average_pnl": 25.000061,
+      "average_winner": 25.000061,
+      "average_loser": 0,
+      "profit_factor": 25.0001,
+      "max_drawdown": 0.0,
+      "max_drawdown_duration": 0,
+      "sharpe_ratio": 0.0,
+      "cagr": 6.731,
+      "total_return": 0.25
+    },
+    "equity_curve": [
+      {
+        "timestamp": "2020-06-11T00:00:00Z",
+        "equity": 10000.0
+      },
+      {
+        "timestamp": "2020-06-25T00:00:00Z",
+        "equity": 10025.0
+      }
+    ]
+  }
+}
